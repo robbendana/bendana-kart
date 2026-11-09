@@ -36,8 +36,8 @@ help  = clamp(base - (base - floor) * fade + rescue, 0, 1)      (rescue only if 
 - **Speed sensitivity**: turn rate scales by `smoothstep(0, 140, |fwd|)` at low
   speed (no spinning on the spot) and by `1 - 0.25 * speedRatio` at speed
   (unchanged).
-- **Toddler and robots**: their steering is rate limited at 6/s too, so the
-  autopilot never snaps.
+- **Toddler and robots**: the autopilot's steering is already smooth, so it is
+  used directly (a rate limit made the autopilot lag and lose speed in tests).
 
 ## 3. Engine and speed
 
@@ -79,9 +79,10 @@ help  = clamp(base - (base - floor) * fade + rescue, 0, 1)      (rescue only if 
   sideways kick of 40.
 - **Body angle**: the drawn kart turns `driftDir * (0.28 + 0.2 * into)` away
   from its direction of travel (into = how hard you steer into the drift, -1
-  to 1), smoothed at rate 10. Outside drifts the body shows the real slip angle
-  `atan2(lateral, forward) * 0.8`, clamped to 0.5, so ice and big slides look
-  like slides.
+  to 1), smoothed at rate 10. Outside drifts the body already points along its
+  heading while it slides; the slide is exaggerated by 30%
+  (`-atan2(lateral, forward) * 0.3`, clamped to 0.25) so ice and big slides
+  read clearly.
 - **Charge** per second: 1.0 steering into the drift, 0.55 neutral, 0.3
   steering out, times `clamp(speedRatio, 0.6, 1)`. Tiers at 0.6 / 1.2 / 2.0 s
   (unchanged, kid friendly).
@@ -98,8 +99,10 @@ remote karts):
 
 - Push out of overlap: half the overlap for karts on my device, the full
   overlap for a remote kart (its own device pushes it).
-- Velocity along the contact normal: the closing part is removed and 35% is
-  returned as a bounce. The sideways part keeps 92%.
+- Velocity along the contact normal: half of the closing speed is exchanged
+  plus a 25% bounce, capped at 70 per bump so a bump never costs much speed.
+  A Toddler kart takes 35% of that (its bubble barely slows). The sideways
+  part keeps 92%.
 - A wobble: `bumpT = 0.35`, which rolls the body (section 8).
 - Feedback for my kart scales with closing speed `c`: shake `min(8, 2 + c/40)`,
   bump sound volume `clamp(c/200, 0.3, 1)`, buzz `10 + c/10` ms. At most one
@@ -214,11 +217,12 @@ A racing line is computed once per track:
    divided by `12 * 8`.
 2. Smoothed twice with a ±20 sample box filter (so the line starts turning in
    before the bend: out, in, out).
-3. Offset `lat[i] = clamp(k[i] * 9000, -60, 60)` toward the inside, then
+3. Offset `lat[i] = clamp(k[i] * 5400, -36, 36)` toward the inside, then
    smoothed once more.
 
-The autopilot (robots, Toddler, steering help) aims at this line plus the
-robot's own lane offset × 0.5.
+The line is only drawn; the autopilot keeps aiming at the centre (plus each
+robot's lane). Tests showed that chasing the apex made the autopilot steer
+more and lose speed, which made Toddler and robots slower.
 
 Drawing (help > 0, not Toddler, racing, not finished): 56 points from 6 to
 90 samples ahead of my kart. Each point's colour compares my speed with the
@@ -226,7 +230,8 @@ safe speed there, `maxS * clamp(1.2 - bend * 0.6, 0.45, 1)` (the same rule
 the autopilot brakes by): green when I am under it, yellow within 60 over,
 red beyond. Alpha fades in over the first 8 points and out over the last 16.
 
-- 3D: a flat ribbon 9 wide, 1.2 above the road, additive, no depth write.
+- 3D: a flat ribbon 14 wide, 1.2 above the road, no depth write, opacity
+  `0.75 * help` (the road is darker in 3D).
 - 2D: dots of radius 5 every 2nd point.
 
 ## 11. Sound and vibration
@@ -261,3 +266,20 @@ red beyond. Alpha fades in over the first 8 points and out over the last 16.
    and grass time recorded before and after.
 4. Robot lap times within 5% of 2.0 on every track.
 5. Look at 3D and 2D screenshots during drifts, boosts and landings.
+
+## 14. Test results (local, before the pull request)
+
+Automated 2-lap solo races against 4 robots, old version (2.0) vs this one.
+
+| Driver | Races | 2.0 avg time / place | 3.0 avg time / place |
+| --- | --- | --- | --- |
+| Toddler (autopilot) | 15 each | 34.3 s / 1.9 | 35.9 s / 2.0 |
+| Lots | 10 each | 38.3 s / 3.1 | 37.5 s / 3.2 |
+| A little | 10 | | 37.4 s / 2.5 |
+| Off | 10 | | 38.6 s / 2.6 |
+
+Race-to-race spread is large (items and bumps), so these say "about the same
+difficulty", which is the goal. Two bugs found and fixed by these runs: the
+edge cushion could cancel a kart's own forward speed when it pointed at the
+grass (it got stuck), and aiming the autopilot at the racing line made it
+slower.
