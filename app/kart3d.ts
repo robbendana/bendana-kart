@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import type { KartView } from './view3d';
+import { faceCanvas, type Expr } from './faces';
 
 // ---------------------------------------------------------------------------
 // Shared textures and sprites
@@ -34,6 +35,20 @@ export function emojiTexture(e: string): THREE.Texture {
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   textureCache.set(e, t);
+  return t;
+}
+
+/** The racer's drawn face for an expression, or their emoji if they have none. */
+export function faceTexture(emoji: string, ex: Expr = 'idle', look = 0): THREE.Texture {
+  const key = `__face|${emoji}|${ex}|${Math.sign(look)}`;
+  const hit = textureCache.get(key);
+  if (hit) return hit;
+  const c = faceCanvas(emoji, ex, look);
+  if (!c) return emojiTexture(emoji);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 2;
+  textureCache.set(key, t);
   return t;
 }
 
@@ -311,6 +326,9 @@ type AnimState = {
   puffI: number;
   wave: number;
   cheer: number;
+  blinkAt: number;
+  ouchUntil: number;
+  faceKey: string;
 };
 
 export type KartObj = {
@@ -327,6 +345,7 @@ export type KartObj = {
   torso: THREE.Group;
   helmet: THREE.Group;
   face: THREE.Sprite;
+  emoji: string;
   arms: THREE.Mesh[]; // upper L, fore L, upper R, fore R
   scarf: THREE.Mesh;
   flag: THREE.Group;
@@ -788,7 +807,7 @@ export function buildKart(k: KartLook): KartObj {
   put(body, L.build(), new THREE.MeshBasicMaterial({ vertexColors: true }));
   const brake = new THREE.MeshBasicMaterial({ color: 0x7f1d1d });
   put(body, K.build(), brake);
-  const decal = put(body, D.build(), new THREE.MeshBasicMaterial({ map: emojiTexture(k.emoji), transparent: true, alphaTest: 0.2, side: THREE.DoubleSide }));
+  const decal = put(body, D.build(), new THREE.MeshBasicMaterial({ map: faceTexture(k.emoji), transparent: true, alphaTest: 0.2, side: THREE.DoubleSide }));
   if (decal) decal.renderOrder = 1;
 
   // Wheels: a mount (which steers) holds the spinning wheel
@@ -853,15 +872,16 @@ export function buildKart(k: KartLook): KartObj {
   torso.add(helmet);
   const helmetMat = new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 90, specular: 0x6b7280, side: THREE.DoubleSide });
   helmet.add(new THREE.Mesh(helmetGeo(paint, trim), helmetMat));
-  const face = new THREE.Sprite(new THREE.SpriteMaterial({ map: emojiTexture(k.emoji), transparent: true, alphaTest: 0.15 }));
-  face.scale.set(HELMET_R * 2.1, HELMET_R * 2.1, 1);
+  const face = new THREE.Sprite(new THREE.SpriteMaterial({ map: faceTexture(k.emoji), transparent: true, alphaTest: 0.15 }));
+  const fs = faceCanvas(k.emoji) ? 2.55 : 2.1;
+  face.scale.set(HELMET_R * fs, HELMET_R * fs, 1);
   face.position.set(1.2, -0.5, 0);
   helmet.add(face);
   // The character's emoji as a sticker on the back of the helmet, so you can
   // tell who is who from behind
   const sticker = new THREE.Mesh(
     new THREE.SphereGeometry(HELMET_R * 1.03, 10, 10, -0.75, 1.5, Math.PI / 2 - 0.85, 1.5),
-    new THREE.MeshBasicMaterial({ map: emojiTexture(k.emoji), transparent: true, alphaTest: 0.2 }),
+    new THREE.MeshBasicMaterial({ map: faceTexture(k.emoji), transparent: true, alphaTest: 0.2 }),
   );
   helmet.add(sticker);
 
@@ -967,11 +987,11 @@ export function buildKart(k: KartLook): KartObj {
     init: false, prevHeading: 0, prevSpeed: 0, prevAir: 0, peakAir: 0, prevLand: 0, yawRate: 0, acc: 0, steer: 0, front: 0,
     spinF: 0, spinR: 0, y: 0, vy: 0, roll: 0, vroll: 0, pitch: 0, vpitch: 0, sq: 0, vsq: 0, tRoll: 0, vtRoll: 0,
     tPitch: 0, vtPitch: 0, look: 0, droop: 0, flagX: 0, vflagX: 0, flagZ: 0, vflagZ: 0, scarf: Math.random() * 10,
-    puffAt: 0, puffI: 0, wave: 0, cheer: 0,
+    puffAt: 0, puffI: 0, wave: 0, cheer: 0, blinkAt: 0, ouchUntil: 0, faceKey: '',
   };
 
   return {
-    group, model, under, body, mounts, wheels, frontCount, tilt, spin, needle, torso, helmet, face, arms, scarf, flag,
+    group, model, under, body, mounts, wheels, frontCount, tilt, spin, needle, torso, helmet, face, emoji: k.emoji, arms, scarf, flag,
     flames, tips, puffs, brake, dizzy, shadow, shield, tag, bubble: null, bubbleE: '', key: kartKey(k),
     bob: Math.random() * 10, alpha: 1, cfg: c, bodyIdx: idx, st,
   };
@@ -1116,6 +1136,7 @@ export function animateKart(o: KartObj, k: KartView, cx: AnimCtx) {
   // ----- Landing, hops and bumps kick the springs
   if (air > s.peakAir) s.peakAir = air;
   const landNow = ext.land !== undefined ? ext.land > s.prevLand + 0.3 : s.prevAir > 2 && air <= 0.5;
+  if (landNow && s.peakAir > 22) s.ouchUntil = now + 450;
   if (landNow) {
     const hit = clamp(Math.max(s.peakAir, 18) / 40, 0.4, 1.5);
     s.vy -= 70 * hit * soft;
@@ -1126,6 +1147,7 @@ export function animateKart(o: KartObj, k: KartView, cx: AnimCtx) {
   s.prevAir = air;
   s.prevLand = ext.land ?? 0;
   const bump = ext.bump ?? 0;
+  if (bump > 0.5) s.ouchUntil = Math.max(s.ouchUntil, now + 350);
 
   // ----- Sprung body: bounce, roll and pitch on springs
   const roadBuzz = sp > 30 ? Math.sin(now / 23 + o.bob) * 0.18 * spN * soft + Math.sin(now / 61) * 0.25 * spN * soft : 0;
@@ -1308,6 +1330,26 @@ export function animateKart(o: KartObj, k: KartView, cx: AnimCtx) {
     _camQ.copy(cx.camera.quaternion).invert();
     _up.applyQuaternion(_camQ);
     o.face.material.rotation = Math.atan2(-_up.x, _up.y) * 0.85;
+    // Which way is the driver's right on screen? Eyes follow the steering.
+    _up.set(0, 0, 1).applyQuaternion(_wq).applyQuaternion(_camQ);
+    const lookScr = Math.abs(s.steer) > 0.3 ? Math.sign(s.steer) * Math.sign(_up.x || 1) : 0;
+    // Pick an expression
+    let ex: Expr = 'idle';
+    if (k.spinning) ex = 'dizzy';
+    else if (k.finished) ex = 'cheer';
+    else if (now < s.ouchUntil) ex = 'ouch';
+    else if (k.boost) ex = 'happy';
+    else if (k.drifting) ex = 'focus';
+    if (ex === 'idle' || ex === 'focus') {
+      if (s.blinkAt === 0) s.blinkAt = now + 800 + Math.random() * 3000;
+      if (now > s.blinkAt + 130) s.blinkAt = now + 1600 + Math.random() * 3200;
+      else if (now > s.blinkAt) ex = 'blink';
+    }
+    const fk = `${ex}|${ex === 'idle' || ex === 'focus' ? lookScr : 0}`;
+    if (fk !== s.faceKey) {
+      s.faceKey = fk;
+      o.face.material.map = faceTexture(o.emoji, ex, lookScr);
+    }
   }
 
   // ----- Shadow stays on the road and shrinks when airborne
