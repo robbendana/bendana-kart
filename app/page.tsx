@@ -550,6 +550,7 @@ type Kart = {
   offT: number;
   wrongT: number;
   steerHeldT: number;
+  assist: number; // steering help: 0 off, 1 a little, 2 lots
 };
 
 type Snap = { t: number; x: number; y: number; a: number };
@@ -630,7 +631,7 @@ function makeKart(id: string, name: string, kartIdx: number, slot: number, toddl
     lane: bot ? (Math.random() - 0.5) * 70 : 0,
     skill: bot ? 0.84 + Math.random() * 0.06 : 1,
     drifting: false, driftDir: 0, charge: 0, tier: 0, miniT: 0, stallT: 0,
-    invT: 0, offT: 0, wrongT: 0, steerHeldT: 0,
+    invT: 0, offT: 0, wrongT: 0, steerHeldT: 0, assist: 0,
   };
 }
 
@@ -660,10 +661,14 @@ function createGame(mode: 'solo' | 'multi', order: string[], meId: string, profi
     const others = pool.slice(0, 3);
     karts.push(makeKart(meId, profile.name || 'You', profile.kartIdx, 3, profile.toddler, false, profile.paint, profile.body));
     others.forEach((k, i) => karts.push(makeKart(`bot${i}`, `${KARTS[k].name} Bot`, k, i, false, true, -1, Math.floor(Math.random() * BODIES.length))));
+    // Robots go easier when the player has steering help on
+    const ease = profile.toddler ? 0.88 : [1, 0.94, 0.87][profile.assist] ?? 1;
+    for (const b of karts) if (b.bot) b.skill *= ease;
   } else {
     const slot = Math.max(0, order.indexOf(meId));
     karts.push(makeKart(meId, profile.name || 'Racer', profile.kartIdx, slot === -1 ? order.length : slot, profile.toddler, false, profile.paint, profile.body));
   }
+  karts[0].assist = profile.toddler ? 2 : profile.assist;
   const players = Math.max(1, order.length);
   return {
     mode, meId,
@@ -773,7 +778,9 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   let fwd = k.vx * fx + k.vy * fy;
   const lat0 = -k.vx * fy + k.vy * fx;
   const off = k.offroad && !k.toddler;
-  let maxS = st.maxSpeed * speedMul * (off ? Math.min(0.75, THEME.offroad * st.offroad) : 1);
+  let offMul = off ? Math.min(0.75, THEME.offroad * st.offroad) : 1;
+  if (off && k.assist > 0) offMul += (1 - offMul) * (k.assist === 2 ? 0.5 : 0.25); // help: grass slows you less
+  let maxS = st.maxSpeed * speedMul * offMul;
   let acc = st.accel;
   if (k.boostT > 0) {
     maxS = st.maxSpeed * 1.6 * speedMul;
@@ -800,7 +807,8 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   const sf = clamp(Math.abs(fwd) / 160, 0, 1);
   const turnRate = st.turn * (k.drifting ? 1.15 : 1) * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
   k.angle = wrapAngle(k.angle + k.steer * turnRate * sf * (fwd >= 0 ? 1 : -1) * dt);
-  const lat = lat0 * Math.exp(-st.grip * THEME.grip * (k.drifting ? 0.55 : 1) * dt);
+  const roadGrip = k.assist === 2 ? Math.max(THEME.grip, 0.85) : k.assist === 1 ? Math.max(THEME.grip, 0.7) : THEME.grip;
+  const lat = lat0 * Math.exp(-st.grip * roadGrip * (k.drifting ? 0.55 : 1) * dt);
   fx = Math.cos(k.angle);
   fy = Math.sin(k.angle);
   k.vx = fx * fwd - fy * lat;
@@ -931,7 +939,21 @@ function step(G: Game, dt: number, now: number, input: Input) {
             brake = a.brake;
           } else brake = 0;
         } else {
-          steerTarget = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+          const manual = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+          if (k.assist > 0) {
+            // Steering help: the kart follows the road by itself, and left/right
+            // taps add on top, so you can still dodge or grab a box. With
+            // "lots" it also eases off the gas before sharp bends.
+            const a = autopilot(k);
+            const pull = k.assist === 2 ? 0.7 : 0.4;
+            steerTarget = manual === 0 ? a.steer * (k.assist === 2 ? 1 : 0.6) : clamp(manual + a.steer * pull, -1, 1);
+            if (k.assist === 2 && a.brake > 0 && throttle > 0 && k.boostT <= 0 && k.miniT <= 0 && !k.drifting) {
+              throttle = 0.25;
+              brake = Math.max(brake, a.brake * 0.6);
+            }
+          } else {
+            steerTarget = manual;
+          }
         }
       }
     }
@@ -944,7 +966,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
       const st = k.stats;
       const fwdSpeed = k.vx * Math.cos(k.angle) + k.vy * Math.sin(k.angle);
       k.steerHeldT = Math.abs(steerTarget) > 0.5 ? k.steerHeldT + dt : 0;
-      const wantDrift = racing && k.spinT <= 0 && (input.drift || (G.autoDrift && k.steerHeldT > 0.3));
+      const wantDrift = racing && k.spinT <= 0 && (input.drift || (G.autoDrift && k.assist < 2 && k.steerHeldT > 0.3));
       if (!k.drifting) {
         if (wantDrift && fwdSpeed > st.maxSpeed * 0.4 && Math.abs(steerTarget) > 0.3) {
           k.drifting = true;
@@ -953,7 +975,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
           k.tier = 0;
           beep(220, 0.08, 'triangle', 0.04);
         }
-      } else if (!wantDrift || fwdSpeed < st.maxSpeed * 0.25 || (G.autoDrift && steerTarget * k.driftDir <= 0)) {
+      } else if (!wantDrift || fwdSpeed < st.maxSpeed * 0.25 || (G.autoDrift && k.assist < 2 && steerTarget * k.driftDir <= 0)) {
         if (k.tier > 0) {
           k.miniT = [0, 0.6, 0.9, 1.3][k.tier];
           beep([0, 523, 659, 784][k.tier], 0.25, 'triangle', 0.06);
@@ -1516,7 +1538,7 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
 }
 
 // ---------- React UI ----------
-type Profile = { name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number; cam: CamMode };
+type Profile = { name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number; cam: CamMode; assist: number };
 type LobbyPlayer = { id: string; name: string; kartIdx: number; toddler: boolean; joinedAt: number; trackIdx: number; paint: number; body: number };
 type Standing = { id: string; name: string; kartIdx: number; place: number; time: string | null; isMe: boolean };
 type Hud = {
@@ -1715,6 +1737,35 @@ function TrackPicker({ value, onPick, disabled }: { value: number; onPick: (i: n
   );
 }
 
+const ASSISTS = [
+  { label: 'Off', blurb: 'You steer everything' },
+  { label: 'A little', blurb: 'Nudges you back toward the road' },
+  { label: 'Lots', blurb: 'Follows the road by itself, you just nudge' },
+];
+function AssistPicker({ value, onPick }: { value: number; onPick: (v: number) => void }) {
+  return (
+    <div className="mt-3 rounded-2xl bg-white/10 p-3 ring-1 ring-white/20">
+      <div className="flex items-center gap-2 text-white">
+        <span className="text-2xl">🎯</span>
+        <span className="text-base font-black">Steering help</span>
+        <span className="ml-auto text-xs font-semibold text-white/75">{ASSISTS[value].blurb}</span>
+      </div>
+      <div className="mt-2 grid grid-cols-3 gap-2">
+        {[2, 1, 0].map((v) => (
+          <button
+            key={v}
+            type="button"
+            onClick={() => onPick(v)}
+            className={`rounded-xl px-2 py-2 text-sm font-black transition active:scale-95 ${value === v ? 'bg-yellow-300 text-slate-900 shadow' : 'bg-black/25 text-white ring-1 ring-white/25'}`}
+          >
+            {ASSISTS[v].label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ToddlerToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   return (
     <button
@@ -1736,7 +1787,7 @@ function ToddlerToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) 
 
 export default function BendanaKartPage() {
   const [screen, setScreen] = useState<Screen>('menu');
-  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0, cam: 'chase' });
+  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0, cam: 'chase', assist: 2 });
   const [joinCode, setJoinCode] = useState('');
   const [room, setRoom] = useState<string | null>(null);
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
@@ -1787,6 +1838,7 @@ export default function BendanaKartPage() {
           paint: typeof p.paint === 'number' && p.paint >= -1 && p.paint < PAINTS.length ? p.paint : -1,
           body: typeof p.body === 'number' && p.body >= 0 && p.body < BODIES.length ? p.body : 0,
           cam: CAM_MODES.some((m) => m.id === p.cam) ? (p.cam as CamMode) : 'chase',
+          assist: typeof p.assist === 'number' && p.assist >= 0 && p.assist <= 2 ? p.assist : 2,
         });
       }
     } catch {
@@ -2458,6 +2510,7 @@ export default function BendanaKartPage() {
 
           <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
           </section>
 
           <section className="grid gap-3 rounded-3xl bg-black/20 p-4 backdrop-blur sm:grid-cols-3 sm:p-5">
@@ -2579,6 +2632,7 @@ export default function BendanaKartPage() {
             {nameInput}
             <KartPicker compact value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
           </section>
 
           {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}

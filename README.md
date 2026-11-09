@@ -6,6 +6,7 @@ players race each other live from different devices.
 - **16 racers:** 🏎️ Red Flash, 🦖 Dino Turbo, 🦄 Cosmic Dash, 🦍 Kong Kart, 🤖 Robo Racer, 🐶 Rocket Pup, 🐱 Kitty Comet, 🐰 Bunny Hop, 🐢 Turbo Turtle, 🐧 Penguin Slide, 🐉 Blaze Dragon, 👽 Zippy Alien, 🦊 Foxy Flame, 🐼 Panda Pop, 🦁 Lion Roar and 🐝 Sparkle Bee, each with its own speed, acceleration, steering and grip.
 - **6 kart bodies:** Classic, Speedster, Monster Truck (bounces over grass), Jet Racer, Mini Buggy and Bubble Car. They change the look and the stats.
 - **10 paint jobs** to color your kart.
+- **Steering help (🎯), on by default:** the kart follows the road by itself, and ◀ ▶ nudge it to dodge or grab a box. It also eases off the gas before sharp bends, and grass and ice are gentler. Pick Lots, A little, or Off on the menu. Practice robots are slower when help is on.
 - **Toddler Assist (🛡️):** the kart steers itself and can't be spun out. Just hold GAS.
 - **Items from 🎁 boxes:** 🚀 Turbo Rocket (2 second boost), 🍌 Banana Peel (spins out whoever hits it), 💥 Homing Blast (chases the kart ahead).
 - **5 tracks:** 🌻 Sunny Meadow, 🍭 Candy Canyon, ⛄ Frosty Peaks (slippery ice), 🌵 Dusty Dunes, 🌋 Volcano Loop. The host picks the track for everyone.
