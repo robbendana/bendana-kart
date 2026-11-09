@@ -9,6 +9,7 @@ players race each other live from different devices.
 - **Toddler Assist (🛡️):** the kart steers itself and can't be spun out. Just hold GAS.
 - **Items from 🎁 boxes:** 🚀 Turbo Rocket (2 second boost), 🍌 Banana Peel (spins out whoever hits it), 💥 Homing Blast (chases the kart ahead).
 - **5 tracks:** 🌻 Sunny Meadow, 🍭 Candy Canyon, ⛄ Frosty Peaks (slippery ice), 🌵 Dusty Dunes, 🌋 Volcano Loop. The host picks the track for everyone.
+- **3D cameras:** chase cam (default), close cam, driver's seat, a 360° cam you drag around your kart, and the classic top-down view. Hold 👀 (or Q) to look behind you. Each race opens with a fly-in over the start line, and the camera circles your kart when you finish.
 - **Drifting:** hold Shift while turning (on touch screens, just keep holding a turn). Blue, then orange, then purple sparks; let go for a mini-turbo.
 - **Rocket start:** press gas just before GO. Too early and you stall.
 - **Polish:** lap and "Final lap!" banners, wrong-way warning, auto-respawn when you're lost off the road, screen shake, speed lines, engine sound, confetti, and game controller support.
@@ -17,11 +18,11 @@ players race each other live from different devices.
 
 ## Controls
 
-| Device | Drive | Steer | Item |
-| --- | --- | --- | --- |
-| Keyboard | W / ↑ gas, S / ↓ brake | A D or ← → (Shift to drift) | Space |
-| Touch | GAS / BRAKE pedals (bottom right) | ◀ ▶ (bottom left, hold to drift) | 🎁 button or the item box at the top |
-| Gamepad | A or right trigger, B or left trigger to brake | Left stick or d-pad (bumpers to drift) | X or Y |
+| Device | Drive | Steer | Item | Camera |
+| --- | --- | --- | --- | --- |
+| Keyboard | W / ↑ gas, S / ↓ brake | A D or ← → (Shift to drift) | Space | C to switch, hold Q to look back |
+| Touch | GAS / BRAKE pedals (bottom right) | ◀ ▶ (bottom left, hold to drift) | 🎁 button or the item box at the top | 🎥 button at the top, hold 👀 to look back, drag to spin the 360° cam |
+| Gamepad | A or right trigger, B or left trigger to brake | Left stick or d-pad (bumpers to drift) | X | Select or Start to switch, hold Y to look back |
 
 ## How multiplayer works
 
