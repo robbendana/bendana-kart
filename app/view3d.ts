@@ -32,6 +32,7 @@ export type SceneTrack = {
   outside: string;
   edge: string;
   night: boolean;
+  ramps?: { x: number; y: number; a: number; len: number; width: number }[];
 };
 
 export type KartView = {
@@ -55,6 +56,10 @@ export type KartView = {
   driftDir: number;
   spinning: boolean;
   finished: boolean;
+  air?: number; // height above the road while jumping
+  shield?: boolean; // the Bubble Shield item
+  alpha?: number; // fades out when a player leaves
+  bubble?: string; // emoji above the kart (reactions, snoozing)
 };
 
 export type FrameView = {
@@ -62,6 +67,7 @@ export type FrameView = {
   dt: number;
   karts: KartView[]; // me first
   boxes: { x: number; y: number; visible: boolean; ghost: boolean }[];
+  coins?: { x: number; y: number; visible: boolean }[];
   bananas: { id: string; x: number; y: number }[];
   blasts: { id: string; x: number; y: number }[];
   particles: { x: number; y: number; life: number; max: number; color: string; size: number }[];
@@ -179,6 +185,9 @@ type KartObj = {
   tag: THREE.Sprite | null;
   key: string;
   bob: number;
+  bubble: THREE.Sprite | null;
+  bubbleE: string;
+  alpha: number;
 };
 
 // Body sizes: [half length, half width, body height, ride height, wheel radius]
@@ -326,7 +335,7 @@ function buildKart(k: KartView): KartObj {
     group.add(tag);
   }
 
-  return { group, model, wheels, flame, shield, driver, tag, key: `${k.body}|${k.color}|${k.emoji}|${k.name}`, bob: Math.random() * 10 };
+  return { group, model, wheels, flame, shield, driver, tag, key: `${k.body}|${k.color}|${k.emoji}|${k.name}`, bob: Math.random() * 10, bubble: null, bubbleE: '', alpha: 1 };
 }
 
 function disposeTree(o: THREE.Object3D) {
@@ -351,6 +360,7 @@ export class View3D {
   private world = new THREE.Group();
   private karts = new Map<string, KartObj>();
   private boxes: THREE.Group[] = [];
+  private coins: THREE.Group[] = [];
   private bananas = new Map<string, THREE.Group>();
   private blasts = new Map<string, THREE.Group>();
   private points: THREE.Points;
@@ -502,6 +512,34 @@ export class View3D {
     banner.rotation.y = -Math.atan2(t.ty[i0], t.tx[i0]);
     this.world.add(banner);
 
+    // Jump ramps: striped wedges rising toward the jump
+    if (t.ramps) {
+      const rampMat = new THREE.MeshLambertMaterial({ color: 0xf97316 });
+      const stripeMat = new THREE.MeshLambertMaterial({ color: 0xfef3c7 });
+      for (const r of t.ramps) {
+        const rise = 14;
+        const tilt = Math.atan2(rise, r.len);
+        const slope = Math.hypot(rise, r.len);
+        const g = new THREE.Group();
+        const deck = new THREE.Mesh(new THREE.BoxGeometry(slope, 3, r.width), rampMat);
+        deck.rotation.z = tilt;
+        deck.position.set(0, rise / 2, 0);
+        g.add(deck);
+        for (let i = -1; i <= 1; i += 2) {
+          const st = new THREE.Mesh(new THREE.BoxGeometry(slope * 0.98, 3.4, 6), stripeMat);
+          st.rotation.z = tilt;
+          st.position.set(0, rise / 2 + 0.2, i * r.width * 0.25);
+          g.add(st);
+        }
+        const lip = new THREE.Mesh(new THREE.BoxGeometry(3, rise, r.width), new THREE.MeshLambertMaterial({ color: 0x7c2d12 }));
+        lip.position.set(r.len / 2, rise / 2, 0);
+        g.add(lip);
+        g.position.set(r.x, 0, r.y);
+        g.rotation.y = -r.a;
+        this.world.add(g);
+      }
+    }
+
     // Clear old moving things; they are rebuilt on demand
     for (const k of this.karts.values()) {
       this.scene.remove(k.group);
@@ -510,6 +548,8 @@ export class View3D {
     this.karts.clear();
     for (const b of this.boxes) this.scene.remove(b);
     this.boxes = [];
+    for (const c of this.coins) this.scene.remove(c);
+    this.coins = [];
     this.bananas.forEach((b) => this.scene.remove(b));
     this.bananas.clear();
     this.blasts.forEach((b) => this.scene.remove(b));
@@ -580,7 +620,7 @@ export class View3D {
       seen.add(k.id);
       const o = this.kartObj(k);
       const hover = k.body === 3 ? Math.sin(now / 160 + o.bob) * 2 : 0;
-      o.group.position.set(k.x, hover, k.y);
+      o.group.position.set(k.x, hover + (k.air ?? 0), k.y);
       o.group.rotation.y = -k.yaw;
       // Lean into drifts and turns
       const lean = k.drifting ? -k.driftDir * 0.14 : 0;
@@ -593,8 +633,46 @@ export class View3D {
         const s = 0.8 + Math.random() * 0.5;
         o.flame.scale.set(1, s, 1);
       }
-      o.shield.visible = k.toddler;
-      if (k.toddler) o.shield.scale.setScalar(1 + Math.sin(now / 250) * 0.05);
+      const sh = k.toddler || !!k.shield;
+      o.shield.visible = sh;
+      if (sh) {
+        o.shield.scale.setScalar(1 + Math.sin(now / 250) * 0.05);
+        const sm = o.shield.material as THREE.MeshBasicMaterial;
+        sm.color.set(k.shield ? 0xfde047 : 0x38bdf8);
+        sm.opacity = k.shield ? 0.28 : 0.16;
+      }
+      // Emoji bubble above the kart
+      const be = k.bubble ?? '';
+      if (be !== o.bubbleE) {
+        o.bubbleE = be;
+        if (o.bubble) {
+          o.group.remove(o.bubble);
+          o.bubble.material.dispose();
+          o.bubble = null;
+        }
+        if (be) {
+          o.bubble = emojiSprite(be, 30);
+          o.bubble.position.y = k.isMe ? 70 : 92;
+          o.group.add(o.bubble);
+        }
+      }
+      if (o.bubble) o.bubble.position.y = (k.isMe ? 70 : 92) + Math.sin(now / 200) * 3;
+      // Fade out a kart whose player left
+      const al = k.alpha ?? 1;
+      if (Math.abs(al - o.alpha) > 0.02) {
+        o.alpha = al;
+        o.group.traverse((c) => {
+          const m = (c as THREE.Mesh).material as THREE.Material | undefined;
+          if (!m || Array.isArray(m)) return;
+          if (m.userData.baseOpacity === undefined) {
+            m.userData.baseOpacity = m.opacity;
+            m.userData.baseTransparent = m.transparent;
+          }
+          m.transparent = al < 0.99 || m.userData.baseTransparent;
+          m.opacity = m.userData.baseOpacity * al;
+          m.needsUpdate = true;
+        });
+      }
       const hideMe = k.isMe && f.mode === 'driver' && !f.lookBack && f.countdownLeft === null && f.finishedFor < 0;
       o.group.visible = !k.blink;
       o.driver.visible = !hideMe;
@@ -635,6 +713,28 @@ export class View3D {
       mat.opacity = b.ghost ? 0.25 : 0.8;
     });
     for (let i = f.boxes.length; i < this.boxes.length; i++) this.boxes[i].visible = false;
+
+    // ----- Coins -----
+    const coins = f.coins ?? [];
+    while (this.coins.length < coins.length) {
+      const g = new THREE.Group();
+      const disc = new THREE.Mesh(
+        new THREE.CylinderGeometry(8, 8, 2.5, 18),
+        new THREE.MeshLambertMaterial({ color: 0xfacc15, emissive: 0x7a5a00 }),
+      );
+      disc.rotation.x = Math.PI / 2;
+      g.add(disc);
+      this.scene.add(g);
+      this.coins.push(g);
+    }
+    coins.forEach((c, i) => {
+      const g = this.coins[i];
+      g.visible = c.visible;
+      if (!c.visible) return;
+      g.position.set(c.x, 14 + Math.sin(now / 250 + c.x * 0.1) * 2, c.y);
+      g.rotation.y = now / 300 + i;
+    });
+    for (let i = coins.length; i < this.coins.length; i++) this.coins[i].visible = false;
 
     // ----- Bananas and blasts -----
     const sync = (
