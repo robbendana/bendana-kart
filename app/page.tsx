@@ -654,10 +654,12 @@ function createGame(mode: 'solo' | 'multi', order: string[], meId: string, profi
     camY: karts[0].y,
     lastSend: 0,
     // Supabase counts every broadcast once when sent and once per player who
-    // receives it, against a 2 million per month free quota shared with the
-    // rest of the project. So positions go out a few times a second and the
-    // other screens smooth the gaps by interpolating.
-    sendInterval: players <= 2 ? 150 : players === 3 ? 200 : 250,
+    // receives it. The free plan disconnects a project that goes over 100
+    // messages a second, and the monthly quota is 2 million. With N players
+    // that is about N * N messages per send round, so the interval grows with
+    // N to stay near 70 a second (150ms for 2-3, ~230ms for 4, ~360ms for 5).
+    // The other screens smooth the gaps by interpolating.
+    sendInterval: Math.max(150, Math.ceil((players * players * 1000) / 70)),
     lastBeep: 4,
     shake: 0,
     zoomK: 1,
