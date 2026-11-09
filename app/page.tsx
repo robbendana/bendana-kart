@@ -24,9 +24,13 @@ import {
    ========================================================================= */
 
 // ---------- World and race constants ----------
-const WORLD_W = 2400;
-const WORLD_H = 1600;
-const HALF_W = 105; // half the road width, in world units
+// Tracks are sized for 5 karts racing side by side: every layout is scaled up
+// by TRACK_SCALE and the road is about five and a half karts wide.
+const TRACK_SCALE = 1.3;
+const WORLD_W = Math.round(2400 * TRACK_SCALE);
+const WORLD_H = Math.round(1600 * TRACK_SCALE);
+const HALF_W = 140; // half the road width, in world units
+const LANE_K = HALF_W / 105; // lateral spacing relative to the original, narrower road
 const SAMPLE_SPACING = 8;
 const BOX_RESPAWN_MS = 6000;
 const CHANNEL_PREFIX = 'bendana-kart:room:';
@@ -279,7 +283,7 @@ function catmull(p0: Vec, p1: Vec, p2: Vec, p3: Vec, t: number): Vec {
 
 function buildTrack(def: TrackDef): Track {
   const raw: Vec[] = [];
-  const wp: Vec[] = def.points.map(([x, y]) => ({ x, y }));
+  const wp: Vec[] = def.points.map(([x, y]) => ({ x: x * TRACK_SCALE, y: y * TRACK_SCALE }));
   const m = wp.length;
   for (let i = 0; i < m; i++) {
     const p0 = wp[(i - 1 + m) % m];
@@ -356,11 +360,12 @@ function nearestOnTrack(x: number, y: number, hint: number): { idx: number; dist
   return { idx: best, dist: Math.sqrt(bd) };
 }
 
+// Staggered starting grid: left, right, left, right, left, each kart a little
+// behind the one before, so all 5 have room to get away cleanly.
 function gridPose(slot: number) {
   const { xs, ys, tx, ty, n } = TRACK;
-  const row = Math.floor(slot / 2);
-  const idx = (n - 14 - row * 11 + n) % n;
-  const side = slot % 2 === 0 ? -42 : 42;
+  const idx = (n - 14 - slot * 8 + n) % n;
+  const side = slot % 2 === 0 ? -72 : 72;
   const nx = -ty[idx];
   const ny = tx[idx];
   return { x: xs[idx] + nx * side, y: ys[idx] + ny * side, angle: Math.atan2(ty[idx], tx[idx]), idx };
@@ -372,7 +377,7 @@ type Pad = { idx: number; lat: number; x: number; y: number; a: number };
 type Ramp = { idx: number; x: number; y: number; a: number };
 type Features = { pads: Pad[]; ramps: Ramp[]; coins: { idx: number; lat: number; x: number; y: number }[] };
 const PAD_LEN = 70;
-const PAD_W = 64;
+const PAD_W = 76;
 const RAMP_LEN = 36;
 const BOX_FRACS = [0.13, 0.33, 0.52, 0.7, 0.88];
 const COIN_FRACS = [0.22, 0.42, 0.61, 0.79];
@@ -423,7 +428,7 @@ function computeFeatures(): Features {
     ramps.push({ idx: c.i, ...p });
   }
   const pads: Pad[] = [];
-  const lats = [0, -45, 45];
+  const lats = [0, -60, 60];
   for (const c of cands) {
     if (pads.length >= 3) break;
     if (c.b > 0.5 || !far(c.i, n * 0.1)) continue;
@@ -433,10 +438,10 @@ function computeFeatures(): Features {
   }
   const coins: Features['coins'] = [];
   COIN_FRACS.forEach((fr, row) => {
-    const lane = [-50, 0, 50, 0][row];
+    const lane = [-70, 0, 70, 0][row];
     for (let k = 0; k < 5; k++) {
       const idx = (Math.floor(fr * n) + k * 6) % n;
-      const lat = lane + (row % 2 ? Math.sin(k) * 20 : 0);
+      const lat = lane + (row % 2 ? Math.sin(k) * 30 : 0);
       coins.push({ idx, lat, ...trackPoint(idx, lat) });
     }
   });
@@ -510,7 +515,7 @@ function sceneryItems(): SceneryItem[] {
   const th = THEME;
   const rnd = mulberry32(11 + TRACK_IDX * 7);
   const out: SceneryItem[] = [];
-  for (let i = 0; i < 300; i++) {
+  for (let i = 0; i < Math.round(300 * TRACK_SCALE * TRACK_SCALE); i++) {
     const x = 50 + rnd() * (WORLD_W - 100);
     const y = 50 + rnd() * (WORLD_H - 100);
     const isBig = rnd() < 0.4;
@@ -825,7 +830,7 @@ function makeKart(id: string, name: string, kartIdx: number, slot: number, toddl
     offroad: false, item: null, charges: 0, rollT: 0, boostT: 0, spinT: 0, spinA: 0,
     toddler, bot, finished: false, finishTime: 0,
     botTimer: 1 + Math.random() * 2,
-    lane: bot ? (Math.random() - 0.5) * 70 : 0,
+    lane: bot ? [-78, 78, -26, 26][slot % 4] + (Math.random() - 0.5) * 24 : 0, // each robot keeps its own lane
     skill: bot ? 0.84 + Math.random() * 0.06 : 1,
     drifting: false, driftDir: 0, charge: 0, tier: 0, miniT: 0, stallT: 0,
     invT: 0, offT: 0, wrongT: 0, steerHeldT: 0, assist: 0,
@@ -853,7 +858,7 @@ function makeBoxes(): Box[] {
     const idx = Math.floor(f * n);
     const nx = -ty[idx];
     const ny = tx[idx];
-    [-58, 0, 58].forEach((lane, j) => {
+    [-108, -36, 36, 108].forEach((lane, j) => {
       out.push({ id: `b${i}_${j}`, x: xs[idx] + nx * lane, y: ys[idx] + ny * lane, hiddenUntil: 0 });
     });
   });
@@ -1112,7 +1117,7 @@ function raceLine(): Float32Array {
   };
   k = blur(blur(k, 20), 20);
   const lat = new Float32Array(n);
-  for (let i = 0; i < n; i++) lat[i] = clamp(k[i] * 5400, -36, 36);
+  for (let i = 0; i < n; i++) lat[i] = clamp(k[i] * 5400 * TRACK_SCALE * LANE_K, -36 * LANE_K, 36 * LANE_K);
   const out = blur(lat, 10);
   raceLineCache.set(TRACK, out);
   return out;
@@ -2319,7 +2324,7 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   const speedR = clamp(Math.hypot(me.vx, me.vy) / me.stats.maxSpeed, 0, 1.4);
   // Frame-rate independent camera: zooms out a little with speed and more in boosts
   G.zoomK += ((fast ? 0.9 : 1 - 0.08 * Math.min(1, speedR)) - G.zoomK) * smoothK(3, rdt);
-  const zoom = clamp(Math.min(w, h) / 720, 0.5, 1.35) * G.zoomK;
+  const zoom = clamp(Math.min(w, h) / 720, 0.5, 1.35) * 0.92 * G.zoomK; // a touch wider to show the roomier roads
   const tx = me.x + me.vx * 0.35;
   const ty = me.y + me.vy * 0.35;
   G.camX += (tx - G.camX) * smoothK(7, rdt);

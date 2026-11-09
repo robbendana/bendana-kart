@@ -184,7 +184,7 @@ export class View3D {
     }
     const { worldW: W, worldH: H } = t;
     this.scene.background = new THREE.Color(t.sky);
-    this.scene.fog = new THREE.Fog(t.horizon, 1400, 4200);
+    this.scene.fog = new THREE.Fog(t.horizon, 1700, 5200);
 
     const hemi = new THREE.HemisphereLight(0xffffff, new THREE.Color(t.outside), t.night ? 0.9 : 1.6);
     this.world.add(hemi);
@@ -229,7 +229,7 @@ export class View3D {
     })();
     for (let i = 0; i < 26; i++) {
       const a = (i / 26) * Math.PI * 2 + rnd() * 0.2;
-      const r = 2300 + rnd() * 700;
+      const r = (2300 + rnd() * 700) * (W / 2400);
       const hgt = 260 + rnd() * 520;
       const hill = new THREE.Mesh(new THREE.ConeGeometry(260 + rnd() * 260, hgt, 7), hillMat);
       hill.position.set(W / 2 + Math.cos(a) * r, hgt / 2 - 20, H / 2 + Math.sin(a) * r * 0.8);
