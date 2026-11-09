@@ -232,7 +232,7 @@ export function beep(freq: number, dur: number, type: OscillatorType = 'sine', v
 export type Sfx = 'countdown' | 'go' | 'itemRoll' | 'itemGet' | 'rocket' | 'banana' | 'blast' | 'hit'
   | 'bump' | 'coin' | 'boostPad' | 'jump' | 'land' | 'trick' | 'driftTier1' | 'driftTier2' | 'driftTier3'
   | 'miniTurbo' | 'shieldUp' | 'shieldPop' | 'snooze' | 'lap' | 'finalLap' | 'finish' | 'posUp' | 'posDown'
-  | 'ready' | 'emote' | 'horn' | 'win' | 'cheer' | 'whoosh';
+  | 'ready' | 'emote' | 'horn' | 'win' | 'cheer' | 'whoosh' | 'clean';
 
 // Last time each effect played, so the same sound can't machine-gun.
 const lastPlayed: Partial<Record<Sfx, number>> = {};
@@ -309,6 +309,7 @@ export function sfx(name: Sfx, opts?: { pitch?: number; vol?: number }): void {
         tone(1000 * r, t, 0.2, 'sine', 0.07 * v, 300 * r);
         break;
       case 'snooze': snooze(t, r, v); break;
+      case 'clean': seq(t, [['E6', 0, 0.08], ['B6', 0.07, 0.16]], 'sine', 0.06 * v, r); break; // sparkly ding
       case 'lap': seq(t, [['C5', 0, 0.14], ['G5', 0.12, 0.26]], 'triangle', 0.1 * v, r); break;
       case 'finalLap': seq(t, [['C5', 0, 0.1], ['E5', 0.09, 0.1], ['G5', 0.18, 0.1], ['C6', 0.27, 0.3]], 'triangle', 0.1 * v, r); break;
       case 'finish': seq(t, [['C5', 0, 0.14], ['G5', 0.12, 0.14], ['C6', 0.24, 0.5]], 'triangle', 0.11 * v, r); break;
@@ -701,32 +702,63 @@ export function setMusicIntensity(level: 0 | 1 | 2): void {
   } catch { /* ignore */ }
 }
 
-// ===== Engine hum: one sawtooth through a lowpass, very quiet. =====
+// ===== Engine hum: two oscillators through a lowpass, very quiet. =====
+// Plus one looping noise source split three ways for the road surface:
+// drift screech, grass rumble and wind at high speed.
 
-let eng: { o: OscillatorNode; f: BiquadFilterNode; g: GainNode; last: number } | null = null;
+type Engine = {
+  o: OscillatorNode; o2: OscillatorNode; f: BiquadFilterNode; g: GainNode; last: number;
+  n: AudioBufferSourceNode; skidF: BiquadFilterNode; skidG: GainNode; grassF: BiquadFilterNode; grassG: GainNode;
+  windF: BiquadFilterNode; windG: GainNode;
+};
+let eng: Engine | null = null;
 
 export function engineStart(): void {
   try {
     const c = live();
-    if (!c || !sfxBus || eng) return;
+    if (!c || !sfxBus || eng || !noiseBuf) return;
     const o = c.createOscillator();
+    const o2 = c.createOscillator();
+    const g2 = c.createGain();
     const f = c.createBiquadFilter();
     const g = c.createGain();
     o.type = 'sawtooth';
     o.frequency.value = 70;
+    o2.type = 'square';
+    o2.frequency.value = 105;
+    g2.gain.value = 0.3;
     f.type = 'lowpass';
     f.frequency.value = 500;
     f.Q.value = 0.7;
     g.gain.value = 0;
     g.gain.setTargetAtTime(0.015, c.currentTime, 0.2);
-    o.connect(f); f.connect(g); g.connect(sfxBus);
+    o.connect(f); o2.connect(g2); g2.connect(f); f.connect(g); g.connect(sfxBus);
     o.start();
-    eng = { o, f, g, last: 0 };
+    o2.start();
+    // Surface sounds share one looping noise source
+    const n = c.createBufferSource();
+    n.buffer = noiseBuf;
+    n.loop = true;
+    const branch = (type: BiquadFilterType, freq: number, q: number) => {
+      const bf = c.createBiquadFilter();
+      const bg = c.createGain();
+      bf.type = type;
+      bf.frequency.value = freq;
+      bf.Q.value = q;
+      bg.gain.value = 0;
+      n.connect(bf); bf.connect(bg); bg.connect(sfxBus!);
+      return [bf, bg] as const;
+    };
+    const [skidF, skidG] = branch('bandpass', 1800, 6);
+    const [grassF, grassG] = branch('lowpass', 220, 1);
+    const [windF, windG] = branch('highpass', 2500, 0.5);
+    n.start();
+    eng = { o, o2, f, g, last: 0, n, skidF, skidG, grassF, grassG, windF, windG };
   } catch { /* ignore */ }
 }
 
 /** Call every frame. Updates are thinned to about 20 per second. */
-export function engineUpdate(speedRatio: number, boosting: boolean): void {
+export function engineUpdate(speedRatio: number, boosting: boolean, surface?: { drift: number; tier: number; grass: boolean; curb: boolean }): void {
   try {
     const c = live();
     if (!c || !eng) return;
@@ -734,9 +766,18 @@ export function engineUpdate(speedRatio: number, boosting: boolean): void {
     if (now - eng.last < 0.05) return;
     eng.last = now;
     const r = Math.max(0, Math.min(1.3, speedRatio || 0));
-    eng.o.frequency.setTargetAtTime(70 + 150 * r, now, 0.08);
-    eng.f.frequency.setTargetAtTime(boosting ? 900 : 500, now, 0.1);
+    const hz = 70 + 170 * r + (boosting ? 25 : 0);
+    eng.o.frequency.setTargetAtTime(hz, now, 0.08);
+    eng.o2.frequency.setTargetAtTime(hz * 1.5, now, 0.08);
+    eng.f.frequency.setTargetAtTime(boosting ? 900 : 500 + 200 * r, now, 0.1);
     eng.g.gain.setTargetAtTime(boosting ? 0.02 : 0.015, now, 0.1);
+    const sf = surface ?? { drift: 0, tier: 0, grass: false, curb: false };
+    eng.skidG.gain.setTargetAtTime(sf.drift > 0 ? 0.022 : 0, now, 0.05);
+    eng.skidF.frequency.setTargetAtTime(1500 + sf.tier * 350, now, 0.1);
+    // The curb pulses (a "brrrp"), the grass is a steady rumble
+    const pulse = sf.curb ? (Math.floor(now * 14) % 2 ? 0.035 : 0.008) : 0;
+    eng.grassG.gain.setTargetAtTime(sf.grass && r > 0.1 ? 0.035 : pulse * Math.min(1, r * 2), now, 0.03);
+    eng.windG.gain.setTargetAtTime(0.02 * r * r, now, 0.15);
   } catch { /* ignore */ }
 }
 
@@ -746,9 +787,15 @@ export function engineStop(): void {
     eng = null;
     if (!e || !ctx) return;
     const t = ctx.currentTime;
-    e.g.gain.setTargetAtTime(0, t, 0.08);
+    for (const gn of [e.g, e.skidG, e.grassG, e.windG]) gn.gain.setTargetAtTime(0, t, 0.08);
     e.o.stop(t + 0.5);
-    e.o.onended = () => { try { e.o.disconnect(); e.f.disconnect(); e.g.disconnect(); } catch { /* ignore */ } };
+    e.o2.stop(t + 0.5);
+    e.n.stop(t + 0.5);
+    e.o.onended = () => {
+      try {
+        for (const nd of [e.o, e.o2, e.f, e.g, e.n, e.skidF, e.skidG, e.grassF, e.grassG, e.windF, e.windG]) nd.disconnect();
+      } catch { /* ignore */ }
+    };
   } catch { /* ignore */ }
 }
 

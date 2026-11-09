@@ -61,6 +61,13 @@ export type KartView = {
   shield?: boolean; // the Bubble Shield item
   alpha?: number; // fades out when a player leaves
   bubble?: string; // emoji above the kart (reactions, snoozing)
+  // Driving feel (filled for karts simulated on this device; missing for remote ones)
+  steer?: number; // -1..1, front wheels and steering wheel
+  slip?: number; // rad, body yaw minus heading (already included in yaw)
+  hop?: number; // 0..1, drift-start hop (already included in air)
+  bump?: number; // 0..1, wobble after a kart bump
+  land?: number; // 0..1, landing squash (1 = just landed)
+  accel?: number; // smoothed forward acceleration, units/s² (+ = speeding up)
 };
 
 export type FrameView = {
@@ -81,6 +88,8 @@ export type FrameView = {
   orbitPitch: number;
   orbitDist: number;
   finishedFor: number; // ms since I finished, or -1
+  kicks?: number; // counts my boost starts; a change kicks the FOV
+  guide?: { x: number; y: number; c: number; a: number }[] | null; // driving line ahead (c: 0 green, 1 yellow, 2 red)
 };
 
 const smooth = (k: number, dt: number) => 1 - Math.exp(-k * dt);
@@ -512,11 +521,85 @@ export class View3D {
     (pg.attributes.position as THREE.BufferAttribute).needsUpdate = true;
     (pg.attributes.color as THREE.BufferAttribute).needsUpdate = true;
 
-    // ----- Camera -----
+    // ----- Driving line and camera -----
+    this.updateGuide(f);
     this.updateCamera(f, me);
     this.renderer.render(this.scene, this.camera);
   }
 
+  // ----- Driving line: a flat ribbon on the road, fading at both ends -----
+  private guideMesh: THREE.Mesh | null = null;
+  private guidePos: Float32Array | null = null;
+  private guideCol: Float32Array | null = null;
+  private updateGuide(f: FrameView) {
+    const pts = f.guide;
+    if (!pts || pts.length < 2) {
+      if (this.guideMesh) this.guideMesh.visible = false;
+      return;
+    }
+    const N = 64;
+    if (!this.guideMesh) {
+      this.guidePos = new Float32Array(N * 2 * 3);
+      this.guideCol = new Float32Array(N * 2 * 4);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(this.guidePos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(this.guideCol, 4));
+      const idx: number[] = [];
+      for (let i = 0; i < N - 1; i++) {
+        const a = i * 2;
+        idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+      }
+      geo.setIndex(idx);
+      this.guideMesh = new THREE.Mesh(
+        geo,
+        new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide }),
+      );
+      this.guideMesh.frustumCulled = false;
+      this.guideMesh.renderOrder = 1;
+      this.scene.add(this.guideMesh);
+    }
+    const pos = this.guidePos!;
+    const col = this.guideCol!;
+    const cols = [[0.29, 0.87, 0.5], [0.98, 0.8, 0.08], [0.97, 0.44, 0.44]];
+    const m = Math.min(N, pts.length);
+    for (let i = 0; i < N; i++) {
+      const p = pts[Math.min(i, m - 1)];
+      const q = pts[Math.min(Math.max(i + 1, 1), m - 1)];
+      const r = pts[Math.max(0, Math.min(i, m - 1) - 1)];
+      let dx = q.x - r.x;
+      let dz = q.y - r.y;
+      const l = Math.hypot(dx, dz) || 1;
+      dx /= l;
+      dz /= l;
+      const hw = 7;
+      for (let s = 0; s < 2; s++) {
+        const side = s ? 1 : -1;
+        const o = (i * 2 + s) * 3;
+        pos[o] = p.x - dz * hw * side;
+        pos[o + 1] = 1.2;
+        pos[o + 2] = p.y + dx * hw * side;
+        const c = cols[p.c] ?? cols[0];
+        const k = (i * 2 + s) * 4;
+        col[k] = c[0];
+        col[k + 1] = c[1];
+        col[k + 2] = c[2];
+        col[k + 3] = i < m ? p.a : 0;
+      }
+    }
+    const g = this.guideMesh.geometry;
+    (g.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (g.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+    this.guideMesh.visible = true;
+  }
+
+  // ----- Camera: a spring that follows where you are going -----
+  private fovKick = 0;
+  private lastKicks = -1;
+  private dip = 0;
+  private wasAir = false;
+  private lastHeading = 0;
+  private yawRate = 0;
+  private lookSide = 0;
   private updateCamera(f: FrameView, me: KartView) {
     const { dt, now } = f;
     const portrait = this.camera.aspect < 1;
@@ -526,7 +609,8 @@ export class View3D {
     const look = new THREE.Vector3();
     let fov = portrait ? 76 : 64;
     let posK = 9;
-    let yawK = 5;
+    const yawK = 5;
+    const speedR = Math.min(1.3, Math.max(0, me.speed / (me.maxSpeed || 1)));
 
     if (this.lastMode !== f.mode) {
       if (this.lastMode !== null) this.blendT = 0.45;
@@ -534,12 +618,30 @@ export class View3D {
     }
     this.blendT = Math.max(0, this.blendT - dt);
 
+    // Turn rate (smoothed) for looking into turns and the driver's-seat roll
+    if (dt > 0) {
+      const w = wrapAngle(me.heading - this.lastHeading) / dt;
+      this.yawRate += (Math.max(-6, Math.min(6, w)) - this.yawRate) * smooth(8, dt);
+    }
+    this.lastHeading = me.heading;
+    // Boost kick: every new boost punches the field of view, then it settles
+    const kicks = f.kicks ?? 0;
+    if (this.lastKicks >= 0 && kicks !== this.lastKicks) this.fovKick = 12;
+    this.lastKicks = kicks;
+    this.fovKick += ((me.boost ? 6 : 0) - this.fovKick) * smooth(this.fovKick > 6 ? 3 : 4, dt);
+    // Landing dip
+    const inAir = (me.air ?? 0) > 2;
+    if (this.wasAir && !inAir) this.dip = 7;
+    this.wasAir = inAir;
+    this.dip += (0 - this.dip) * smooth(9, dt);
+
     // Yaw follows the direction of travel with a little lag, so turns and
     // drifts swing the kart sideways on screen.
     if (!this.started) {
       this.camYaw = me.heading;
     }
-    const fast = me.boost;
+    const slip = Math.max(-0.6, Math.min(0.6, me.slip ?? 0));
+    const travel = me.speed > 80 && !me.spinning ? me.heading - slip * 0.6 : me.heading;
     const intro = f.countdownLeft !== null && f.countdownLeft > 900 && f.introMs > 0;
     const victory = f.finishedFor >= 0;
 
@@ -588,21 +690,28 @@ export class View3D {
       const eye = driverEye(me.body);
       target.set(me.x + Math.cos(me.yaw) * eye.fwd, eye.up + (me.air ?? 0), me.y + Math.sin(me.yaw) * eye.fwd);
       look.set(me.x + cx * 220, 22, me.y + cz * 220);
-      fov = portrait ? 88 : 78;
+      fov = (portrait ? 88 : 78) + 6 * speedR ** 1.5;
       posK = 40;
     } else {
       const near = f.mode === 'near';
-      this.camYaw += wrapAngle(me.heading - this.camYaw) * smooth(yawK, dt);
+      this.camYaw += wrapAngle(travel - this.camYaw) * smooth(yawK, dt);
       const cx = Math.cos(this.camYaw);
       const cz = Math.sin(this.camYaw);
-      // On a tall phone screen sit a little higher so more road shows
-      const dist = (near ? 82 : portrait ? 120 : 132) + (fast ? 16 : 0);
-      const height = near ? (portrait ? 42 : 34) : portrait ? 72 : 60;
+      // On a tall phone screen sit a little higher so more road shows.
+      // Faster: a little further back and lower, for a sense of speed.
+      const sr = Math.min(1, speedR);
+      const dist = (near ? 82 : portrait ? 120 : 132) + 14 * sr;
+      const height = (near ? (portrait ? 42 : 34) : portrait ? 72 : 60) - 6 * sr;
       const ahead = near ? 90 : portrait ? 40 : 70;
+      // Look a little into the turn
+      this.lookSide += (Math.max(-40, Math.min(40, this.yawRate * 28)) - this.lookSide) * smooth(4, dt);
+      const sx = -cz * this.lookSide;
+      const sz = cx * this.lookSide;
       target.set(me.x - cx * dist, height, me.y - cz * dist);
-      look.set(me.x + cx * ahead, near ? 16 : portrait ? 8 : 18, me.y + cz * ahead);
+      look.set(me.x + cx * ahead + sx, near ? 16 : portrait ? 8 : 18, me.y + cz * ahead + sz);
+      fov += 9 * Math.min(1, speedR) ** 1.5;
     }
-    if (fast && !victory) fov += 12;
+    if (!victory && !intro) fov += this.fovKick;
     if (this.blendT > 0) posK = Math.min(posK, 6);
 
     if (!intro) {
@@ -610,23 +719,29 @@ export class View3D {
       this.camPos.lerp(target, k);
       this.camLook.lerp(look, Math.min(1, k * 1.4));
     }
-    this.fov += (fov - this.fov) * smooth(5, dt);
+    this.fov += (fov - this.fov) * smooth(this.fovKick > 7 ? 10 : 5, dt);
     if (Math.abs(this.camera.fov - this.fov) > 0.05) {
       this.camera.fov = this.fov;
       this.camera.updateProjectionMatrix();
     }
     this.camera.position.copy(this.camPos);
+    if (!intro && !victory) this.camera.position.y -= this.dip;
     if (f.shake > 0) {
+      // Smooth shake: sums of sine waves instead of random jitter
+      const t = now / 1000;
+      const nz = (a: number) => Math.sin(t * 23 + a) * 0.5 + Math.sin(t * 31 + a * 2.3) * 0.3 + Math.sin(t * 41 + a * 3.1) * 0.2;
       const s = f.shake * 0.25;
-      this.camera.position.x += (Math.random() - 0.5) * s;
-      this.camera.position.y += (Math.random() - 0.5) * s * 0.5;
-      this.camera.position.z += (Math.random() - 0.5) * s;
+      this.camera.position.x += nz(0) * s;
+      this.camera.position.y += nz(1.7) * s * 0.5;
+      this.camera.position.z += nz(3.4) * s;
     }
     if (this.camera.position.y < 6) this.camera.position.y = 6;
     this.camera.lookAt(this.camLook);
-    // A small roll in drifts for the driver's seat
-    if (f.mode === 'driver' && !f.lookBack && me.drifting && !victory) this.camera.rotateZ(me.driftDir * 0.05);
-    void now;
+    // Driver's seat: roll a little with the turn, and more in drifts
+    if (f.mode === 'driver' && !f.lookBack && !victory) {
+      const roll = Math.max(-0.06, Math.min(0.06, -this.yawRate * 0.03)) + (me.drifting ? me.driftDir * 0.05 : 0);
+      this.camera.rotateZ(roll);
+    }
   }
 
   dispose() {

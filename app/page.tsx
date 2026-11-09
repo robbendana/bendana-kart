@@ -702,6 +702,26 @@ type Kart = {
   react: { e: string; until: number } | null;
   st: RaceStats;
   snoozeUsed: boolean;
+  // Driving feel (3.0)
+  help: number; // 0..1, how much the steering help does right now (section 1 of the v3 spec)
+  rescue: number; // extra help after a struggle, fades on the road
+  curb: boolean; // on the rumble strip
+  dist: number; // distance from the centerline
+  curbT: number; // rumble buzz timer
+  grassT: number; // how long this grass trip has lasted
+  hopT: number; // drift-start hop
+  slip: number; // drawn body angle relative to the heading
+  bumpT: number; // wobble after a kart bump
+  landT: number; // landing squash
+  accelS: number; // smoothed forward acceleration
+  prevFwd: number;
+  boostLvl: number; // last frame's boost multiplier, to detect a new boost
+  kicks: number; // counts boost starts (camera FOV kick)
+  steerIn: number; // my own steering input this frame (-1..1)
+  autoSteer: number; // what the autopilot would steer this frame
+  lapClean: boolean;
+  lapGrass: number;
+  sc: { bendT: number; goodT: number; roadT: number; grassT: number };
 };
 
 type Remote = {
@@ -737,7 +757,8 @@ type Banana = { id: string; x: number; y: number; owner: string; safeUntil: numb
 type Blast = { id: string; x: number; y: number; angle: number; owner: string; target: string | null; life: number };
 type Coin = { x: number; y: number; hiddenUntil: number };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number };
-type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean; drift: boolean; lookBack: boolean };
+type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean; drift: boolean; lookBack: boolean; ax: number };
+type InputKey = Exclude<keyof Input, 'ax'>;
 
 type Game = {
   mode: 'solo' | 'multi';
@@ -766,6 +787,14 @@ type Game = {
   firstFinishAt: number; // when the first human finished (starts the hurry timer)
   closedAt: number; // when the race closed (everyone done or time up)
   nextTick: number;
+  renderAt: number;
+  cleanLaps: number;
+  skill: Skill;
+  scored: boolean;
+  improved: boolean;
+  raceScore: number;
+  lapAt: number[]; // race ms of each lap line crossing (for tests)
+  tip: string | null; // the one coaching tip shown this race, if any
   emit: (ev: NetEvent) => void; // send an event to the other screens
 };
 
@@ -801,6 +830,8 @@ function makeKart(id: string, name: string, kartIdx: number, slot: number, toddl
     invT: 0, offT: 0, wrongT: 0, steerHeldT: 0, assist: 0,
     coins: 0, coinT: 0, padT: 0, airT: 0, airMax: AIR_TIME, rampCool: 0, trickDone: false, trickT: 0, trickA: 0,
     shieldT: 0, snoozeT: 0, draftC: 0, draftT: 0, epoch: 0, react: null, st: newStats(), snoozeUsed: false,
+    help: 0, rescue: 0, curb: false, dist: 0, curbT: 0, grassT: 0, hopT: 0, slip: 0, bumpT: 0, landT: 0, accelS: 0, prevFwd: 0,
+    boostLvl: 0, kicks: 0, steerIn: 0, autoSteer: 0, lapClean: true, lapGrass: 0, sc: { bendT: 0, goodT: 0, roadT: 0, grassT: 0 },
   };
 }
 
@@ -828,6 +859,83 @@ function makeBoxes(): Box[] {
   return out;
 }
 
+// ---------- Support ladder: help that eases off as you get better ----------
+type Skill = { s: number; n: number };
+const SKILL_KEY = 'bendana-kart-skill';
+const TIPS_KEY = 'bendana-kart-tips';
+function loadSkill(): Skill {
+  try {
+    const v = JSON.parse(window.localStorage.getItem(SKILL_KEY) || 'null');
+    if (v && typeof v.s === 'number' && typeof v.n === 'number') return { s: clamp(v.s, 0, 1), n: Math.max(0, v.n | 0) };
+  } catch {
+    /* storage blocked */
+  }
+  return { s: 0, n: 0 };
+}
+function saveSkill(sk: Skill) {
+  try {
+    window.localStorage.setItem(SKILL_KEY, JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
+  } catch {
+    /* storage blocked */
+  }
+}
+const HELP_BASE = [0, 0.55, 1];
+const HELP_FLOOR = [0, 0.35, 0.7];
+/** How much steering help a level gives right now, before rescue help. */
+function helpFor(assist: number, sk: Skill): number {
+  const base = HELP_BASE[assist] ?? 0;
+  const floor = HELP_FLOOR[assist] ?? 0;
+  const fade = sk.n >= 2 ? clamp((sk.s - 0.55) / 0.35, 0, 1) : 0;
+  return base - (base - floor) * fade;
+}
+let tipCache: Record<string, number> | null = null;
+function tips(): Record<string, number> {
+  if (tipCache) return tipCache;
+  try {
+    const v = JSON.parse(window.localStorage.getItem(TIPS_KEY) || '{}');
+    tipCache = v && typeof v === 'object' ? v : {};
+  } catch {
+    tipCache = { drift: 99, grass: 99, unlock: 99 }; // can't remember tips: don't nag
+  }
+  return tipCache!;
+}
+function tipCount(name: string): number {
+  const v = tips()[name];
+  return typeof v === 'number' ? v : 0;
+}
+function bumpTip(name: string) {
+  const t = tips();
+  t[name] = tipCount(name) + 1;
+  try {
+    window.localStorage.setItem(TIPS_KEY, JSON.stringify(t));
+  } catch {
+    /* storage blocked */
+  }
+}
+function showTip(G: Game, name: string, text: string, max: number) {
+  if (G.tip || tipCount(name) >= max) return;
+  G.tip = name;
+  bumpTip(name);
+  setBanner(G, text, '#fdba74', 3200);
+}
+/** At the finish: score this race and fold it into the stored driving score. */
+function scoreRace(G: Game, k: Kart) {
+  if (k.toddler || G.scored) return;
+  G.scored = true;
+  const sc = k.sc;
+  if (sc.roadT + sc.grassT < 10) return; // too short to judge
+  const steerScore = sc.bendT > 3 ? sc.goodT / sc.bendT : 0.5;
+  const roadScore = sc.roadT / (sc.roadT + sc.grassT);
+  const driftScore = Math.min(1, k.st.drifts / (G.laps * 2));
+  const race = 0.45 * steerScore + 0.4 * roadScore + 0.15 * driftScore;
+  const sk = G.skill;
+  G.improved = sk.n > 0 && race >= sk.s + 0.05;
+  sk.s = sk.n === 0 ? race : sk.s + (race - sk.s) * 0.3;
+  sk.n++;
+  G.raceScore = race;
+  saveSkill(sk);
+}
+
 type RaceCfg = {
   mode: 'solo' | 'multi';
   id: string;
@@ -853,7 +961,7 @@ function createGame(cfg: RaceCfg, meId: string, profile: Profile, roster: Map<st
     karts.push(makeKart(meId, profile.name || 'You', profile.kartIdx, 4, profile.toddler, false, profile.paint, profile.body));
     others.forEach((k, i) => karts.push(makeKart(`bot${i}`, `${KARTS[k].name}`, k, i, false, true, -1, Math.floor(Math.random() * BODIES.length))));
     // Robots go easier when the player has steering help on
-    const ease = profile.toddler ? 0.88 : [1, 0.94, 0.87][profile.assist] ?? 1;
+    const ease = profile.toddler ? 0.86 : [1, 0.94, 0.87][profile.assist] ?? 1;
     for (const b of karts) if (b.bot) b.skill *= ease;
   } else {
     const slot = Math.max(0, cfg.order.indexOf(meId));
@@ -891,6 +999,14 @@ function createGame(cfg: RaceCfg, meId: string, profile: Profile, roster: Map<st
     firstFinishAt: 0,
     closedAt: 0,
     nextTick: 0,
+    renderAt: 0,
+    cleanLaps: 0,
+    skill: loadSkill(),
+    scored: false,
+    improved: false,
+    raceScore: -1,
+    lapAt: [],
+    tip: null,
     emit: () => undefined,
   };
 }
@@ -958,6 +1074,7 @@ function spinOut(G: Game, k: Kart): boolean {
   k.charge = 0;
   k.tier = 0;
   k.st.hitBy++;
+  k.lapClean = false;
   react(k, '💫', 1300);
   // Drop a few coins
   const drop = Math.min(3, k.coins);
@@ -972,6 +1089,40 @@ function spinOut(G: Game, k: Kart): boolean {
   return true;
 }
 
+// ---------- Racing line ----------
+// A smooth out-in-out line: curvature, blurred so it starts turning in before
+// each bend, turned into a sideways offset toward the inside.
+const raceLineCache = new WeakMap<Track, Float32Array>();
+function raceLine(): Float32Array {
+  const hit = raceLineCache.get(TRACK);
+  if (hit) return hit;
+  const n = TRACK.n;
+  let k = new Float32Array(n);
+  for (let i = 0; i < n; i++) k[i] = wrapAngle(trackAngle(i + 6) - trackAngle(i - 6)) / (12 * SAMPLE_SPACING);
+  const blur = (src: Float32Array, r: number) => {
+    const out = new Float32Array(n);
+    let sum = 0;
+    for (let o = -r; o <= r; o++) sum += src[((o % n) + n) % n];
+    for (let i = 0; i < n; i++) {
+      out[i] = sum / (2 * r + 1);
+      sum += src[(i + r + 1) % n] - src[((i - r) % n + n) % n];
+    }
+    return out;
+  };
+  k = blur(blur(k, 20), 20);
+  const lat = new Float32Array(n);
+  for (let i = 0; i < n; i++) lat[i] = clamp(k[i] * 5400, -36, 36);
+  const out = blur(lat, 10);
+  raceLineCache.set(TRACK, out);
+  return out;
+}
+
+/** How fast it is safe to go at track sample i (the autopilot brakes by this). */
+function safeSpeed(i: number, maxS: number) {
+  const bend = Math.abs(wrapAngle(trackAngle(i + 26) - trackAngle(i)));
+  return maxS * clamp(1.2 - bend * 0.6, 0.45, 1);
+}
+
 function autopilot(k: Kart): { steer: number; throttle: number; brake: number } {
   const { xs, ys, tx, ty, n } = TRACK;
   const speed = Math.hypot(k.vx, k.vy);
@@ -982,26 +1133,37 @@ function autopilot(k: Kart): { steer: number; throttle: number; brake: number } 
   const diff = wrapAngle(Math.atan2(py - k.y, px - k.x) - k.angle);
   const steer = clamp(diff * 2.8, -1, 1);
   const ad = Math.abs(diff);
-  // Slow down before sharp bends: compare the road direction here and ahead
-  const j2 = (k.idx + 26) % n;
-  const bend = Math.abs(wrapAngle(Math.atan2(ty[j2], tx[j2]) - Math.atan2(ty[k.idx], tx[k.idx])));
-  const target = k.stats.maxSpeed * clamp(1.2 - bend * 0.6, 0.45, 1);
+  // Slow down before sharp bends
+  const target = safeSpeed(k.idx, k.stats.maxSpeed);
   if (speed > target + 40 && k.boostT <= 0 && k.padT <= 0) return { steer, throttle: 0, brake: 0.5 };
   const throttle = ad > 0.9 ? 0.25 : ad > 0.5 && speed > 320 ? 0.55 : 1;
   return { steer, throttle, brake: 0 };
 }
 
-function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul: number) {
+const CURB_W = 18; // rumble strip past the road edge: a warning, not a penalty
+const GRASS_RAMP = 40; // grass slows you more the deeper you go, over this distance
+const smoothK = (rate: number, dt: number) => 1 - Math.exp(-rate * dt);
+const smoothstep = (e0: number, e1: number, x: number) => {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul: number, edgeDist: number) {
   const st = k.stats;
   let throttle = throttleIn;
   let fx = Math.cos(k.angle);
   let fy = Math.sin(k.angle);
   let fwd = k.vx * fx + k.vy * fy;
-  const lat0 = -k.vx * fy + k.vy * fx;
+  let lat0 = -k.vx * fy + k.vy * fx;
   const air = k.airT > 0;
-  const off = k.offroad && !k.toddler && !air;
-  let offMul = off ? Math.min(0.75, THEME.offroad * st.offroad) : 1;
-  if (off && k.assist > 0) offMul += (1 - offMul) * (k.assist === 2 ? 0.5 : 0.25); // help: grass slows you less
+  const help = k.toddler ? 1 : k.help;
+  // Grass: no slowdown on the curb, then a smooth ramp down to the grass limit
+  const depth = edgeDist - HALF_W - CURB_W;
+  const grassP = k.toddler || air ? 0 : smoothstep(0, GRASS_RAMP, depth);
+  let grassMul = Math.min(0.75, THEME.offroad * st.offroad);
+  grassMul += (1 - grassMul) * help * 0.5;
+  const offMul = 1 + (grassMul - 1) * grassP;
+  const off = grassP > 0.5;
   // Coins add a little top speed; snooze slows you for a moment
   const coinMul = 1 + 0.01 * k.coins;
   const snoozeMul = k.snoozeT > 0 ? 0.7 : 1;
@@ -1022,8 +1184,18 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   } else if (k.coinT > 0) {
     maxS *= 1.08;
   }
+  // Boost punch: a new (or stronger) boost shoves you forward right away
+  if (boostMul > k.boostLvl + 0.01) {
+    fwd = Math.min(maxS, Math.max(fwd, 0) + 25 + 75 * (boostMul - 1));
+    k.kicks++;
+  }
+  k.boostLvl = boostMul;
   if (k.stallT > 0) throttle = 0;
-  if (throttle > 0 && fwd < maxS) fwd = Math.min(maxS, fwd + acc * throttle * dt);
+  if (throttle > 0 && fwd < maxS) {
+    // Strong launch, gentle approach to top speed
+    const r = clamp(fwd / maxS, 0, 1);
+    fwd = Math.min(maxS, fwd + acc * (1.45 - r * r) * throttle * dt);
+  }
   if (brake > 0) {
     if (fwd > 20) fwd -= 950 * brake * dt;
     else if (fwd > -st.maxSpeed * 0.35) fwd -= acc * 0.7 * brake * dt;
@@ -1032,15 +1204,28 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
     const f = Math.min(Math.abs(fwd), 240 * dt);
     fwd -= Math.sign(fwd) * f;
   }
-  // Going faster than allowed (for example after hitting the grass) decays quickly
-  if (fwd > maxS) fwd = Math.max(maxS, fwd - (off ? 1500 : 500) * dt);
+  // Faster than allowed (a boost just ended, or the grass): ease down, don't chop
+  if (fwd > maxS) fwd = Math.max(maxS, fwd - (off ? 900 : 380) * dt);
   fwd *= 1 - 0.12 * dt;
-  const sf = clamp(Math.abs(fwd) / 160, 0, 1);
+  // Edge cushion: with steering help, sliding away from the road is damped
+  if (help > 0 && !k.toddler && edgeDist > HALF_W - 20) {
+    const side = lateralOf(k.x, k.y, k.idx) >= 0 ? 1 : -1; // which edge
+    const nx = -TRACK.ty[k.idx] * side;
+    const ny = TRACK.tx[k.idx] * side;
+    // Only the sideways slide is damped, never the kart's own forward drive,
+    // so a kart pointing at the grass can still drive (and turn) back.
+    const out = lat0 * (-fy * nx + fx * ny);
+    if (out > 0) {
+      const keep = Math.exp(-help * 6 * dt);
+      lat0 -= Math.sign(-fy * nx + fx * ny) * out * (1 - keep);
+    }
+  }
+  const sf = Math.min(1, Math.abs(fwd) / 110) ** 0.8; // can still turn when slow (e.g. on grass)
   const turnRate = st.turn * (k.drifting ? 1.15 : 1) * (air ? 0.35 : 1) * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
   const a0 = k.angle;
   k.angle = wrapAngle(k.angle + k.steer * turnRate * sf * (fwd >= 0 ? 1 : -1) * dt);
   k.w = dt > 0 ? wrapAngle(k.angle - a0) / dt : 0;
-  const roadGrip = k.assist === 2 ? Math.max(THEME.grip, 0.85) : k.assist === 1 ? Math.max(THEME.grip, 0.7) : THEME.grip;
+  const roadGrip = THEME.grip + Math.max(0, 0.9 - THEME.grip) * help;
   const lat = lat0 * Math.exp(-st.grip * roadGrip * (k.drifting ? 0.55 : 1) * (air ? 0.2 : 1) * dt);
   fx = Math.cos(k.angle);
   fy = Math.sin(k.angle);
@@ -1048,6 +1233,14 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   k.vy = fy * fwd + fx * lat;
   k.x += k.vx * dt;
   k.y += k.vy * dt;
+  // Body motion for the 3D view: smoothed acceleration and the slide angle
+  if (dt > 0) k.accelS += ((fwd - k.prevFwd) / dt - k.accelS) * smoothK(8, dt);
+  k.prevFwd = fwd;
+  const into = k.drifting ? clamp(k.steer * k.driftDir, -1, 1) : 0;
+  const slipT = k.drifting
+    ? k.driftDir * (0.28 + 0.2 * into)
+    : Math.abs(fwd) > 60 ? clamp(-Math.atan2(lat, Math.abs(fwd)) * 0.3, -0.25, 0.25) : 0; // exaggerate a slide a little
+  k.slip += (slipT - k.slip) * smoothK(10, dt);
   const m = 34;
   if (k.x < m) { k.x = m; k.vx = Math.abs(k.vx) * 0.3; }
   if (k.x > WORLD_W - m) { k.x = WORLD_W - m; k.vx = -Math.abs(k.vx) * 0.3; }
@@ -1236,6 +1429,14 @@ function step(G: Game, dt: number, now: number, input: Input) {
   const ranked = rankRacers(all);
   const me = G.karts[0];
   const n = TRACK.n;
+  me.help = me.toddler ? 1 : clamp(helpFor(me.assist, G.skill) + (me.assist > 0 ? me.rescue : 0), 0, 1);
+  if (!me.toddler && !me.finished) {
+    if (!racing && G.autoDrift && me.assist === 2 && me.help <= 0.85) showTip(G, 'unlock', '🔥 New! Hold a turn to drift!', 1);
+    if (racing && me.lap === 2 && me.idx > n * 0.5 && me.st.drifts === 0 && !me.drifting && (!G.autoDrift || me.help <= 0.85)) {
+      showTip(G, 'drift', G.autoDrift ? '🔥 Hold a turn to drift!' : '🔥 Hold Shift in turns to drift!', 3);
+    }
+    if (racing && me.lapGrass >= 3 && me.help < 1) showTip(G, 'grass', '🌱 Grass is slow: ease off in tight turns', 3);
+  }
 
   for (const k of G.karts) {
     let throttle = 0;
@@ -1258,23 +1459,28 @@ function step(G: Game, dt: number, now: number, input: Input) {
       } else if (isMe) {
         throttle = input.up ? 1 : 0;
         brake = input.down ? 1 : 0;
+        const a = autopilot(k);
+        k.autoSteer = a.steer;
         if (k.toddler) {
-          const a = autopilot(k);
           steerTarget = a.steer;
           if (throttle > 0) {
             throttle = a.throttle;
             brake = a.brake;
           } else brake = 0;
         } else {
-          const manual = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-          if (k.assist > 0) {
-            // Steering help: the kart follows the road by itself, and left/right
-            // taps add on top, so you can still dodge or grab a box. With
-            // "lots" it also eases off the gas before sharp bends.
-            const a = autopilot(k);
-            const pull = k.assist === 2 ? 0.7 : 0.4;
-            steerTarget = manual === 0 ? a.steer * (k.assist === 2 ? 1 : 0.6) : clamp(manual + a.steer * pull, -1, 1);
-            if (k.assist === 2 && a.brake > 0 && throttle > 0 && k.boostT <= 0 && k.miniT <= 0 && k.padT <= 0 && !k.drifting) {
+          // Analog stick if there is one, otherwise the left/right buttons
+          const manual = Math.abs(input.ax) > 0.01 ? input.ax : (input.right ? 1 : 0) - (input.left ? 1 : 0);
+          k.steerIn = manual;
+          const h = k.help;
+          if (h > 0) {
+            // Steering help: the kart follows the road by itself, and your
+            // steering adds on top so you can still dodge or grab a box. Near
+            // the edge it also pulls back toward the road. With lots of help
+            // it eases off the gas before sharp bends.
+            const edge = Math.abs(lateralOf(k.x, k.y, k.idx)) > HALF_W - 20 ? 0.5 * h : 0;
+            const pull = a.steer * (0.7 * h + edge);
+            steerTarget = manual === 0 ? a.steer * Math.min(1, h + edge) : clamp(manual + pull, -1, 1);
+            if (h >= 0.7 && a.brake > 0 && throttle > 0 && k.boostT <= 0 && k.miniT <= 0 && k.padT <= 0 && !k.drifting) {
               throttle = 0.25;
               brake = Math.max(brake, a.brake * 0.6);
             }
@@ -1284,8 +1490,14 @@ function step(G: Game, dt: number, now: number, input: Input) {
         }
       }
     }
-    if (k.bot || k.toddler || k.finished) k.steer = steerTarget;
-    else k.steer += clamp(steerTarget - k.steer, -dt * 7, dt * 7);
+    // Shaped steering: quick to turn in, quicker to let go, so a tap is a
+    // small nudge and a hold is a full turn.
+    if (k.bot || k.toddler || k.finished) k.steer = steerTarget; // the autopilot's output is already smooth
+    else {
+      const easing = Math.abs(steerTarget) < Math.abs(k.steer) || steerTarget * k.steer < 0;
+      const rate = easing ? 12 : 5.5;
+      k.steer += clamp(steerTarget - k.steer, -dt * rate, dt * rate);
+    }
 
     // Drifting and mini-turbo (human drivers only). Keyboard: hold Shift while
     // turning. Touch: keep holding a turn at speed and the drift starts itself.
@@ -1293,16 +1505,23 @@ function step(G: Game, dt: number, now: number, input: Input) {
       const st = k.stats;
       const fwdSpeed = k.vx * Math.cos(k.angle) + k.vy * Math.sin(k.angle);
       k.steerHeldT = Math.abs(steerTarget) > 0.5 ? k.steerHeldT + dt : 0;
-      const wantDrift = racing && k.spinT <= 0 && (input.drift || (G.autoDrift && k.assist < 2 && k.steerHeldT > 0.3));
+      const touchDrift = G.autoDrift && k.help <= 0.85; // Lots unlocks this as you get better
+      const wantDrift = racing && k.spinT <= 0 && (input.drift || (touchDrift && k.steerHeldT > 0.3));
       if (!k.drifting) {
         if (wantDrift && fwdSpeed > st.maxSpeed * 0.4 && Math.abs(steerTarget) > 0.3) {
           k.drifting = true;
           k.driftDir = Math.sign(steerTarget);
           k.charge = 0;
           k.tier = 0;
+          k.hopT = 0.18;
+          // A little outward kick so the slide starts with a feel
+          const nx = -Math.sin(k.angle);
+          const ny = Math.cos(k.angle);
+          k.vx -= nx * k.driftDir * 40;
+          k.vy -= ny * k.driftDir * 40;
           beep(220, 0.08, 'triangle', 0.04);
         }
-      } else if (!wantDrift || fwdSpeed < st.maxSpeed * 0.25 || (G.autoDrift && k.assist < 2 && steerTarget * k.driftDir <= 0)) {
+      } else if (!wantDrift || fwdSpeed < st.maxSpeed * 0.25 || (touchDrift && !input.drift && steerTarget * k.driftDir <= 0)) {
         if (k.tier > 0) {
           k.miniT = [0, 0.6, 0.9, 1.3][k.tier];
           k.st.drifts++;
@@ -1315,7 +1534,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
         k.tier = 0;
       } else {
         const into = steerTarget * k.driftDir;
-        k.charge += dt * (into > 0.2 ? 1 : 0.4);
+        k.charge += dt * (into > 0.2 ? 1 : into < -0.2 ? 0.3 : 0.55) * clamp(fwdSpeed / st.maxSpeed, 0.6, 1);
         // Kid-friendly tier timings: 0.6 s, 1.2 s, 2.0 s
         const tier = k.charge >= 2.0 ? 3 : k.charge >= 1.2 ? 2 : k.charge >= 0.6 ? 1 : 0;
         if (tier > k.tier) {
@@ -1354,6 +1573,9 @@ function step(G: Game, dt: number, now: number, input: Input) {
     if (k.rollT > 0) k.rollT -= dt;
     if (k.stallT > 0) k.stallT -= dt;
     if (k.invT > 0 && k.spinT <= 0) k.invT -= dt;
+    if (k.hopT > 0) k.hopT -= dt;
+    if (k.bumpT > 0) k.bumpT -= dt;
+    if (k.landT > 0) k.landT = Math.max(0, k.landT - dt * 4);
 
     // Jumps: a parabolic hop; a trick in the air pays off on landing
     if (k.airT > 0) {
@@ -1369,6 +1591,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
           if (isMe) sfx('trick');
         }
         k.trickDone = false;
+        k.landT = 1;
         spawnParticles(G, k.x, k.y, 10, () => THEME.dust, 160, 0.4, 7);
         if (isMe) {
           sfx('land');
@@ -1378,17 +1601,68 @@ function step(G: Game, dt: number, now: number, input: Input) {
       }
     }
 
-    drive(k, dt, k.spinT > 0 ? 0 : throttle, k.spinT > 0 ? 0 : brake, speedMul);
+    drive(k, dt, k.spinT > 0 ? 0 : throttle, k.spinT > 0 ? 0 : brake, speedMul, k.dist);
 
     // Track position, laps and off-road check
     const prev = k.idx;
     const near = nearestOnTrack(k.x, k.y, k.idx);
     k.idx = near.idx;
-    k.offroad = near.dist > HALF_W;
+    k.dist = near.dist;
+    const wasGrass = k.offroad;
+    k.offroad = near.dist > HALF_W + CURB_W && !k.toddler;
+    k.curb = !k.offroad && near.dist > HALF_W && k.airT <= 0;
+    if (isMe && racing && !k.finished) {
+      // The rumble strip: you can feel it before anything slows you down
+      if (k.curb && Math.hypot(k.vx, k.vy) > 120) {
+        k.curbT -= dt;
+        if (k.curbT <= 0) {
+          k.curbT = 0.15;
+          vibrate(6);
+          G.shake = Math.max(G.shake, 1.5);
+        }
+      } else k.curbT = 0;
+      // Grass trips, rescue help, and the driving score
+      if (k.offroad && k.airT <= 0) {
+        k.grassT += dt;
+        if (!wasGrass) k.lapGrass++;
+        if (k.grassT > 0.5 && k.grassT - dt <= 0.5) {
+          k.lapClean = false;
+          if (k.assist > 0) k.rescue = Math.min(0.3, k.rescue + 0.12);
+        }
+      } else {
+        k.grassT = 0;
+        k.rescue = Math.max(0, k.rescue - 0.015 * dt);
+      }
+      if (!k.toddler && k.spinT <= 0) {
+        const sc = k.sc;
+        if (k.offroad) sc.grassT += dt;
+        else sc.roadT += dt;
+        if (Math.abs(k.autoSteer) > 0.25 && Math.hypot(k.vx, k.vy) > 120) {
+          sc.bendT += dt;
+          const mine = k.drifting ? k.driftDir : k.steerIn;
+          if (mine * k.autoSteer > 0) sc.goodT += dt;
+        }
+      }
+    }
     if (prev > n * 0.75 && k.idx < n * 0.25) {
       k.lap++;
+      if (isMe) G.lapAt.push(Math.round(now - G.goAt));
+      if (isMe && k.lap >= 2 && k.lap <= G.laps + 1 && !k.toddler && k.lapClean) {
+        G.cleanLaps++;
+        sfx('clean');
+        spawnParticles(G, k.x, k.y, 24, (i) => (i % 2 ? '#fde047' : '#ffffff'), 220, 0.6, 6);
+      }
+      const wasClean = k.lapClean;
+      k.lapClean = true;
+      k.lapGrass = 0;
       if (isMe && k.lap >= 2 && k.lap <= G.laps) {
-        if (k.lap === G.laps) {
+        if (wasClean && !k.toddler) {
+          setBanner(G, k.lap === G.laps ? '✨ Clean lap! 🏁 FINAL LAP!' : `✨ Clean lap! LAP ${k.lap}/${G.laps}`, '#fde047', 2000);
+          if (k.lap === G.laps) {
+            sfx('finalLap');
+            setMusicIntensity(1);
+          }
+        } else if (k.lap === G.laps) {
           setBanner(G, '🏁 FINAL LAP!', '#f472b6', 2000);
           sfx('finalLap');
           setMusicIntensity(1);
@@ -1404,8 +1678,9 @@ function step(G: Game, dt: number, now: number, input: Input) {
     const speedNow = Math.hypot(k.vx, k.vy);
     const facing = Math.cos(k.angle) * TRACK.tx[k.idx] + Math.sin(k.angle) * TRACK.ty[k.idx];
     k.wrongT = racing && facing < -0.3 && speedNow > 40 ? k.wrongT + dt : 0;
+    if (isMe && k.wrongT > 1 && k.wrongT - dt <= 1 && k.assist > 0 && !k.toddler) k.rescue = Math.min(0.3, k.rescue + 0.12);
     k.offT = racing && near.dist > HALF_W * 1.9 && k.airT <= 0 ? k.offT + dt : 0;
-    if (k.offT > 2.5) {
+    if (k.offT > 2.5 - 1.0 * (k.toddler ? 1 : k.help)) {
       const j = near.idx;
       k.x = TRACK.xs[j];
       k.y = TRACK.ys[j];
@@ -1424,6 +1699,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
       k.finishTime = now - G.goAt;
       if (!G.firstFinishAt) G.firstFinishAt = now;
       if (isMe) {
+        scoreRace(G, k);
         G.emit({ i: randId(), k: 'fin', ft: Math.round(k.finishTime), st: k.st });
         const place = ranked.filter((r) => r.finished && r.id !== k.id).length + 1;
         // Photo finish: someone else crossed within 0.3 s
@@ -1634,7 +1910,8 @@ function step(G: Game, dt: number, now: number, input: Input) {
     }
   }
 
-  // Kart bumping (only the karts this device simulates get pushed)
+  // Kart bumping (only the karts this device simulates get pushed). Karts
+  // bounce apart and keep their speed along the bump instead of sticking.
   for (const k of G.karts) {
     if (k.airT > 0) continue;
     for (const o of all) {
@@ -1642,18 +1919,38 @@ function step(G: Game, dt: number, now: number, input: Input) {
       const dx = k.x - o.x;
       const dy = k.y - o.y;
       const d = Math.hypot(dx, dy);
-      const reach = KART_RADIUS * 2 * (G.remotes.has(o.id) ? 1.1 : 1);
+      const remote = G.remotes.get(o.id);
+      const reach = KART_RADIUS * 2 * (remote ? 1.1 : 1);
       if (d > 0 && d < reach) {
-        const push = (reach - d) * 0.5;
-        k.x += (dx / d) * push;
-        k.y += (dy / d) * push;
-        k.vx *= 0.97;
-        k.vy *= 0.97;
-        if (k.id === G.meId && now - G.lastBump > 400) {
-          G.lastBump = now;
-          G.shake = Math.max(G.shake, 4);
-          sfx('bump');
-          vibrate(20);
+        const nx = dx / d;
+        const ny = dy / d;
+        const push = (reach - d) * (remote ? 1 : 0.5);
+        k.x += nx * push;
+        k.y += ny * push;
+        // The other kart's velocity: local karts we know, remote ones from their samples
+        const ok = G.karts.find((x) => x.id === o.id);
+        const ovx = ok ? ok.vx : remote ? remote.vx : 0;
+        const ovy = ok ? ok.vy : remote ? remote.vy : 0;
+        const closing = (ovx - k.vx) * nx + (ovy - k.vy) * ny; // > 0: coming together
+        if (closing > 0) {
+          // Each kart takes half the exchange (equal mass), plus a 35% bounce
+          // Capped so a bump never costs much speed; the Toddler bubble barely slows
+          const j = Math.min(70, closing * 0.5 * 1.25) * (k.toddler ? 0.35 : 1);
+          k.vx += nx * j;
+          k.vy += ny * j;
+          // Sideways part keeps most of its speed
+          const tx = -ny;
+          const ty = nx;
+          const side = k.vx * tx + k.vy * ty;
+          k.vx -= tx * side * 0.08;
+          k.vy -= ty * side * 0.08;
+          k.bumpT = 0.35;
+          if (k.id === G.meId && now - G.lastBump > 250) {
+            G.lastBump = now;
+            G.shake = Math.max(G.shake, Math.min(8, 2 + closing / 40));
+            sfx('bump', { vol: clamp(closing / 200, 0.3, 1) });
+            vibrate(Math.round(10 + closing / 10));
+          }
         }
       }
     }
@@ -1944,6 +2241,11 @@ function drawKart(
   ctx.restore();
 }
 
+/** The little hop when a drift starts (visual only). */
+function hopHeight(k: Kart) {
+  return k.hopT > 0 ? Math.sin((1 - k.hopT / 0.18) * Math.PI) * 7 : 0;
+}
+
 function airHeight(airT: number, airMax: number) {
   const s = clamp(1 - airT / Math.max(0.01, airMax), 0, 1);
   return 4 * AIR_HEIGHT * s * (1 - s);
@@ -1974,17 +2276,51 @@ function drawTag(ctx: CanvasRenderingContext2D, x: number, y: number, text: stri
   ctx.fillText(text, x, y + 1);
 }
 
+/** Smooth camera shake: three sine waves instead of random jitter (-1..1). */
+function shakeNoise(now: number, seed: number) {
+  const t = now / 1000;
+  return (Math.sin(t * 23 + seed) * 0.5 + Math.sin(t * 31 + seed * 2.3) * 0.3 + Math.sin(t * 41 + seed * 3.1) * 0.2);
+}
+
+/** Points of the driving line ahead of my kart, coloured by how safe my speed is. */
+type GuidePt = { x: number; y: number; c: number; a: number };
+function showGuide(G: Game) {
+  const me = G.karts[0];
+  return G.phase === 'racing' && !me.toddler && !me.finished && me.help > 0;
+}
+function guideLine(k: Kart): GuidePt[] {
+  const { xs, ys, tx, ty, n } = TRACK;
+  const line = raceLine();
+  const speed = Math.hypot(k.vx, k.vy);
+  const out: GuidePt[] = [];
+  const N = 56;
+  for (let p = 0; p < N; p++) {
+    const j = (k.idx + 6 + Math.round((p * 84) / (N - 1))) % n;
+    const lat = line[j];
+    const over = speed - safeSpeed(j, k.stats.maxSpeed);
+    const c = over < 0 ? 0 : over < 60 ? 1 : 2;
+    const a = Math.min(1, p / 8, (N - 1 - p) / 16);
+    out.push({ x: xs[j] - ty[j] * lat, y: ys[j] + tx[j] * lat, c, a });
+  }
+  return out;
+}
+const GUIDE_COLORS = ['#4ade80', '#facc15', '#f87171'];
+
 function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement, w: number, h: number, dpr: number, now: number, overlayOnly = false) {
   const me = G.karts[0];
   const fast = me.boostT > 0 || me.miniT > 0 || me.padT > 0 || me.trickT > 0;
-  G.zoomK += ((fast ? 0.9 : 1) - G.zoomK) * 0.06;
+  const rdt = G.renderAt ? clamp((now - G.renderAt) / 1000, 0, 0.1) : 1 / 60;
+  G.renderAt = now;
+  const speedR = clamp(Math.hypot(me.vx, me.vy) / me.stats.maxSpeed, 0, 1.4);
+  // Frame-rate independent camera: zooms out a little with speed and more in boosts
+  G.zoomK += ((fast ? 0.9 : 1 - 0.08 * Math.min(1, speedR)) - G.zoomK) * smoothK(3, rdt);
   const zoom = clamp(Math.min(w, h) / 720, 0.5, 1.35) * G.zoomK;
-  const tx = me.x + me.vx * 0.3;
-  const ty = me.y + me.vy * 0.3;
-  G.camX += (tx - G.camX) * 0.12;
-  G.camY += (ty - G.camY) * 0.12;
-  const shx = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
-  const shy = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
+  const tx = me.x + me.vx * 0.35;
+  const ty = me.y + me.vy * 0.35;
+  G.camX += (tx - G.camX) * smoothK(7, rdt);
+  G.camY += (ty - G.camY) * smoothK(7, rdt);
+  const shx = G.shake > 0 ? shakeNoise(now, 0) * G.shake * 0.5 : 0;
+  const shy = G.shake > 0 ? shakeNoise(now, 1.7) * G.shake * 0.5 : 0;
   if (overlayOnly) {
     // The 3D view draws the world; this canvas only adds speed lines and the minimap
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1995,6 +2331,21 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   ctx.fillRect(0, 0, w, h);
   ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * (w / 2 - G.camX * zoom + shx), dpr * (h / 2 - G.camY * zoom + shy));
   ctx.drawImage(track, 0, 0);
+
+  // Driving line (steering help only): fades away as help eases off
+  const guideA = showGuide(G) ? 0.6 * me.help : 0;
+  if (guideA > 0.02) {
+    const pts = guideLine(me);
+    for (let i = 0; i < pts.length; i += 2) {
+      const p = pts[i];
+      ctx.globalAlpha = guideA * p.a;
+      ctx.fillStyle = GUIDE_COLORS[p.c];
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
 
   // Item boxes
   for (const b of G.boxes) {
@@ -2086,8 +2437,8 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
       y: k.y,
       draw: () => {
         if (k.invT > 0 && Math.floor(now / 90) % 2 === 0) return;
-        const air = k.airT > 0 ? airHeight(k.airT, k.airMax) : 0;
-        drawKart(ctx, k.x, k.y, k.angle + (k.drifting ? k.driftDir * 0.35 : 0) + k.trickA, k.spinA, k.kartIdx, k.paint, k.body, k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0, k.toddler, now, true, air, k.shieldT > 0);
+        const air = (k.airT > 0 ? airHeight(k.airT, k.airMax) : 0) + hopHeight(k);
+        drawKart(ctx, k.x, k.y, k.angle + k.slip + k.trickA, k.spinA, k.kartIdx, k.paint, k.body, k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0, k.toddler, now, true, air, k.shieldT > 0);
       },
       tag: () => {
         drawTag(ctx, k.x, k.y - 52, isMe ? `⭐ ${k.name}` : k.name, kartColors(k.kartIdx, k.paint).color);
@@ -2116,17 +2467,24 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   for (const d of list) d.tag?.();
   }
 
-  // Speed lines while boosting
+  // Speed lines: wind streaks near top speed, stronger while boosting. Each
+  // streak has a fixed direction and flies outward, so they never flicker.
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  if (fast) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  const lineA = fast ? 0.5 : clamp((speedR - 0.82) / 0.18, 0, 1) * 0.35;
+  if (lineA > 0.01 && G.phase === 'racing' && !me.finished) {
     ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
     const cx = w / 2;
-    const cy = h / 2;
-    for (let i = 0; i < 16; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const r0 = Math.max(w, h) * (0.35 + Math.random() * 0.2);
-      const r1 = r0 + 60 + Math.random() * 80;
+    const cy = overlayOnly ? h * 0.4 : h / 2;
+    const R = Math.max(w, h);
+    for (let i = 0; i < 22; i++) {
+      const seed = Math.sin(i * 12.9898) * 43758.5453;
+      const fr = seed - Math.floor(seed);
+      const a = i * 2.39996 + fr * 0.5; // golden-angle spread
+      const life = ((now / 350 + fr) % 1);
+      const r0 = R * (0.18 + life * 0.5);
+      const r1 = r0 + R * (0.06 + 0.06 * fr) * (fast ? 1.6 : 1);
+      ctx.strokeStyle = `rgba(255,255,255,${(lineA * Math.sin(life * Math.PI)).toFixed(3)})`;
       ctx.beginPath();
       ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
       ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
@@ -2201,6 +2559,7 @@ type Hud = {
   air: boolean;
   hurry: number | null;
   draft: boolean;
+  improved: boolean;
 };
 type Screen = 'menu' | 'lobby' | 'race';
 
@@ -2215,7 +2574,7 @@ const MAX_PLAYERS = 5;
 const EMPTY_HUD: Hud = {
   place: 1, total: 1, lap: 1, laps: 3, time: '0:00.0', item: null, charges: 0, rolling: false, countdown: 4, finished: false,
   podium: false, boost: false, banner: null, bannerColor: '#fff', wrongWay: false, tier: 0, standings: [], coins: 0, air: false,
-  hurry: null, draft: false,
+  hurry: null, draft: false, improved: false,
 };
 
 function parseMeta(id: string, m: Meta | undefined): LobbyPlayer {
@@ -2290,6 +2649,7 @@ function computeHud(G: Game, now: number): Hud {
     air: me.airT > 0 && !me.trickDone && !me.toddler,
     hurry: hurry !== null && hurry <= 20 ? hurry : null,
     draft: me.draftC > 0.2 || me.draftT > 0,
+    improved: G.improved,
   };
 }
 
@@ -2526,6 +2886,12 @@ const ASSISTS = [
   { label: 'Lots', blurb: 'Follows the road by itself, you just nudge' },
 ];
 function AssistPicker({ value, onPick }: { value: number; onPick: (v: number) => void }) {
+  // The driving score lives in this browser only; read it after mount
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const sk = loadSkill();
+    setReady(sk.n >= 3 && sk.s >= 0.8);
+  }, []);
   return (
     <div className="mt-3 rounded-2xl bg-white/10 p-3 ring-1 ring-white/20">
       <div className="flex items-center gap-2 text-white">
@@ -2545,6 +2911,7 @@ function AssistPicker({ value, onPick }: { value: number; onPick: (v: number) =>
           </button>
         ))}
       </div>
+      {ready && value > 0 && <div className="mt-2 text-center text-sm font-black text-yellow-200">🌟 You&apos;re driving great! Ready to try less help?</div>}
     </div>
   );
 }
@@ -2636,7 +3003,7 @@ export default function BendanaKartPage() {
   const eventsRef = useRef(new EventLog());
   const samplerRef = useRef(new Sampler());
   const wakeRef = useRef<WakeLock | null>(null);
-  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false });
+  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false, ax: 0 });
   const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
@@ -2653,6 +3020,7 @@ export default function BendanaKartPage() {
   const emoteAtRef = useRef(0);
   const debugRef = useRef(false);
   const autodriveRef = useRef(false);
+  const testdriveRef = useRef<string | null>(null); // ?testdrive=0|1|2|t: a scripted driver for testing
 
   const multiplayerReady = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
@@ -2699,6 +3067,7 @@ export default function BendanaKartPage() {
       }
       debugRef.current = q.has('netdebug');
       autodriveRef.current = q.has('autodrive');
+      testdriveRef.current = q.get('testdrive');
     } catch {
       /* ignore */
     }
@@ -3225,6 +3594,12 @@ export default function BendanaKartPage() {
     const track = getTrackCanvas();
     const G = createGame(race, myIdRef.current, profileRef.current, rosterRef.current);
     G.autoDrift = isTouchRef.current;
+    const testdrive = testdriveRef.current;
+    if (testdrive) {
+      const me0 = G.karts[0];
+      me0.toddler = testdrive === 't';
+      me0.assist = me0.toddler ? 2 : clamp(parseInt(testdrive, 10) || 0, 0, 2);
+    }
     const events = eventsRef.current;
     events.clear();
     const sampler = samplerRef.current;
@@ -3239,7 +3614,7 @@ export default function BendanaKartPage() {
     const input = inputRef.current;
     input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
     // Merged input from keyboard/touch plus any connected gamepad
-    const merged: Input = { up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false };
+    const merged: Input = { up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false, ax: 0 };
     let padFirePrev = false;
     let padCamPrev = false;
     let driftPrev = false;
@@ -3250,6 +3625,18 @@ export default function BendanaKartPage() {
       merged.right = input.right;
       merged.drift = input.drift;
       merged.lookBack = input.lookBack;
+      merged.ax = 0;
+      if (testdrive) merged.up = true; // hold gas through the countdown, like ?autodrive
+      if (testdrive && G.phase === 'racing') {
+        // Press keys like a person would: on/off steering, brake for bends, drift long turns
+        const me0 = G.karts[0];
+        const a = autopilot(me0);
+        merged.up = true;
+        merged.left = a.steer < -0.15;
+        merged.right = a.steer > 0.15;
+        merged.down = a.brake > 0 && me0.assist === 0;
+        merged.drift = Math.abs(a.steer) > 0.6 && me0.assist < 2;
+      }
       try {
         const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
         for (const pad of pads) {
@@ -3258,8 +3645,10 @@ export default function BendanaKartPage() {
           const ax = pad.axes[0] ?? 0;
           merged.up = merged.up || b(0) || b(7) || b(12);
           merged.down = merged.down || b(1) || b(6) || b(13);
-          merged.left = merged.left || ax < -0.35 || b(14);
-          merged.right = merged.right || ax > 0.35 || b(15);
+          merged.left = merged.left || b(14);
+          merged.right = merged.right || b(15);
+          // Analog stick: a dead zone, then a gentle curve for fine control
+          if (Math.abs(ax) > 0.15 && Math.abs(ax) > Math.abs(merged.ax)) merged.ax = Math.sign(ax) * ((Math.abs(ax) - 0.15) / 0.85) ** 1.5;
           merged.drift = merged.drift || b(4) || b(5);
           const f = b(2);
           if (f && !padFirePrev) input.fire = true;
@@ -3323,7 +3712,7 @@ export default function BendanaKartPage() {
     window.addEventListener('resize', resize);
     window.addEventListener('orientationchange', resize);
 
-    const keyMap: Record<string, keyof Input> = {
+    const keyMap: Record<string, InputKey> = {
       KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down',
       KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
       ShiftLeft: 'drift', ShiftRight: 'drift', KeyK: 'drift',
@@ -3394,7 +3783,9 @@ export default function BendanaKartPage() {
         engineStart();
         engineOn = true;
       }
-      engineUpdate(me.finished ? 0 : Math.hypot(me.vx, me.vy) / me.stats.maxSpeed, me.boostT > 0 || me.padT > 0 || me.miniT > 0);
+      engineUpdate(me.finished ? 0 : Math.hypot(me.vx, me.vy) / me.stats.maxSpeed, me.boostT > 0 || me.padT > 0 || me.miniT > 0, {
+        drift: me.drifting ? 1 : 0, tier: me.tier, grass: me.offroad && me.airT <= 0, curb: me.curb && G.phase === 'racing',
+      });
       // Item button: a trick while in the air, otherwise use the item
       const driftEdge = inp.drift && !driftPrev;
       driftPrev = inp.drift;
@@ -3469,13 +3860,15 @@ export default function BendanaKartPage() {
           const col = kartColors(k.kartIdx, k.paint);
           karts.push({
             id: k.id, name: k.name, isMe: k.id === G.meId, x: k.x, y: k.y,
-            yaw: k.angle + (k.drifting ? k.driftDir * 0.35 : 0) + k.spinA + k.trickA, heading: k.angle,
+            yaw: k.angle + k.slip + k.spinA + k.trickA, heading: k.angle,
             speed: Math.hypot(k.vx, k.vy), maxSpeed: k.stats.maxSpeed,
             emoji: KARTS[k.kartIdx].emoji, color: col.color, dark: col.dark, body: k.body,
             boost: k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0, toddler: k.toddler,
             blink: k.invT > 0 && Math.floor(now / 90) % 2 === 0,
             drifting: k.drifting, driftDir: k.driftDir, spinning: k.spinT > 0, finished: k.finished,
-            air: k.airT > 0 ? airHeight(k.airT, k.airMax) : 0, shield: k.shieldT > 0, alpha: 1,
+            air: (k.airT > 0 ? airHeight(k.airT, k.airMax) : 0) + hopHeight(k), shield: k.shieldT > 0, alpha: 1,
+            steer: k.steer, slip: k.slip, hop: k.hopT > 0 ? hopHeight(k) / 7 : 0, bump: clamp(k.bumpT / 0.35, 0, 1),
+            land: k.landT, accel: k.accelS,
             bubble: k.react && now < k.react.until ? k.react.e : k.snoozeT > 0 ? '💤' : '',
           });
         }
@@ -3497,7 +3890,8 @@ export default function BendanaKartPage() {
           coins: G.coins.map((c) => ({ x: c.x, y: c.y, visible: now >= c.hiddenUntil })),
           bananas: G.bananas, blasts: G.blasts, particles: G.particles,
           countdownLeft: G.phase === 'countdown' ? G.goAt - now : null,
-          introMs: 2300, shake: G.shake, mode, lookBack: inp.lookBack,
+          introMs: 2300, shake: G.shake, mode, lookBack: inp.lookBack, kicks: me.kicks,
+          guide: showGuide(G) && me.help * 0.6 > 0.02 ? guideLine(me).map((p) => ({ x: p.x, y: p.y, c: p.c, a: p.a * me.help * 0.75 })) : null,
           orbitYaw: orbit.yaw, orbitPitch: orbit.pitch, orbitDist: orbit.dist,
           finishedFor: G.finishedAt ? now - G.finishedAt : -1,
         });
@@ -3518,6 +3912,18 @@ export default function BendanaKartPage() {
           hudKey = key;
           setHud(next);
         }
+      }
+      if (testdrive && now - debugAt > 500) {
+        debugAt = now;
+        const me0 = G.karts[0];
+        (window as unknown as { __bk: unknown }).__bk = {
+          phase: G.phase, lap: me0.lap, laps: G.laps, lapAt: G.lapAt, finished: me0.finished, finishTime: me0.finishTime,
+          help: me0.help, sc: me0.sc, drifts: me0.st.drifts, cleanLaps: G.cleanLaps, raceScore: G.raceScore,
+          place: rankRacers(racers(G)).findIndex((r) => r.isMe) + 1,
+          x: Math.round(me0.x), y: Math.round(me0.y), a: +me0.angle.toFixed(2), d: Math.round(me0.dist), v: Math.round(Math.hypot(me0.vx, me0.vy)),
+          idx: me0.idx, steer: +me0.steer.toFixed(2), auto: +me0.autoSteer.toFixed(2), spin: me0.spinT > 0, wrong: +me0.wrongT.toFixed(1),
+          bots: G.karts.slice(1).map((b) => ({ lap: b.lap, ft: b.finishTime, done: b.finished })),
+        };
       }
       if (debugRef.current && now - debugAt > 500) {
         debugAt = now;
@@ -3550,10 +3956,10 @@ export default function BendanaKartPage() {
   }, [screen, race]);
 
   // ---------- Touch controls ----------
-  const press = (key: keyof Input, on: boolean) => {
+  const press = (key: InputKey, on: boolean) => {
     inputRef.current[key] = on;
   };
-  const holdHandlers = (key: keyof Input) => ({
+  const holdHandlers = (key: InputKey) => ({
     onTouchStart: () => {
       lastTouchRef.current = Date.now();
       unlockAudio();
@@ -4081,6 +4487,7 @@ export default function BendanaKartPage() {
             <div className="rounded-[1.4rem] bg-slate-900/90 p-5 text-white">
               <div className="text-center text-6xl">{hud.place === 1 ? '🏆' : hud.place === 2 ? '🥈' : hud.place === 3 ? '🥉' : '🎉'}</div>
               <h2 className="mt-1 text-center text-3xl font-black">You finished {ordinal(hud.place)}!</h2>
+              {hud.improved && <p className="mt-1 text-center text-base font-black text-yellow-200">🌟 Your driving is getting better!</p>}
               <ol className="mt-4 flex flex-col gap-2">
                 {hud.standings.map((s) => (
                   <li key={s.id} className={`flex items-center gap-3 rounded-xl px-3 py-2 ${s.isMe ? 'bg-white/20 ring-2 ring-yellow-300' : 'bg-white/10'}`}>
