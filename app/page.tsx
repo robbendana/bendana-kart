@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import type { RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
+import { View3D, CAM_MODES, type CamMode, type KartView, type SceneTrack } from './view3d';
 
 /* =========================================================================
    Bendana Kart: a family kart racer.
@@ -229,6 +230,15 @@ const TRACKS: TrackDef[] = [
   },
 ];
 
+// Sky, horizon haze and distant hills for the 3D view, one per track
+const SKIES: { sky: string; horizon: string; hills: string; night: boolean }[] = [
+  { sky: '#7cc8ff', horizon: '#cdeaff', hills: '#3f8f47', night: false },
+  { sky: '#ffc4e6', horizon: '#ffe4f3', hills: '#c0477f', night: false },
+  { sky: '#bfdcff', horizon: '#eef6ff', hills: '#f8fafc', night: false },
+  { sky: '#ffcf87', horizon: '#ffe8c2', hills: '#c2410c', night: false },
+  { sky: '#2a0f0b', horizon: '#5b1d0f', hills: '#1c0d0a', night: true },
+];
+
 let TRACK_IDX = 0;
 let THEME: TrackDef = TRACKS[0];
 
@@ -374,9 +384,32 @@ function traceTrack(ctx: CanvasRenderingContext2D) {
   ctx.closePath();
 }
 
-const trackCanvasCache = new Map<number, HTMLCanvasElement>();
-function getTrackCanvas(): HTMLCanvasElement {
-  const cached = trackCanvasCache.get(TRACK_IDX);
+type SceneryItem = { x: number; y: number; e: string; size: number; big: boolean };
+const sceneryCache = new Map<number, SceneryItem[]>();
+function sceneryItems(): SceneryItem[] {
+  const cached = sceneryCache.get(TRACK_IDX);
+  if (cached) return cached;
+  const th = THEME;
+  const rnd = mulberry32(11 + TRACK_IDX * 7);
+  const out: SceneryItem[] = [];
+  for (let i = 0; i < 300; i++) {
+    const x = 50 + rnd() * (WORLD_W - 100);
+    const y = 50 + rnd() * (WORLD_H - 100);
+    const isBig = rnd() < 0.4;
+    const { dist } = nearestOnTrack(x, y, -1);
+    if (dist < HALF_W + (isBig ? 70 : 40)) continue;
+    const list = isBig ? th.big : th.small;
+    const e = list[Math.floor(rnd() * list.length)];
+    out.push({ x, y, e, size: isBig ? 46 + rnd() * 22 : 20 + rnd() * 10, big: isBig });
+  }
+  sceneryCache.set(TRACK_IDX, out);
+  return out;
+}
+
+const trackCanvasCache = new Map<string, HTMLCanvasElement>();
+function getTrackCanvas(flat = false): HTMLCanvasElement {
+  const cacheKey = `${TRACK_IDX}|${flat ? 1 : 0}`;
+  const cached = trackCanvasCache.get(cacheKey);
   if (cached) return cached;
   const c = document.createElement('canvas');
   c.width = WORLD_W;
@@ -393,22 +426,13 @@ function getTrackCanvas(): HTMLCanvasElement {
   ctx.strokeStyle = th.edge;
   ctx.lineWidth = 44;
   ctx.strokeRect(0, 0, WORLD_W, WORLD_H);
-  // Scenery on the grass
-  const rnd = mulberry32(11 + TRACK_IDX * 7);
-  const big = th.big;
-  const small = th.small;
-  for (let i = 0; i < 300; i++) {
-    const x = 50 + rnd() * (WORLD_W - 100);
-    const y = 50 + rnd() * (WORLD_H - 100);
-    const isBig = rnd() < 0.4;
-    const { dist } = nearestOnTrack(x, y, -1);
-    if (dist < HALF_W + (isBig ? 70 : 40)) continue;
-    const list = isBig ? big : small;
-    const e = list[Math.floor(rnd() * list.length)];
-    ctx.font = `${isBig ? 46 + rnd() * 22 : 20 + rnd() * 10}px ${EMOJI_FONT}`;
+  // Scenery on the grass (the 3D view stands the big pieces up as billboards)
+  for (const it of sceneryItems()) {
+    if (flat && it.big) continue;
+    ctx.font = `${it.size}px ${EMOJI_FONT}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(e, x, y);
+    ctx.fillText(it.e, it.x, it.y);
   }
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
@@ -450,7 +474,7 @@ function getTrackCanvas(): HTMLCanvasElement {
     col++;
   }
   ctx.restore();
-  trackCanvasCache.set(TRACK_IDX, c);
+  trackCanvasCache.set(cacheKey, c);
   return c;
 }
 
@@ -554,7 +578,7 @@ type Box = { id: string; x: number; y: number; hiddenUntil: number };
 type Banana = { id: string; x: number; y: number; owner: string; safeUntil: number };
 type Blast = { id: string; x: number; y: number; angle: number; owner: string; target: string | null; life: number };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number };
-type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean; drift: boolean };
+type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean; drift: boolean; lookBack: boolean };
 
 type Game = {
   mode: 'solo' | 'multi';
@@ -578,6 +602,7 @@ type Game = {
   gasAt: number | null;
   autoDrift: boolean;
   lastBump: number;
+  finishedAt: number; // performance.now() when I finished, 0 before
   send: (event: string, payload: Record<string, unknown>) => void;
 };
 
@@ -667,6 +692,7 @@ function createGame(mode: 'solo' | 'multi', order: string[], meId: string, profi
     gasAt: null,
     autoDrift: false,
     lastBump: 0,
+    finishedAt: 0,
     send: () => undefined,
   };
 }
@@ -1328,7 +1354,7 @@ function drawTag(ctx: CanvasRenderingContext2D, x: number, y: number, text: stri
   ctx.fillText(text, x, y + 1);
 }
 
-function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement, w: number, h: number, dpr: number, now: number) {
+function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement, w: number, h: number, dpr: number, now: number, overlayOnly = false) {
   const me = G.karts[0];
   const fast = me.boostT > 0 || me.miniT > 0;
   G.zoomK += ((fast ? 0.9 : 1) - G.zoomK) * 0.06;
@@ -1339,6 +1365,11 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   G.camY += (ty - G.camY) * 0.12;
   const shx = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
   const shy = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
+  if (overlayOnly) {
+    // The 3D view draws the world; this canvas only adds speed lines and the minimap
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+  } else {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = THEME.outside;
   ctx.fillRect(0, 0, w, h);
@@ -1432,6 +1463,7 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   list.sort((a, b) => a.y - b.y);
   for (const d of list) d.draw();
   for (const d of list) d.tag?.();
+  }
 
   // Speed lines while boosting
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1484,7 +1516,7 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
 }
 
 // ---------- React UI ----------
-type Profile = { name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number };
+type Profile = { name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number; cam: CamMode };
 type LobbyPlayer = { id: string; name: string; kartIdx: number; toddler: boolean; joinedAt: number; trackIdx: number; paint: number; body: number };
 type Standing = { id: string; name: string; kartIdx: number; place: number; time: string | null; isMe: boolean };
 type Hud = {
@@ -1528,7 +1560,7 @@ function computeHud(G: Game, now: number): Hud {
     item: rollingItem,
     rolling: !!me.item && me.rollT > 0,
     countdown,
-    finished: me.finished,
+    finished: me.finished && G.finishedAt > 0 && now - G.finishedAt > 2600,
     boost: me.boostT > 0 || me.miniT > 0,
     banner: G.banner && now < G.banner.until ? G.banner.text : null,
     bannerColor: G.banner ? G.banner.color : '#fff',
@@ -1704,7 +1736,7 @@ function ToddlerToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) 
 
 export default function BendanaKartPage() {
   const [screen, setScreen] = useState<Screen>('menu');
-  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0 });
+  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0, cam: 'chase' });
   const [joinCode, setJoinCode] = useState('');
   const [room, setRoom] = useState<string | null>(null);
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
@@ -1717,11 +1749,17 @@ export default function BendanaKartPage() {
   const [copied, setCopied] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvas3dRef = useRef<HTMLCanvasElement | null>(null);
+  // 360 cam angles, relative to the kart: yaw 0 is behind, PI is in front
+  const orbitRef = useRef({ yaw: 2.3, pitch: 0.35, dist: 160 });
+  const dragRef = useRef<{ id: number; x: number; y: number } | null>(null);
+  const cycleCamRef = useRef<() => void>(() => undefined);
+  const [camToast, setCamToast] = useState<{ text: string; key: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const gameRef = useRef<Game | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
   const supaRef = useRef<SupabaseClient | null>(null);
-  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false });
+  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false });
   const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
@@ -1748,6 +1786,7 @@ export default function BendanaKartPage() {
           muted: !!p.muted,
           paint: typeof p.paint === 'number' && p.paint >= -1 && p.paint < PAINTS.length ? p.paint : -1,
           body: typeof p.body === 'number' && p.body >= 0 && p.body < BODIES.length ? p.body : 0,
+          cam: CAM_MODES.some((m) => m.id === p.cam) ? (p.cam as CamMode) : 'chase',
         });
       }
     } catch {
@@ -1763,6 +1802,55 @@ export default function BendanaKartPage() {
       /* ignore */
     }
   }, []);
+
+  // Switch to the next camera (button, C key or controller Select)
+  const cycleCam = useCallback(() => {
+    const cur = profileRef.current.cam;
+    const i = CAM_MODES.findIndex((m) => m.id === cur);
+    const next = CAM_MODES[(i + 1) % CAM_MODES.length];
+    profileRef.current = { ...profileRef.current, cam: next.id };
+    setProfile((p) => ({ ...p, cam: next.id }));
+    setCamToast({ text: `${next.icon} ${next.label}${next.id === 'orbit' ? ': drag to spin around' : ''}`, key: Date.now() });
+  }, []);
+  cycleCamRef.current = cycleCam;
+  useEffect(() => {
+    if (!camToast) return;
+    const t = window.setTimeout(() => setCamToast(null), 1800);
+    return () => window.clearTimeout(t);
+  }, [camToast]);
+
+  // 360 cam: drag on the screen to swing around the kart, scroll to zoom
+  const orbitHandlers = {
+    onPointerDown: (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (profileRef.current.cam !== 'orbit' || dragRef.current) return;
+      dragRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY };
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const d = dragRef.current;
+      if (!d || d.id !== e.pointerId) return;
+      const o = orbitRef.current;
+      o.yaw -= (e.clientX - d.x) * 0.009;
+      o.pitch = clamp(o.pitch + (e.clientY - d.y) * 0.006, 0.06, 1.35);
+      d.x = e.clientX;
+      d.y = e.clientY;
+    },
+    onPointerUp: (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (dragRef.current?.id === e.pointerId) dragRef.current = null;
+    },
+    onPointerCancel: () => {
+      dragRef.current = null;
+    },
+    onWheel: (e: React.WheelEvent<HTMLCanvasElement>) => {
+      if (profileRef.current.cam !== 'orbit') return;
+      const o = orbitRef.current;
+      o.dist = clamp(o.dist * (1 + e.deltaY * 0.001), 70, 420);
+    },
+  };
 
   useEffect(() => {
     profileRef.current = profile;
@@ -2020,16 +2108,18 @@ export default function BendanaKartPage() {
     };
     gameRef.current = G;
     const input = inputRef.current;
-    input.up = input.down = input.left = input.right = input.fire = input.drift = false;
+    input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
     // Merged input from keyboard/touch plus any connected gamepad
-    const merged: Input = { up: false, down: false, left: false, right: false, fire: false, drift: false };
+    const merged: Input = { up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false };
     let padFirePrev = false;
+    let padCamPrev = false;
     const readInput = () => {
       merged.up = input.up;
       merged.down = input.down;
       merged.left = input.left;
       merged.right = input.right;
       merged.drift = input.drift;
+      merged.lookBack = input.lookBack;
       try {
         const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
         for (const pad of pads) {
@@ -2041,9 +2131,13 @@ export default function BendanaKartPage() {
           merged.left = merged.left || ax < -0.35 || b(14);
           merged.right = merged.right || ax > 0.35 || b(15);
           merged.drift = merged.drift || b(4) || b(5);
-          const f = b(2) || b(3);
+          const f = b(2);
           if (f && !padFirePrev) input.fire = true;
           padFirePrev = f;
+          merged.lookBack = merged.lookBack || b(3);
+          const c = b(8) || b(9);
+          if (c && !padCamPrev) cycleCamRef.current();
+          padCamPrev = c;
         }
       } catch {
         /* gamepads unavailable */
@@ -2076,6 +2170,32 @@ export default function BendanaKartPage() {
     let w = 1;
     let h = 1;
     let dpr = 1;
+    // 3D view, made the first time a 3D camera is used. If WebGL is not
+    // available the game stays in the top-down view.
+    const canvas3d = canvas3dRef.current;
+    let view: View3D | null = null;
+    let failed3d = !canvas3d;
+    const view3dRatio = () => Math.min(dpr, isTouchRef.current ? 1.5 : 2);
+    const getView = (): View3D | null => {
+      if (view || failed3d || !canvas3d) return view;
+      try {
+        view = new View3D(canvas3d, isTouchRef.current);
+        view.setSize(w, h, view3dRatio());
+        const sky = SKIES[TRACK_IDX] || SKIES[0];
+        const scene: SceneTrack = {
+          xs: TRACK.xs, ys: TRACK.ys, tx: TRACK.tx, ty: TRACK.ty, n: TRACK.n, halfW: HALF_W,
+          worldW: WORLD_W, worldH: WORLD_H, ground: getTrackCanvas(true),
+          big: sceneryItems().filter((it) => it.big),
+          sky: sky.sky, horizon: sky.horizon, hills: sky.hills, night: sky.night,
+          outside: THEME.outside, edge: THEME.edge,
+        };
+        view.setTrack(scene);
+      } catch {
+        view = null;
+        failed3d = true;
+      }
+      return view;
+    };
     const resize = () => {
       const r = wrap.getBoundingClientRect();
       w = Math.max(1, r.width);
@@ -2085,6 +2205,7 @@ export default function BendanaKartPage() {
       canvas.height = Math.round(h * dpr);
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
+      view?.setSize(w, h, view3dRatio());
     };
     resize();
     window.addEventListener('resize', resize);
@@ -2096,6 +2217,14 @@ export default function BendanaKartPage() {
       ShiftLeft: 'drift', ShiftRight: 'drift', KeyK: 'drift',
     };
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'KeyC') {
+        if (!e.repeat) cycleCamRef.current();
+        return;
+      }
+      if (e.code === 'KeyQ' || e.code === 'KeyB') {
+        input.lookBack = true;
+        return;
+      }
       if (e.code === 'Space') {
         e.preventDefault();
         if (!e.repeat) input.fire = true;
@@ -2108,11 +2237,12 @@ export default function BendanaKartPage() {
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'KeyQ' || e.code === 'KeyB') input.lookBack = false;
       const k = keyMap[e.code];
       if (k) input[k] = false;
     };
     const onBlur = () => {
-      input.up = input.down = input.left = input.right = input.drift = false;
+      input.up = input.down = input.left = input.right = input.drift = input.lookBack = false;
     };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -2166,7 +2296,48 @@ export default function BendanaKartPage() {
           });
         }
       }
-      render(ctx, G, track, w, h, dpr, now);
+      const me0 = G.karts[0];
+      if (me0.finished && !G.finishedAt) G.finishedAt = now;
+      const mode = profileRef.current.cam;
+      const v = mode !== 'top' ? getView() : null;
+      const show3d = !!v;
+      if (canvas3d && canvas3d.style.visibility !== (show3d ? 'visible' : 'hidden')) canvas3d.style.visibility = show3d ? 'visible' : 'hidden';
+      if (v) {
+        const karts: KartView[] = [];
+        for (const k of G.karts) {
+          const col = kartColors(k.kartIdx, k.paint);
+          karts.push({
+            id: k.id, name: k.name, isMe: k.id === G.meId, x: k.x, y: k.y,
+            yaw: k.angle + (k.drifting ? k.driftDir * 0.35 : 0) + k.spinA, heading: k.angle,
+            speed: Math.hypot(k.vx, k.vy), maxSpeed: k.stats.maxSpeed,
+            emoji: KARTS[k.kartIdx].emoji, color: col.color, dark: col.dark, body: k.body,
+            boost: k.boostT > 0 || k.miniT > 0, toddler: k.toddler,
+            blink: k.invT > 0 && Math.floor(now / 90) % 2 === 0,
+            drifting: k.drifting, driftDir: k.driftDir, spinning: k.spinT > 0, finished: k.finished,
+          });
+        }
+        G.remotes.forEach((r) => {
+          if (!r.snaps.length) return;
+          const col = kartColors(r.kartIdx, r.paint);
+          karts.push({
+            id: r.id, name: r.name, isMe: false, x: r.x, y: r.y, yaw: r.angle + r.spinA, heading: r.angle,
+            speed: r.speed, maxSpeed: 1, emoji: KARTS[r.kartIdx]?.emoji ?? '🏎️', color: col.color, dark: col.dark,
+            body: r.body, boost: r.boost, toddler: r.toddler, blink: false, drifting: false, driftDir: 0,
+            spinning: r.spinA !== 0, finished: r.finished,
+          });
+        });
+        const orbit = orbitRef.current;
+        v.render({
+          now, dt, karts,
+          boxes: G.boxes.map((b) => ({ x: b.x, y: b.y, visible: now >= b.hiddenUntil, ghost: now < b.hiddenUntil && b.hiddenUntil - now <= 500 })),
+          bananas: G.bananas, blasts: G.blasts, particles: G.particles,
+          countdownLeft: G.phase === 'countdown' ? G.goAt - now : null,
+          introMs: 2300, shake: G.shake, mode, lookBack: inp.lookBack,
+          orbitYaw: orbit.yaw, orbitPitch: orbit.pitch, orbitDist: orbit.dist,
+          finishedFor: G.finishedAt ? now - G.finishedAt : -1,
+        });
+      }
+      render(ctx, G, track, w, h, dpr, now, show3d);
       if (now - hudAt > 100) {
         hudAt = now;
         const next = computeHud(G, now);
@@ -2186,7 +2357,7 @@ export default function BendanaKartPage() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
-      input.up = input.down = input.left = input.right = input.fire = input.drift = false;
+      input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
       if (engine) {
         try {
           engine.osc.stop();
@@ -2196,6 +2367,8 @@ export default function BendanaKartPage() {
         }
       }
       if (gameRef.current === G) gameRef.current = null;
+      view?.dispose();
+      view = null;
     };
   }, [screen, race]);
 
@@ -2336,7 +2509,7 @@ export default function BendanaKartPage() {
           {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
 
           <p className="pb-4 text-center text-sm font-semibold text-white/85">
-            Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item. Game controllers work too. On a tablet, use the big buttons and hold a turn to drift.
+            Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item, C to switch camera, Q to look back. Game controllers work too (X item, Y look back, Select camera). On a tablet, use the big buttons, hold a turn to drift, and tap 🎥 to switch camera.
           </p>
         </div>
       </main>
@@ -2440,7 +2613,8 @@ export default function BendanaKartPage() {
   return (
     <main className="no-touch-ui fixed inset-0 overflow-hidden bg-slate-900" onContextMenu={(e) => e.preventDefault()}>
       <div ref={wrapRef} className="absolute inset-0">
-        <canvas ref={canvasRef} className="block h-full w-full" />
+        <canvas ref={canvas3dRef} className="absolute inset-0 block h-full w-full" style={{ visibility: 'hidden' }} />
+        <canvas ref={canvasRef} {...orbitHandlers} className="absolute inset-0 block h-full w-full touch-none" />
       </div>
 
       {/* Top HUD */}
@@ -2466,6 +2640,16 @@ export default function BendanaKartPage() {
         <div className="flex items-start gap-2">
           <button
             type="button"
+            onClick={cycleCam}
+            className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
+            aria-label="Switch camera"
+            title="Switch camera (C)"
+          >
+            {(CAM_MODES.find((m) => m.id === profile.cam) || CAM_MODES[0]).icon}
+            <span className="ml-1 hidden sm:inline">{(CAM_MODES.find((m) => m.id === profile.cam) || CAM_MODES[0]).label}</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setProfile((p) => ({ ...p, muted: !p.muted }))}
             className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
             aria-label={profile.muted ? 'Sound on' : 'Sound off'}
@@ -2475,9 +2659,10 @@ export default function BendanaKartPage() {
           <button
             type="button"
             onClick={race?.mode === 'multi' ? backToLobby : quitToMenu}
-            className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
+            className="pointer-events-auto whitespace-nowrap rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
+            aria-label="Quit"
           >
-            ✕ Quit
+            ✕<span className="ml-1 hidden sm:inline">Quit</span>
           </button>
         </div>
       </div>
@@ -2497,6 +2682,11 @@ export default function BendanaKartPage() {
           >
             {hud.banner}
           </div>
+        </div>
+      )}
+      {camToast && (
+        <div key={camToast.key} className="pointer-events-none absolute inset-x-0 top-[10.5rem] flex justify-center sm:top-44">
+          <div className="rounded-full bg-slate-900/80 px-5 py-2 text-lg font-black text-white shadow-xl ring-2 ring-white/30">{camToast.text}</div>
         </div>
       )}
       {hud.wrongWay && (
@@ -2528,7 +2718,7 @@ export default function BendanaKartPage() {
       )}
       {hud.countdown !== null && hud.countdown > 0 && !isTouch && (
         <div className="pointer-events-none absolute inset-x-0 bottom-8 text-center text-lg font-bold text-white drop-shadow">
-          W A S D or arrows to drive · Shift to drift · Space for items · hold gas just before GO for a rocket start!
+          W A S D or arrows to drive · Shift to drift · Space for items · C camera · Q look back · hold gas just before GO for a rocket start!
         </div>
       )}
 
@@ -2554,9 +2744,16 @@ export default function BendanaKartPage() {
             </div>
           )}
           <div className="flex items-end gap-2 sm:gap-3">
-            <button type="button" aria-label="Use item" {...fireHandlers} className={`${btn} h-16 w-16 sm:h-20 sm:w-20 bg-gradient-to-b from-yellow-300/80 to-orange-500/80 text-4xl`}>
-              {hud.item ? ITEMS[hud.item].emoji : '🎁'}
-            </button>
+            <div className="flex flex-col items-center gap-2 sm:gap-3">
+              {profile.cam !== 'top' && (
+                <button type="button" aria-label="Look back" {...holdHandlers('lookBack')} className={`${btn} h-12 w-16 rounded-2xl bg-slate-900/45 text-2xl sm:h-14 sm:w-20`}>
+                  👀
+                </button>
+              )}
+              <button type="button" aria-label="Use item" {...fireHandlers} className={`${btn} h-16 w-16 sm:h-20 sm:w-20 bg-gradient-to-b from-yellow-300/80 to-orange-500/80 text-4xl`}>
+                {hud.item ? ITEMS[hud.item].emoji : '🎁'}
+              </button>
+            </div>
             <div className="flex flex-col items-center gap-2 sm:gap-3">
               {!profile.toddler && (
                 <button type="button" aria-label="Brake" {...holdHandlers('down')} className={`${btn} h-14 w-20 rounded-2xl bg-red-500/70 text-base sm:h-16 sm:w-24 sm:text-lg`}>
