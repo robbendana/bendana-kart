@@ -96,11 +96,91 @@ function mulberry32(seed: number) {
 }
 
 // ---------- Track geometry (closed Catmull-Rom spline through waypoints) ----------
-const WAYPOINTS: Vec[] = [
-  [300, 820], [300, 420], [480, 230], [780, 240], [940, 430], [1150, 560], [1360, 420], [1520, 230],
-  [1860, 210], [2120, 360], [2160, 660], [1960, 830], [1700, 860], [1600, 1010], [1800, 1160], [2060, 1260],
-  [2060, 1430], [1700, 1490], [1300, 1410], [1100, 1210], [850, 1150], [650, 1380], [400, 1410], [270, 1160],
-].map(([x, y]) => ({ x, y }));
+type TrackDef = {
+  name: string;
+  emoji: string;
+  blurb: string;
+  points: number[][];
+  grassA: string;
+  grassB: string;
+  edge: string;
+  outside: string;
+  road: string;
+  roadInner: string;
+  curbA: string;
+  curbB: string;
+  line: string;
+  big: string[];
+  small: string[];
+  grip: number; // multiplies kart grip (ice is slippery)
+  offroad: number; // top speed multiplier off the road
+  dust: string;
+  card: string;
+};
+
+const TRACKS: TrackDef[] = [
+  {
+    name: 'Sunny Meadow', emoji: '🌻', blurb: 'Grassy hills and flower patches',
+    points: [
+      [300, 820], [300, 420], [480, 230], [780, 240], [940, 430], [1150, 560], [1360, 420], [1520, 230],
+      [1860, 210], [2120, 360], [2160, 660], [1960, 830], [1700, 860], [1600, 1010], [1800, 1160], [2060, 1260],
+      [2060, 1420], [1700, 1460], [1300, 1400], [1100, 1210], [850, 1150], [650, 1370], [400, 1400], [270, 1160],
+    ],
+    grassA: '#5fbf5a', grassB: '#6acb62', edge: '#2f7d32', outside: '#1f6f2a',
+    road: '#4b5563', roadInner: '#535e6e', curbA: '#ffffff', curbB: '#ef4444', line: 'rgba(255,255,255,0.5)',
+    big: ['🌳', '🌲', '🌴', '🪨', '🏠'], small: ['🌼', '🌷', '🍄', '🌻', '🌸'],
+    grip: 1, offroad: 0.42, dust: '#a16207', card: 'from-green-400 to-emerald-600',
+  },
+  {
+    name: 'Candy Canyon', emoji: '🍭', blurb: 'Chocolate roads through a sweet shop',
+    points: [
+      [300, 320], [900, 250], [1200, 470], [1500, 250], [2100, 300], [2160, 690], [1770, 930], [2160, 1180],
+      [2100, 1380], [1500, 1380], [1200, 1160], [900, 1380], [300, 1360], [240, 840],
+    ],
+    grassA: '#f9a8d4', grassB: '#fbcfe8', edge: '#db2777', outside: '#9d174d',
+    road: '#7c4a2d', roadInner: '#8b5a3c', curbA: '#ffffff', curbB: '#ec4899', line: 'rgba(255,230,240,0.7)',
+    big: ['🍭', '🧁', '🍩', '🎂', '🍦'], small: ['🍬', '🍫', '🍪', '🍓', '🍒'],
+    grip: 1, offroad: 0.45, dust: '#f472b6', card: 'from-pink-400 to-fuchsia-600',
+  },
+  {
+    name: 'Frosty Peaks', emoji: '⛄', blurb: 'Slippery ice, so steer early!',
+    points: [
+      [400, 1300], [300, 900], [400, 450], [800, 250], [1200, 400], [1300, 720], [1100, 950], [1250, 1150],
+      [1700, 1180], [1920, 1060], [1840, 790], [1650, 600], [1800, 300], [2150, 350], [2220, 800], [2200, 1250],
+      [2000, 1460], [700, 1460],
+    ],
+    grassA: '#f1f5f9', grassB: '#e2e8f0', edge: '#94a3b8', outside: '#64748b',
+    road: '#7dd3fc', roadInner: '#a5e1fb', curbA: '#ffffff', curbB: '#3b82f6', line: 'rgba(255,255,255,0.8)',
+    big: ['⛄', '🌲', '🏔️', '🧊', '🏠'], small: ['❄️', '🐧', '🧣', '⭐', '🎿'],
+    grip: 0.55, offroad: 0.45, dust: '#ffffff', card: 'from-sky-300 to-blue-600',
+  },
+  {
+    name: 'Dusty Dunes', emoji: '🌵', blurb: 'Hairpin turns in the hot desert',
+    points: [
+      [250, 800], [300, 300], [700, 200], [800, 600], [1000, 900], [1300, 700], [1250, 300], [1650, 200],
+      [2150, 250], [2210, 650], [1840, 860], [2210, 1140], [2100, 1440], [1500, 1400], [1100, 1250], [700, 1440],
+      [300, 1350],
+    ],
+    grassA: '#fcd34d', grassB: '#fde68a', edge: '#b45309', outside: '#92400e',
+    road: '#a16207', roadInner: '#b07519', curbA: '#ffffff', curbB: '#f97316', line: 'rgba(255,255,255,0.55)',
+    big: ['🌵', '🐪', '🏜️', '🪨', '🛖'], small: ['🦂', '🌾', '🦎', '🐚', '☀️'],
+    grip: 1.05, offroad: 0.38, dust: '#d97706', card: 'from-amber-300 to-orange-600',
+  },
+  {
+    name: 'Volcano Loop', emoji: '🌋', blurb: 'Tight twists past glowing lava',
+    points: [
+      [1200, 1420], [500, 1420], [250, 1100], [400, 750], [820, 820], [900, 560], [600, 420], [800, 230],
+      [1250, 260], [1500, 420], [1400, 700], [1700, 840], [2000, 560], [2200, 820], [2150, 1200], [1800, 1300], [1500, 1150],
+    ],
+    grassA: '#3f2a26', grassB: '#47302b', edge: '#f97316', outside: '#1c1210',
+    road: '#27272a', roadInner: '#303034', curbA: '#fde047', curbB: '#ef4444', line: 'rgba(253,224,71,0.6)',
+    big: ['🌋', '🔥', '🪨', '💎', '🏰'], small: ['🔥', '🦴', '💀', '🍄', '✨'],
+    grip: 1, offroad: 0.34, dust: '#f97316', card: 'from-orange-500 to-red-800',
+  },
+];
+
+let TRACK_IDX = 0;
+let THEME: TrackDef = TRACKS[0];
 
 type Track = { xs: Float32Array; ys: Float32Array; tx: Float32Array; ty: Float32Array; n: number };
 
@@ -113,14 +193,15 @@ function catmull(p0: Vec, p1: Vec, p2: Vec, p3: Vec, t: number): Vec {
   };
 }
 
-function buildTrack(): Track {
+function buildTrack(def: TrackDef): Track {
   const raw: Vec[] = [];
-  const m = WAYPOINTS.length;
+  const wp: Vec[] = def.points.map(([x, y]) => ({ x, y }));
+  const m = wp.length;
   for (let i = 0; i < m; i++) {
-    const p0 = WAYPOINTS[(i - 1 + m) % m];
-    const p1 = WAYPOINTS[i];
-    const p2 = WAYPOINTS[(i + 1) % m];
-    const p3 = WAYPOINTS[(i + 2) % m];
+    const p0 = wp[(i - 1 + m) % m];
+    const p1 = wp[i];
+    const p2 = wp[(i + 1) % m];
+    const p3 = wp[(i + 2) % m];
     let len = 0;
     let prev = p1;
     for (let s = 1; s <= 24; s++) {
@@ -150,7 +231,15 @@ function buildTrack(): Track {
   return { xs, ys, tx, ty, n };
 }
 
-const TRACK = buildTrack();
+let TRACK = buildTrack(TRACKS[0]);
+
+function setTrack(i: number) {
+  const idx = clamp(Math.floor(i) || 0, 0, TRACKS.length - 1);
+  if (idx === TRACK_IDX && TRACK) return;
+  TRACK_IDX = idx;
+  THEME = TRACKS[idx];
+  TRACK = buildTrack(THEME);
+}
 
 function nearestOnTrack(x: number, y: number, hint: number): { idx: number; dist: number } {
   const { xs, ys, n } = TRACK;
@@ -235,27 +324,29 @@ function traceTrack(ctx: CanvasRenderingContext2D) {
   ctx.closePath();
 }
 
-let trackCanvasCache: HTMLCanvasElement | null = null;
+const trackCanvasCache = new Map<number, HTMLCanvasElement>();
 function getTrackCanvas(): HTMLCanvasElement {
-  if (trackCanvasCache) return trackCanvasCache;
+  const cached = trackCanvasCache.get(TRACK_IDX);
+  if (cached) return cached;
   const c = document.createElement('canvas');
   c.width = WORLD_W;
   c.height = WORLD_H;
   const ctx = c.getContext('2d');
   if (!ctx) return c;
-  // Mowed lawn stripes
+  const th = THEME;
+  // Ground stripes
   for (let x = 0; x < WORLD_W; x += 80) {
-    ctx.fillStyle = (x / 80) % 2 === 0 ? '#5fbf5a' : '#6acb62';
+    ctx.fillStyle = (x / 80) % 2 === 0 ? th.grassA : th.grassB;
     ctx.fillRect(x, 0, 80, WORLD_H);
   }
-  // Hedge border
-  ctx.strokeStyle = '#2f7d32';
+  // Border
+  ctx.strokeStyle = th.edge;
   ctx.lineWidth = 44;
   ctx.strokeRect(0, 0, WORLD_W, WORLD_H);
   // Scenery on the grass
-  const rnd = mulberry32(11);
-  const big = ['🌳', '🌲', '🌴', '🪨', '🏠'];
-  const small = ['🌼', '🌷', '🍄', '🌻', '🌸'];
+  const rnd = mulberry32(11 + TRACK_IDX * 7);
+  const big = th.big;
+  const small = th.small;
   for (let i = 0; i < 300; i++) {
     const x = 50 + rnd() * (WORLD_W - 100);
     const y = 50 + rnd() * (WORLD_H - 100);
@@ -276,21 +367,21 @@ function getTrackCanvas(): HTMLCanvasElement {
   ctx.strokeStyle = 'rgba(0,0,0,0.18)';
   ctx.lineWidth = HALF_W * 2 + 44;
   ctx.stroke();
-  ctx.strokeStyle = '#ffffff';
+  ctx.strokeStyle = th.curbA;
   ctx.lineWidth = HALF_W * 2 + 24;
   ctx.stroke();
   ctx.setLineDash([30, 30]);
-  ctx.strokeStyle = '#ef4444';
+  ctx.strokeStyle = th.curbB;
   ctx.stroke();
   ctx.setLineDash([]);
-  ctx.strokeStyle = '#4b5563';
+  ctx.strokeStyle = th.road;
   ctx.lineWidth = HALF_W * 2;
   ctx.stroke();
-  ctx.strokeStyle = '#535e6e';
+  ctx.strokeStyle = th.roadInner;
   ctx.lineWidth = HALF_W * 1.3;
   ctx.stroke();
   ctx.setLineDash([40, 40]);
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.strokeStyle = th.line;
   ctx.lineWidth = 6;
   ctx.stroke();
   ctx.setLineDash([]);
@@ -309,12 +400,13 @@ function getTrackCanvas(): HTMLCanvasElement {
     col++;
   }
   ctx.restore();
-  trackCanvasCache = c;
+  trackCanvasCache.set(TRACK_IDX, c);
   return c;
 }
 
 // ---------- Sound (generated tones, no audio files) ----------
 let audioCtx: AudioContext | null = null;
+let MUTED = false;
 function unlockAudio() {
   try {
     if (!audioCtx) {
@@ -328,7 +420,7 @@ function unlockAudio() {
 }
 function beep(freq: number, dur: number, type: OscillatorType = 'square', vol = 0.04) {
   try {
-    if (!audioCtx || audioCtx.state !== 'running') return;
+    if (MUTED || !audioCtx || audioCtx.state !== 'running') return;
     const o = audioCtx.createOscillator();
     const g = audioCtx.createGain();
     o.type = type;
@@ -371,6 +463,16 @@ type Kart = {
   botTimer: number;
   lane: number;
   skill: number;
+  drifting: boolean;
+  driftDir: number;
+  charge: number;
+  tier: number;
+  miniT: number;
+  stallT: number;
+  invT: number;
+  offT: number;
+  wrongT: number;
+  steerHeldT: number;
 };
 
 type Snap = { t: number; x: number; y: number; a: number };
@@ -397,7 +499,7 @@ type Box = { id: string; x: number; y: number; hiddenUntil: number };
 type Banana = { id: string; x: number; y: number; owner: string; safeUntil: number };
 type Blast = { id: string; x: number; y: number; angle: number; owner: string; target: string | null; life: number };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number };
-type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean };
+type Input = { up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean; drift: boolean };
 
 type Game = {
   mode: 'solo' | 'multi';
@@ -415,6 +517,12 @@ type Game = {
   lastSend: number;
   sendInterval: number;
   lastBeep: number;
+  shake: number;
+  zoomK: number;
+  banner: { text: string; color: string; until: number } | null;
+  gasAt: number | null;
+  autoDrift: boolean;
+  lastBump: number;
   send: (event: string, payload: Record<string, unknown>) => void;
 };
 
@@ -441,6 +549,8 @@ function makeKart(id: string, name: string, kartIdx: number, slot: number, toddl
     botTimer: 1 + Math.random() * 2,
     lane: bot ? (Math.random() - 0.5) * 70 : 0,
     skill: bot ? 0.84 + Math.random() * 0.06 : 1,
+    drifting: false, driftDir: 0, charge: 0, tier: 0, miniT: 0, stallT: 0,
+    invT: 0, offT: 0, wrongT: 0, steerHeldT: 0,
   };
 }
 
@@ -489,6 +599,12 @@ function createGame(mode: 'solo' | 'multi', order: string[], meId: string, profi
     // other screens smooth the gaps by interpolating.
     sendInterval: players <= 2 ? 150 : players === 3 ? 200 : 250,
     lastBeep: 4,
+    shake: 0,
+    zoomK: 1,
+    banner: null,
+    gasAt: null,
+    autoDrift: false,
+    lastBump: 0,
     send: () => undefined,
   };
 }
@@ -525,15 +641,24 @@ function spawnParticles(G: Game, x: number, y: number, count: number, colorFn: (
   }
 }
 
+function setBanner(G: Game, text: string, color: string, ms: number) {
+  G.banner = { text, color, until: performance.now() + ms };
+}
+
 function spinOut(G: Game, k: Kart) {
-  if (k.toddler) return; // Toddler Assist karts are invincible
+  if (k.toddler || k.invT > 0 || k.spinT > 0) return; // Toddler Assist karts are invincible
   k.spinT = 1;
   k.boostT = 0;
+  k.miniT = 0;
+  k.drifting = false;
+  k.charge = 0;
+  k.tier = 0;
+  if (k.id === G.meId) G.shake = 12;
   spawnParticles(G, k.x, k.y, 14, () => '#fde047', 220, 0.6, 7);
   if (k.id === G.meId) beep(180, 0.35, 'sawtooth', 0.05);
 }
 
-function autopilot(k: Kart): { steer: number; throttle: number } {
+function autopilot(k: Kart): { steer: number; throttle: number; brake: number } {
   const { xs, ys, tx, ty, n } = TRACK;
   const speed = Math.hypot(k.vx, k.vy);
   const look = Math.round(9 + speed / 45);
@@ -543,8 +668,13 @@ function autopilot(k: Kart): { steer: number; throttle: number } {
   const diff = wrapAngle(Math.atan2(py - k.y, px - k.x) - k.angle);
   const steer = clamp(diff * 2.8, -1, 1);
   const ad = Math.abs(diff);
+  // Slow down before sharp bends: compare the road direction here and ahead
+  const j2 = (k.idx + 26) % n;
+  const bend = Math.abs(wrapAngle(Math.atan2(ty[j2], tx[j2]) - Math.atan2(ty[k.idx], tx[k.idx])));
+  const target = KARTS[k.kartIdx].maxSpeed * clamp(1.2 - bend * 0.6, 0.45, 1);
+  if (speed > target + 40 && k.boostT <= 0) return { steer, throttle: 0, brake: 0.5 };
   const throttle = ad > 0.9 ? 0.25 : ad > 0.5 && speed > 320 ? 0.55 : 1;
-  return { steer, throttle };
+  return { steer, throttle, brake: 0 };
 }
 
 function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul: number) {
@@ -561,7 +691,12 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
     maxS = st.maxSpeed * 1.6 * speedMul;
     acc *= 2.4;
     throttle = 1;
+  } else if (k.miniT > 0) {
+    maxS = st.maxSpeed * 1.3 * speedMul;
+    acc *= 2;
+    throttle = 1;
   }
+  if (k.stallT > 0) throttle = 0;
   if (throttle > 0 && fwd < maxS) fwd = Math.min(maxS, fwd + acc * throttle * dt);
   if (brake > 0) {
     if (fwd > 20) fwd -= 950 * brake * dt;
@@ -575,9 +710,9 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   if (fwd > maxS) fwd = Math.max(maxS, fwd - (off ? 1500 : 500) * dt);
   fwd *= 1 - 0.12 * dt;
   const sf = clamp(Math.abs(fwd) / 160, 0, 1);
-  const turnRate = st.turn * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
+  const turnRate = st.turn * (k.drifting ? 1.15 : 1) * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
   k.angle = wrapAngle(k.angle + k.steer * turnRate * sf * (fwd >= 0 ? 1 : -1) * dt);
-  const lat = lat0 * Math.exp(-st.grip * dt);
+  const lat = lat0 * Math.exp(-st.grip * THEME.grip * (k.drifting ? 0.55 : 1) * dt);
   fx = Math.cos(k.angle);
   fy = Math.sin(k.angle);
   k.vx = fx * fwd - fy * lat;
@@ -592,9 +727,11 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
 }
 
 function rollItem(place: number, total: number): ItemKind {
+  // Leaders mostly get bananas to defend with; karts at the back get boosts
+  // and homing blasts to catch up, which keeps family races close.
   const behind = total > 1 ? (place - 1) / (total - 1) : 0.5; // 0 = leader, 1 = last
-  const pRocket = 0.2 + behind * 0.3;
-  const pBanana = 0.55 - behind * 0.45;
+  const pRocket = 0.3 + behind * 0.25;
+  const pBanana = 0.7 - behind * 0.7;
   const r = Math.random();
   if (r < pRocket) return 'rocket';
   if (r < pRocket + pBanana) return 'banana';
@@ -651,11 +788,28 @@ function step(G: Game, dt: number, now: number, input: Input) {
       G.lastBeep = left;
       beep(440, 0.15, 'square', 0.05);
     }
+    // Rocket start: hold gas during the last moment of the countdown
+    if (input.up) {
+      if (G.gasAt === null) G.gasAt = now;
+    } else G.gasAt = null;
     if (now >= G.goAt) {
       G.phase = 'racing';
       beep(880, 0.4, 'square', 0.06);
+      const meK = G.karts[0];
+      if (input.up && G.gasAt !== null) {
+        const held = G.goAt - G.gasAt;
+        if (meK.toddler || held <= 800) {
+          meK.boostT = meK.toddler ? 0.8 : 1.1;
+          setBanner(G, '🚀 ROCKET START!', '#facc15', 1400);
+        } else if (held > 1700) {
+          meK.stallT = 0.6;
+          setBanner(G, '💨 Too early!', '#94a3b8', 1200);
+        }
+      }
+      for (const b of G.karts) if (b.bot && Math.random() < 0.4) b.boostT = 0.8;
     }
   }
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 40);
   const racing = G.phase === 'racing';
   const all = racers(G);
   const ranked = rankRacers(all);
@@ -672,6 +826,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
         const a = autopilot(k);
         steerTarget = a.steer;
         throttle = k.finished ? 0.5 : a.throttle;
+        brake = k.finished ? 0 : a.brake;
         if (k.bot) {
           speedMul = k.skill;
           if (k.progress < me.progress - 150) speedMul += 0.12;
@@ -683,8 +838,10 @@ function step(G: Game, dt: number, now: number, input: Input) {
         if (k.toddler) {
           const a = autopilot(k);
           steerTarget = a.steer;
-          if (throttle > 0) throttle = a.throttle;
-          brake = 0;
+          if (throttle > 0) {
+            throttle = a.throttle;
+            brake = a.brake;
+          } else brake = 0;
         } else {
           steerTarget = (input.right ? 1 : 0) - (input.left ? 1 : 0);
         }
@@ -693,16 +850,57 @@ function step(G: Game, dt: number, now: number, input: Input) {
     if (k.bot || k.toddler || k.finished) k.steer = steerTarget;
     else k.steer += clamp(steerTarget - k.steer, -dt * 7, dt * 7);
 
+    // Drifting and mini-turbo (human drivers only). Keyboard: hold Shift while
+    // turning. Touch: keep holding a turn at speed and the drift starts itself.
+    if (isMe && !k.toddler && !k.finished) {
+      const st = KARTS[k.kartIdx];
+      const fwdSpeed = k.vx * Math.cos(k.angle) + k.vy * Math.sin(k.angle);
+      k.steerHeldT = Math.abs(steerTarget) > 0.5 ? k.steerHeldT + dt : 0;
+      const wantDrift = racing && k.spinT <= 0 && (input.drift || (G.autoDrift && k.steerHeldT > 0.3));
+      if (!k.drifting) {
+        if (wantDrift && fwdSpeed > st.maxSpeed * 0.4 && Math.abs(steerTarget) > 0.3) {
+          k.drifting = true;
+          k.driftDir = Math.sign(steerTarget);
+          k.charge = 0;
+          k.tier = 0;
+          beep(220, 0.08, 'triangle', 0.04);
+        }
+      } else if (!wantDrift || fwdSpeed < st.maxSpeed * 0.25 || (G.autoDrift && steerTarget * k.driftDir <= 0)) {
+        if (k.tier > 0) {
+          k.miniT = [0, 0.6, 0.9, 1.3][k.tier];
+          beep([0, 523, 659, 784][k.tier], 0.25, 'triangle', 0.06);
+        }
+        k.drifting = false;
+        k.charge = 0;
+        k.tier = 0;
+      } else {
+        const into = steerTarget * k.driftDir;
+        k.charge += dt * (into > 0.2 ? 1 : 0.4);
+        const tier = k.charge >= 2.4 ? 3 : k.charge >= 1.5 ? 2 : k.charge >= 0.7 ? 1 : 0;
+        if (tier > k.tier) beep([0, 523, 659, 784][tier], 0.1, 'sine', 0.05);
+        k.tier = tier;
+        k.steer = k.driftDir * clamp(0.6 + 0.35 * into, 0.25, 0.95);
+      }
+    } else {
+      k.drifting = false;
+    }
+
     if (k.spinT > 0) {
       k.spinT -= dt;
       k.spinA = (1 - Math.max(0, k.spinT)) * Math.PI * 2;
       k.vx *= Math.exp(-2.8 * dt);
       k.vy *= Math.exp(-2.8 * dt);
       k.steer = 0;
-      if (k.spinT <= 0) k.spinA = 0;
+      if (k.spinT <= 0) {
+        k.spinA = 0;
+        k.invT = 1;
+      }
     }
     if (k.boostT > 0) k.boostT -= dt;
+    if (k.miniT > 0) k.miniT -= dt;
     if (k.rollT > 0) k.rollT -= dt;
+    if (k.stallT > 0) k.stallT -= dt;
+    if (k.invT > 0 && k.spinT <= 0) k.invT -= dt;
 
     drive(k, dt, k.spinT > 0 ? 0 : throttle, k.spinT > 0 ? 0 : brake, speedMul);
 
@@ -712,16 +910,47 @@ function step(G: Game, dt: number, now: number, input: Input) {
     k.idx = near.idx;
     k.offroad = near.dist > HALF_W;
     const n = TRACK.n;
-    if (prev > n * 0.75 && k.idx < n * 0.25) k.lap++;
-    else if (prev < n * 0.25 && k.idx > n * 0.75) k.lap--;
+    if (prev > n * 0.75 && k.idx < n * 0.25) {
+      k.lap++;
+      if (isMe && k.lap >= 2 && k.lap <= LAPS) {
+        if (k.lap === LAPS) {
+          setBanner(G, '🏁 FINAL LAP!', '#f472b6', 2000);
+          [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.15, 'triangle', 0.05), i * 110));
+        } else {
+          setBanner(G, `LAP ${k.lap}/${LAPS}`, '#ffffff', 1500);
+          beep(659, 0.12, 'triangle', 0.05);
+          setTimeout(() => beep(880, 0.2, 'triangle', 0.05), 120);
+        }
+      }
+    } else if (prev < n * 0.25 && k.idx > n * 0.75) k.lap--;
     k.progress = k.lap * n + k.idx;
+
+    // Wrong-way warning and auto-respawn when stuck far off the road
+    const speedNow = Math.hypot(k.vx, k.vy);
+    const facing = Math.cos(k.angle) * TRACK.tx[k.idx] + Math.sin(k.angle) * TRACK.ty[k.idx];
+    k.wrongT = racing && facing < -0.3 && speedNow > 40 ? k.wrongT + dt : 0;
+    k.offT = racing && near.dist > HALF_W * 1.9 ? k.offT + dt : 0;
+    if (k.offT > 2.5) {
+      const j = near.idx;
+      k.x = TRACK.xs[j];
+      k.y = TRACK.ys[j];
+      k.angle = Math.atan2(TRACK.ty[j], TRACK.tx[j]);
+      k.vx = 0;
+      k.vy = 0;
+      k.offT = 0;
+      k.invT = 1.5;
+      k.drifting = false;
+      spawnParticles(G, k.x, k.y, 20, () => '#ffffff', 200, 0.6, 8);
+      if (isMe) setBanner(G, '✨ Back on track!', '#a5f3fc', 1200);
+    }
     if (!k.finished && k.lap > LAPS) {
       k.finished = true;
       k.finishTime = now - G.goAt;
       if (isMe) {
         G.send('finish', { id: k.id, name: k.name, k: k.kartIdx, ft: Math.round(k.finishTime) });
-        beep(660, 0.2, 'triangle', 0.06);
-        setTimeout(() => beep(990, 0.4, 'triangle', 0.06), 180);
+        [523, 659, 784, 1047, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.18, 'triangle', 0.06), i * 140));
+        spawnParticles(G, k.x, k.y, 160, (i) => `hsl(${(i * 37) % 360},95%,60%)`, 520, 1.6, 7);
+        k.drifting = false;
       }
     }
 
@@ -737,8 +966,25 @@ function step(G: Game, dt: number, now: number, input: Input) {
           life: 0.5, max: 0.5, color: `hsl(${(now / 3 + i * 60) % 360},100%,60%)`, size: 9,
         });
       }
+    } else if (k.miniT > 0) {
+      const c = k.miniT > 0.9 ? '#e879f9' : k.miniT > 0.6 ? '#fb923c' : '#60a5fa';
+      for (let i = 0; i < 2; i++) {
+        G.particles.push({ x: k.x - Math.cos(k.angle) * 28, y: k.y - Math.sin(k.angle) * 28, vx: (Math.random() - 0.5) * 80, vy: (Math.random() - 0.5) * 80, life: 0.35, max: 0.35, color: c, size: 7 });
+      }
     } else if (k.offroad && !k.toddler && speed > 120 && Math.random() < 0.5) {
-      G.particles.push({ x: k.x, y: k.y, vx: (Math.random() - 0.5) * 60, vy: (Math.random() - 0.5) * 60, life: 0.5, max: 0.5, color: '#a16207', size: 6 });
+      G.particles.push({ x: k.x, y: k.y, vx: (Math.random() - 0.5) * 60, vy: (Math.random() - 0.5) * 60, life: 0.5, max: 0.5, color: THEME.dust, size: 6 });
+    }
+
+    if (k.drifting && k.tier > 0) {
+      const c = ['', '#60a5fa', '#fb923c', '#e879f9'][k.tier];
+      for (const side of [-1, 1]) {
+        if (G.particles.length > 450) G.particles.shift();
+        const bx = k.x - Math.cos(k.angle) * 18 - Math.sin(k.angle) * 16 * side;
+        const by = k.y - Math.sin(k.angle) * 18 + Math.cos(k.angle) * 16 * side;
+        G.particles.push({ x: bx, y: by, vx: (Math.random() - 0.5) * 140, vy: (Math.random() - 0.5) * 140, life: 0.25, max: 0.25, color: c, size: 4 + k.tier });
+      }
+    } else if (k.stallT > 0 && Math.random() < 0.5) {
+      G.particles.push({ x: k.x - Math.cos(k.angle) * 30, y: k.y - Math.sin(k.angle) * 30, vx: (Math.random() - 0.5) * 40, vy: -40, life: 0.6, max: 0.6, color: '#9ca3af', size: 9 });
     }
 
     if (!racing) continue;
@@ -833,6 +1079,11 @@ function step(G: Game, dt: number, now: number, input: Input) {
         k.y += (dy / d) * push;
         k.vx *= 0.97;
         k.vy *= 0.97;
+        if (k.id === G.meId && now - G.lastBump > 400) {
+          G.lastBump = now;
+          G.shake = Math.max(G.shake, 4);
+          beep(120, 0.06, 'square', 0.05);
+        }
       }
     }
   }
@@ -965,15 +1216,19 @@ function drawTag(ctx: CanvasRenderingContext2D, x: number, y: number, text: stri
 
 function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement, w: number, h: number, dpr: number, now: number) {
   const me = G.karts[0];
-  const zoom = clamp(Math.min(w, h) / 720, 0.5, 1.35);
-  const tx = me.x + me.vx * 0.25;
-  const ty = me.y + me.vy * 0.25;
+  const fast = me.boostT > 0 || me.miniT > 0;
+  G.zoomK += ((fast ? 0.9 : 1) - G.zoomK) * 0.06;
+  const zoom = clamp(Math.min(w, h) / 720, 0.5, 1.35) * G.zoomK;
+  const tx = me.x + me.vx * 0.3;
+  const ty = me.y + me.vy * 0.3;
   G.camX += (tx - G.camX) * 0.12;
   G.camY += (ty - G.camY) * 0.12;
+  const shx = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
+  const shy = G.shake > 0 ? (Math.random() - 0.5) * G.shake : 0;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#1f6f2a';
+  ctx.fillStyle = THEME.outside;
   ctx.fillRect(0, 0, w, h);
-  ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * (w / 2 - G.camX * zoom), dpr * (h / 2 - G.camY * zoom));
+  ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * (w / 2 - G.camX * zoom + shx), dpr * (h / 2 - G.camY * zoom + shy));
   ctx.drawImage(track, 0, 0);
 
   // Item boxes
@@ -1045,7 +1300,10 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
     const isMe = k.id === G.meId;
     list.push({
       y: k.y,
-      draw: () => drawKart(ctx, k.x, k.y, k.angle, k.spinA, k.kartIdx, k.boostT > 0, k.toddler, now),
+      draw: () => {
+        if (k.invT > 0 && Math.floor(now / 90) % 2 === 0) return;
+        drawKart(ctx, k.x, k.y, k.angle + (k.drifting ? k.driftDir * 0.35 : 0), k.spinA, k.kartIdx, k.boostT > 0 || k.miniT > 0, k.toddler, now);
+      },
       tag: () => drawTag(ctx, k.x, k.y - 52, isMe ? `⭐ ${k.name}` : k.name, KARTS[k.kartIdx].color),
     });
   }
@@ -1061,9 +1319,26 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   for (const d of list) d.draw();
   for (const d of list) d.tag?.();
 
-  // Minimap
+  // Speed lines while boosting
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const mw = clamp(w * 0.22, 110, 190);
+  if (fast) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = 2;
+    const cx = w / 2;
+    const cy = h / 2;
+    for (let i = 0; i < 16; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r0 = Math.max(w, h) * (0.35 + Math.random() * 0.2);
+      const r1 = r0 + 60 + Math.random() * 80;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+      ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+      ctx.stroke();
+    }
+  }
+
+  // Minimap
+  const mw = Math.min(clamp(w * 0.22, 100, 190), (h * 0.26 * WORLD_W) / WORLD_H);
   const ms = mw / WORLD_W;
   const mh = WORLD_H * ms;
   const mx = w - mw - 12;
@@ -1095,8 +1370,8 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
 }
 
 // ---------- React UI ----------
-type Profile = { name: string; kartIdx: number; toddler: boolean };
-type LobbyPlayer = { id: string; name: string; kartIdx: number; toddler: boolean; joinedAt: number };
+type Profile = { name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean };
+type LobbyPlayer = { id: string; name: string; kartIdx: number; toddler: boolean; joinedAt: number; trackIdx: number };
 type Standing = { id: string; name: string; kartIdx: number; place: number; time: string | null; isMe: boolean };
 type Hud = {
   place: number;
@@ -1108,12 +1383,16 @@ type Hud = {
   countdown: number | null;
   finished: boolean;
   boost: boolean;
+  banner: string | null;
+  bannerColor: string;
+  wrongWay: boolean;
+  tier: number;
   standings: Standing[];
 };
-type RaceCfg = { mode: 'solo' | 'multi'; order: string[]; nonce: number };
+type RaceCfg = { mode: 'solo' | 'multi'; order: string[]; track: number; nonce: number };
 type Screen = 'menu' | 'lobby' | 'race';
 
-const EMPTY_HUD: Hud = { place: 1, total: 1, lap: 1, time: '0:00.0', item: null, rolling: false, countdown: 3, finished: false, boost: false, standings: [] };
+const EMPTY_HUD: Hud = { place: 1, total: 1, lap: 1, time: '0:00.0', item: null, rolling: false, countdown: 3, finished: false, boost: false, banner: null, bannerColor: '#fff', wrongWay: false, tier: 0, standings: [] };
 
 function computeHud(G: Game, now: number): Hud {
   const me = G.karts[0];
@@ -1136,7 +1415,11 @@ function computeHud(G: Game, now: number): Hud {
     rolling: !!me.item && me.rollT > 0,
     countdown,
     finished: me.finished,
-    boost: me.boostT > 0,
+    boost: me.boostT > 0 || me.miniT > 0,
+    banner: G.banner && now < G.banner.until ? G.banner.text : null,
+    bannerColor: G.banner ? G.banner.color : '#fff',
+    wrongWay: me.wrongT > 1 && !me.finished,
+    tier: me.drifting ? me.tier : 0,
     standings,
   };
 }
@@ -1182,6 +1465,29 @@ function KartPicker({ value, onPick, compact }: { value: number; onPick: (i: num
   );
 }
 
+function TrackPicker({ value, onPick, disabled }: { value: number; onPick: (i: number) => void; disabled?: boolean }) {
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      {TRACKS.map((t, i) => {
+        const active = i === value;
+        return (
+          <button
+            key={t.name}
+            type="button"
+            disabled={disabled && !active}
+            onClick={() => onPick(i)}
+            className={`rounded-2xl bg-gradient-to-br ${t.card} p-3 text-center transition active:scale-95 disabled:opacity-40 ${active ? 'scale-[1.03] shadow-xl ring-4 ring-white' : 'opacity-85 ring-2 ring-white/20 hover:opacity-100'}`}
+          >
+            <div className="text-4xl drop-shadow">{t.emoji}</div>
+            <div className="mt-1 text-sm font-black text-white drop-shadow">{t.name}</div>
+            <div className="mt-0.5 text-[11px] font-bold leading-tight text-white/85">{t.blurb}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function ToddlerToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   return (
     <button
@@ -1203,7 +1509,7 @@ function ToddlerToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) 
 
 export default function BendanaKartPage() {
   const [screen, setScreen] = useState<Screen>('menu');
-  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false });
+  const [profile, setProfile] = useState<Profile>({ name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false });
   const [joinCode, setJoinCode] = useState('');
   const [room, setRoom] = useState<string | null>(null);
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
@@ -1220,7 +1526,8 @@ export default function BendanaKartPage() {
   const gameRef = useRef<Game | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
   const supaRef = useRef<SupabaseClient | null>(null);
-  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false });
+  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false });
+  const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
   const myIdRef = useRef('');
@@ -1242,12 +1549,16 @@ export default function BendanaKartPage() {
           name: typeof p.name === 'string' ? p.name.slice(0, 14) : '',
           kartIdx: typeof p.kartIdx === 'number' && p.kartIdx >= 0 && p.kartIdx < KARTS.length ? p.kartIdx : 0,
           toddler: !!p.toddler,
+          trackIdx: typeof p.trackIdx === 'number' && p.trackIdx >= 0 && p.trackIdx < TRACKS.length ? p.trackIdx : 0,
+          muted: !!p.muted,
         });
       }
     } catch {
       /* storage unavailable */
     }
-    setIsTouch('ontouchstart' in window || navigator.maxTouchPoints > 0);
+    const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    isTouchRef.current = touch;
+    setIsTouch(touch);
     try {
       const code = new URLSearchParams(window.location.search).get('room');
       if (code && /^[A-Za-z]{4}$/.test(code)) setJoinCode(code.toUpperCase());
@@ -1258,6 +1569,7 @@ export default function BendanaKartPage() {
 
   useEffect(() => {
     profileRef.current = profile;
+    MUTED = profile.muted;
     try {
       window.localStorage.setItem('bendana-kart-profile', JSON.stringify(profile));
     } catch {
@@ -1275,9 +1587,9 @@ export default function BendanaKartPage() {
     return supaRef.current;
   }, []);
 
-  const startRace = useCallback((mode: 'solo' | 'multi', order: string[]) => {
+  const startRace = useCallback((mode: 'solo' | 'multi', order: string[], track: number) => {
     setHud(EMPTY_HUD);
-    setRace({ mode, order, nonce: Date.now() + Math.random() });
+    setRace({ mode, order, track: clamp(Math.floor(track) || 0, 0, TRACKS.length - 1), nonce: Date.now() + Math.random() });
     setScreen('race');
   }, []);
 
@@ -1308,7 +1620,7 @@ export default function BendanaKartPage() {
     const ch = channelRef.current;
     if (!ch) return;
     const p = profileRef.current;
-    void ch.track({ name: p.name || 'Racer', kartIdx: p.kartIdx, toddler: p.toddler, joinedAt: joinedAtRef.current });
+    void ch.track({ name: p.name || 'Racer', kartIdx: p.kartIdx, toddler: p.toddler, trackIdx: p.trackIdx, joinedAt: joinedAtRef.current });
   }, []);
 
   const joinRoom = useCallback((code: string) => {
@@ -1339,6 +1651,7 @@ export default function BendanaKartPage() {
           kartIdx: clamp(Number(m.kartIdx) || 0, 0, KARTS.length - 1),
           toddler: !!m.toddler,
           joinedAt: Number(m.joinedAt) || 0,
+          trackIdx: clamp(Number(m.trackIdx) || 0, 0, TRACKS.length - 1),
         });
       }
       list.sort((a, b) => a.joinedAt - b.joinedAt || a.id.localeCompare(b.id));
@@ -1425,7 +1738,9 @@ export default function BendanaKartPage() {
     });
     ch.on('broadcast', { event: 'race_start' }, ({ payload }) => {
       const order = Array.isArray(payload?.order) ? (payload.order as unknown[]).map(String) : playersRef.current.map((p) => p.id);
-      startRace('multi', order);
+      const host = playersRef.current[0];
+      const track = typeof payload?.track === 'number' ? payload.track : host ? host.trackIdx : 0;
+      startRace('multi', order, track);
     });
     ch.on('broadcast', { event: 'to_lobby' }, () => {
       setScreen('lobby');
@@ -1463,8 +1778,9 @@ export default function BendanaKartPage() {
     if (!ch) return;
     const order = playersRef.current.map((p) => p.id);
     if (!order.includes(myIdRef.current)) order.push(myIdRef.current);
-    void ch.send({ type: 'broadcast', event: 'race_start', payload: { order } });
-    startRace('multi', order);
+    const track = profileRef.current.trackIdx;
+    void ch.send({ type: 'broadcast', event: 'race_start', payload: { order, track } });
+    startRace('multi', order, track);
   };
 
   const backToLobby = () => {
@@ -1492,15 +1808,69 @@ export default function BendanaKartPage() {
     if (!canvas || !wrap) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    setTrack(race.track);
     const track = getTrackCanvas();
     const G = createGame(race.mode, race.order, myIdRef.current, profileRef.current);
+    G.autoDrift = isTouchRef.current;
+    MUTED = profileRef.current.muted;
     G.send = (event, payload) => {
       const ch = channelRef.current;
       if (G.mode === 'multi' && ch) void ch.send({ type: 'broadcast', event, payload }).catch(() => undefined);
     };
     gameRef.current = G;
     const input = inputRef.current;
-    input.up = input.down = input.left = input.right = input.fire = false;
+    input.up = input.down = input.left = input.right = input.fire = input.drift = false;
+    // Merged input from keyboard/touch plus any connected gamepad
+    const merged: Input = { up: false, down: false, left: false, right: false, fire: false, drift: false };
+    let padFirePrev = false;
+    const readInput = () => {
+      merged.up = input.up;
+      merged.down = input.down;
+      merged.left = input.left;
+      merged.right = input.right;
+      merged.drift = input.drift;
+      try {
+        const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+        for (const pad of pads) {
+          if (!pad) continue;
+          const b = (i: number) => !!pad.buttons[i]?.pressed;
+          const ax = pad.axes[0] ?? 0;
+          merged.up = merged.up || b(0) || b(7) || b(12);
+          merged.down = merged.down || b(1) || b(6) || b(13);
+          merged.left = merged.left || ax < -0.35 || b(14);
+          merged.right = merged.right || ax > 0.35 || b(15);
+          merged.drift = merged.drift || b(4) || b(5);
+          const f = b(2) || b(3);
+          if (f && !padFirePrev) input.fire = true;
+          padFirePrev = f;
+        }
+      } catch {
+        /* gamepads unavailable */
+      }
+      return merged;
+    };
+
+    // Engine hum: a soft low tone whose pitch follows your speed
+    let engine: { osc: OscillatorNode; gain: GainNode } | null = null;
+    try {
+      if (audioCtx && !MUTED) {
+        const osc = audioCtx.createOscillator();
+        const filter = audioCtx.createBiquadFilter();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.value = 70;
+        filter.type = 'lowpass';
+        filter.frequency.value = 500;
+        gain.gain.value = 0.018;
+        osc.connect(filter);
+        filter.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        engine = { osc, gain };
+      }
+    } catch {
+      engine = null;
+    }
 
     let w = 1;
     let h = 1;
@@ -1522,6 +1892,7 @@ export default function BendanaKartPage() {
     const keyMap: Record<string, keyof Input> = {
       KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down',
       KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
+      ShiftLeft: 'drift', ShiftRight: 'drift', KeyK: 'drift',
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Space') {
@@ -1540,7 +1911,7 @@ export default function BendanaKartPage() {
       if (k) input[k] = false;
     };
     const onBlur = () => {
-      input.up = input.down = input.left = input.right = false;
+      input.up = input.down = input.left = input.right = input.drift = false;
     };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -1557,13 +1928,19 @@ export default function BendanaKartPage() {
       last = now;
       if (dt > 0.1) dt = 0.1;
       if (dt < 0) dt = 0;
+      const inp = readInput();
       let rem = dt;
       while (rem > 1e-6) {
         const s = Math.min(rem, 1 / 60);
-        step(G, s, now, input);
+        step(G, s, now, inp);
         rem -= s;
       }
       const me = G.karts[0];
+      if (engine && audioCtx) {
+        const ratio = Math.hypot(me.vx, me.vy) / KARTS[me.kartIdx].maxSpeed;
+        engine.osc.frequency.setTargetAtTime(70 + 150 * ratio, audioCtx.currentTime, 0.05);
+        engine.gain.gain.setTargetAtTime(me.finished ? 0 : 0.012 + 0.012 * Math.min(1, ratio), audioCtx.currentTime, 0.1);
+      }
       if (input.fire) {
         input.fire = false;
         fireItem(G, me, now);
@@ -1608,7 +1985,15 @@ export default function BendanaKartPage() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
-      input.up = input.down = input.left = input.right = input.fire = false;
+      input.up = input.down = input.left = input.right = input.fire = input.drift = false;
+      if (engine) {
+        try {
+          engine.osc.stop();
+          engine.osc.disconnect();
+        } catch {
+          /* already stopped */
+        }
+      }
       if (gameRef.current === G) gameRef.current = null;
     };
   }, [screen, race]);
@@ -1693,6 +2078,11 @@ export default function BendanaKartPage() {
           </section>
 
           <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
+            <h2 className="mb-3 text-lg font-black text-white">3. Pick a track</h2>
+            <TrackPicker value={profile.trackIdx} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
+          </section>
+
+          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
           </section>
 
@@ -1701,7 +2091,7 @@ export default function BendanaKartPage() {
               type="button"
               onClick={() => {
                 unlockAudio();
-                startRace('solo', []);
+                startRace('solo', [], profile.trackIdx);
               }}
               className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 px-4 py-5 text-xl font-black text-slate-900 shadow-lg active:scale-95"
             >
@@ -1745,7 +2135,7 @@ export default function BendanaKartPage() {
           {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
 
           <p className="pb-4 text-center text-sm font-semibold text-white/85">
-            Keyboard: W A S D or arrow keys to drive, Space to use an item. On a tablet, use the big buttons.
+            Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item. Game controllers work too. On a tablet, use the big buttons and hold a turn to drift.
           </p>
         </div>
       </main>
@@ -1797,6 +2187,17 @@ export default function BendanaKartPage() {
             {players.length === 1 && netStatus === 'connected' && (
               <p className="mt-3 text-center text-sm font-bold text-white/80">Waiting for others to join…</p>
             )}
+          </section>
+
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
+            <h2 className="text-lg font-black text-white">{isHost ? 'Pick the track' : `Track (👑 ${players[0]?.name ?? 'host'} picks)`}</h2>
+            <TrackPicker
+              value={isHost ? profile.trackIdx : players[0]?.trackIdx ?? 0}
+              disabled={!isHost}
+              onPick={(i) => {
+                if (isHost) setProfile((p) => ({ ...p, trackIdx: i }));
+              }}
+            />
           </section>
 
           <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
@@ -1861,7 +2262,15 @@ export default function BendanaKartPage() {
           <span className={`text-4xl sm:text-5xl ${hud.rolling ? 'animate-pulse' : ''}`}>{hud.item ? ITEMS[hud.item].emoji : '❔'}</span>
           <span className="text-[10px] font-black uppercase text-slate-700">{hud.item && !hud.rolling ? ITEMS[hud.item].label : 'Item'}</span>
         </button>
-        <div className="flex flex-col items-end gap-2">
+        <div className="flex items-start gap-2">
+          <button
+            type="button"
+            onClick={() => setProfile((p) => ({ ...p, muted: !p.muted }))}
+            className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
+            aria-label={profile.muted ? 'Sound on' : 'Sound off'}
+          >
+            {profile.muted ? '🔇' : '🔊'}
+          </button>
           <button
             type="button"
             onClick={race?.mode === 'multi' ? backToLobby : quitToMenu}
@@ -1878,6 +2287,33 @@ export default function BendanaKartPage() {
         </div>
       )}
 
+      {hud.banner && hud.countdown === null && (
+        <div className="pointer-events-none absolute inset-x-0 top-1/3 flex justify-center">
+          <div
+            key={hud.banner}
+            className="animate-[bounce_0.6s_ease-out_2] rounded-3xl bg-slate-900/70 px-6 py-3 text-4xl font-black drop-shadow-[0_4px_0_rgba(0,0,0,0.4)] sm:text-6xl"
+            style={{ color: hud.bannerColor }}
+          >
+            {hud.banner}
+          </div>
+        </div>
+      )}
+      {hud.wrongWay && (
+        <div className="pointer-events-none absolute inset-x-0 top-[45%] flex justify-center">
+          <div className="animate-pulse rounded-3xl bg-red-600/90 px-6 py-3 text-4xl font-black text-white shadow-2xl">↻ WRONG WAY</div>
+        </div>
+      )}
+      {hud.tier > 0 && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-36 flex justify-center sm:bottom-40">
+          <div
+            className="rounded-full px-5 py-1 text-xl font-black text-white shadow-lg"
+            style={{ background: ['', '#3b82f6', '#f97316', '#d946ef'][hud.tier] }}
+          >
+            DRIFT {'🔥'.repeat(hud.tier)}
+          </div>
+        </div>
+      )}
+
       {/* Countdown */}
       {hud.countdown !== null && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -1891,32 +2327,38 @@ export default function BendanaKartPage() {
       )}
       {hud.countdown !== null && hud.countdown > 0 && !isTouch && (
         <div className="pointer-events-none absolute inset-x-0 bottom-8 text-center text-lg font-bold text-white drop-shadow">
-          W A S D or arrow keys to drive · Space to use your item
+          W A S D or arrows to drive · Shift to drift · Space for items · hold gas just before GO for a rocket start!
+        </div>
+      )}
+
+      {hud.countdown !== null && hud.countdown > 0 && isTouch && (
+        <div className="pointer-events-none absolute inset-x-0 top-[26%] px-4 text-center text-base font-black text-white drop-shadow">
+          {profile.toddler ? 'Hold GAS to go!' : 'Tap GAS right before GO for a rocket start! Hold a turn to drift.'}
         </div>
       )}
 
       {/* Touch controls */}
       {isTouch && !hud.finished && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-between gap-2 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           {profile.toddler ? (
             <div className="rounded-2xl bg-sky-400/80 px-4 py-3 text-base font-black text-slate-900 shadow">🛡️ Auto-steer</div>
           ) : (
-            <div className="flex gap-3">
-              <button type="button" aria-label="Steer left" {...holdHandlers('left')} className={`${btn} h-24 w-24 bg-slate-900/45 text-5xl sm:h-28 sm:w-28`}>
+            <div className="flex gap-2 sm:gap-3">
+              <button type="button" aria-label="Steer left" {...holdHandlers('left')} className={`${btn} h-20 w-20 bg-slate-900/45 text-4xl sm:h-28 sm:w-28 sm:text-5xl`}>
                 ◀
               </button>
-              <button type="button" aria-label="Steer right" {...holdHandlers('right')} className={`${btn} h-24 w-24 bg-slate-900/45 text-5xl sm:h-28 sm:w-28`}>
+              <button type="button" aria-label="Steer right" {...holdHandlers('right')} className={`${btn} h-20 w-20 bg-slate-900/45 text-4xl sm:h-28 sm:w-28 sm:text-5xl`}>
                 ▶
               </button>
             </div>
           )}
-          <div className="flex items-end gap-3">
-            <button type="button" aria-label="Use item" {...fireHandlers} className={`${btn} h-20 w-20 bg-gradient-to-b from-yellow-300/80 to-orange-500/80 text-4xl`}>
+          <div className="flex items-end gap-2 sm:gap-3">
+            <button type="button" aria-label="Use item" {...fireHandlers} className={`${btn} h-16 w-16 sm:h-20 sm:w-20 bg-gradient-to-b from-yellow-300/80 to-orange-500/80 text-4xl`}>
               {hud.item ? ITEMS[hud.item].emoji : '🎁'}
             </button>
-            <div className="flex flex-col items-center gap-3">
+            <div className="flex flex-col items-center gap-2 sm:gap-3">
               {!profile.toddler && (
-                <button type="button" aria-label="Brake" {...holdHandlers('down')} className={`${btn} h-16 w-24 rounded-2xl bg-red-500/70 text-lg`}>
+                <button type="button" aria-label="Brake" {...holdHandlers('down')} className={`${btn} h-14 w-20 rounded-2xl bg-red-500/70 text-base sm:h-16 sm:w-24 sm:text-lg`}>
                   BRAKE
                 </button>
               )}
@@ -1924,7 +2366,7 @@ export default function BendanaKartPage() {
                 type="button"
                 aria-label="Gas"
                 {...holdHandlers('up')}
-                className={`${btn} ${profile.toddler ? 'h-36 w-36 text-3xl' : 'h-28 w-28 text-2xl'} bg-gradient-to-b from-lime-400/85 to-green-600/85`}
+                className={`${btn} ${profile.toddler ? 'h-32 w-32 text-3xl sm:h-36 sm:w-36' : 'h-24 w-24 text-2xl sm:h-28 sm:w-28'} bg-gradient-to-b from-lime-400/85 to-green-600/85`}
               >
                 GAS
               </button>
@@ -1952,7 +2394,7 @@ export default function BendanaKartPage() {
               </ol>
               <div className="mt-5 flex flex-col gap-2">
                 {race?.mode === 'solo' && (
-                  <button type="button" onClick={() => startRace('solo', [])} className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95">
+                  <button type="button" onClick={() => startRace('solo', [], profile.trackIdx)} className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95">
                     🔁 Race again
                   </button>
                 )}
