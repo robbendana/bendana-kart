@@ -3,7 +3,9 @@
 A top-down family kart racer for phones, tablets and computers. Up to four
 players race each other live from different devices.
 
-- **Karts:** 🏎️ Red Flash, 🦖 Dino Turbo, 🦄 Cosmic Dash, 🦍 Kong Kart, each with its own speed, acceleration and steering.
+- **16 racers:** 🏎️ Red Flash, 🦖 Dino Turbo, 🦄 Cosmic Dash, 🦍 Kong Kart, 🤖 Robo Racer, 🐶 Rocket Pup, 🐱 Kitty Comet, 🐰 Bunny Hop, 🐢 Turbo Turtle, 🐧 Penguin Slide, 🐉 Blaze Dragon, 👽 Zippy Alien, 🦊 Foxy Flame, 🐼 Panda Pop, 🦁 Lion Roar and 🐝 Sparkle Bee, each with its own speed, acceleration, steering and grip.
+- **6 kart bodies:** Classic, Speedster, Monster Truck (bounces over grass), Jet Racer, Mini Buggy and Bubble Car. They change the look and the stats.
+- **10 paint jobs** to color your kart.
 - **Toddler Assist (🛡️):** the kart steers itself and can't be spun out. Just hold GAS.
 - **Items from 🎁 boxes:** 🚀 Turbo Rocket (2 second boost), 🍌 Banana Peel (spins out whoever hits it), 💥 Homing Blast (chases the kart ahead).
 - **5 tracks:** 🌻 Sunny Meadow, 🍭 Candy Canyon, ⛄ Frosty Peaks (slippery ice), 🌵 Dusty Dunes, 🌋 Volcano Loop. The host picks the track for everyone.
