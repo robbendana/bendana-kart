@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { View3D, CAM_MODES, type CamMode, type KartView, type SceneTrack } from './view3d';
+import { KartShowcase } from './kart3d';
 import {
   beep, sfx, unlockAudio, setMuted, setMusicOn, setHaptics, startMusic, stopMusic, setMusicIntensity,
   playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning,
@@ -1712,6 +1713,7 @@ function drawKart(
 ) {
   const spec = KARTS[kartIdx] || KARTS[0];
   const col = kartColors(kartIdx, paint);
+  const spinning = Math.abs(spinA) > 0.01;
   ctx.save();
   ctx.translate(x, y);
   ctx.fillStyle = air > 0 ? 'rgba(0,0,0,0.16)' : 'rgba(0,0,0,0.25)';
@@ -1735,50 +1737,85 @@ function drawKart(
     [22, 17, 17, 10, 6],
   ];
   const [hl, hw, cr, wl, ww] = shapes[body] || shapes[0];
-  if (boost) {
-    const fl = 18 + Math.sin(t / 30) * 6;
-    ctx.fillStyle = '#f97316';
-    ctx.beginPath();
-    ctx.moveTo(-hl, -9);
-    ctx.lineTo(-hl - fl, 0);
-    ctx.lineTo(-hl, 9);
-    ctx.fill();
-    ctx.fillStyle = '#fde047';
-    ctx.beginPath();
-    ctx.moveTo(-hl, -5);
-    ctx.lineTo(-hl - fl * 0.6, 0);
-    ctx.lineTo(-hl, 5);
-    ctx.fill();
+  const roll = (t / 40) % 6;
+  // Exhaust flames
+  if (boost || body === 3) {
+    const fl = (boost ? 18 : 7) + Math.sin(t / 30) * (boost ? 6 : 2);
+    for (const s of body === 3 || body === 1 ? [-7, 7] : [-4, 4]) {
+      ctx.fillStyle = boost ? '#f97316' : 'rgba(56,189,248,0.75)';
+      ctx.beginPath();
+      ctx.moveTo(-hl - 2, s - 4);
+      ctx.lineTo(-hl - 2 - fl, s);
+      ctx.lineTo(-hl - 2, s + 4);
+      ctx.fill();
+      ctx.fillStyle = boost ? '#fde047' : 'rgba(224,242,254,0.9)';
+      ctx.beginPath();
+      ctx.moveTo(-hl - 2, s - 2);
+      ctx.lineTo(-hl - 2 - fl * 0.55, s);
+      ctx.lineTo(-hl - 2, s + 2);
+      ctx.fill();
+    }
   }
   if (body === 3) {
-    // Jet Racer: twin glowing thrusters instead of wheels
-    ctx.fillStyle = `rgba(56,189,248,${0.5 + Math.sin(t / 60) * 0.2})`;
-    ctx.beginPath();
-    ctx.ellipse(-hl - 4, -7, 7, 4, 0, 0, Math.PI * 2);
-    ctx.ellipse(-hl - 4, 7, 7, 4, 0, 0, Math.PI * 2);
-    ctx.fill();
+    // Jet Racer: wings and glowing hover pads instead of wheels
+    ctx.fillStyle = `rgba(103,232,249,${0.45 + Math.sin(t / 60) * 0.2})`;
+    for (const [px, py] of [[-14, -8], [-14, 8], [14, -8], [14, 8]]) {
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = col.dark;
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(4, s * hw);
+      ctx.lineTo(-6, s * (hw + 13));
+      ctx.lineTo(-15, s * (hw + 13));
+      ctx.lineTo(-14, s * hw);
+      ctx.fill();
+    }
   } else {
-    ctx.fillStyle = '#111827';
+    // Axles
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-hl * 0.62, -hw - ww + 3);
+    ctx.lineTo(-hl * 0.62, hw + ww - 3);
+    ctx.moveTo(hl * 0.55, -hw - ww + 3);
+    ctx.lineTo(hl * 0.55, hw + ww - 3);
+    ctx.stroke();
+    // Tyres with rolling tread marks
     const wx1 = -hl * 0.62 - wl / 2;
     const wx2 = hl * 0.55 - wl / 2;
     for (const [wx, wy] of [[wx1, -hw - ww + 2], [wx2, -hw - ww + 2], [wx1, hw - 2], [wx2, hw - 2]]) {
-      roundRectPath(ctx, wx, wy, wl, ww, 2);
+      ctx.fillStyle = '#1f2430';
+      roundRectPath(ctx, wx, wy, wl, ww, 2.5);
       ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.13)';
+      for (let i = -1; i < wl / 6; i++) {
+        const tx = wx + i * 6 + roll;
+        if (tx > wx + 1 && tx < wx + wl - 2) ctx.fillRect(tx, wy + 1, 1.6, ww - 2);
+      }
     }
   }
   const g = ctx.createLinearGradient(0, -hw, 0, hw);
   g.addColorStop(0, col.color);
+  g.addColorStop(0.55, col.color);
   g.addColorStop(1, col.dark);
   ctx.fillStyle = g;
-  if (body === 3) {
-    // pointed jet nose
+  if (body === 3 || body === 1) {
+    // pointed nose
     ctx.beginPath();
     ctx.moveTo(hl + 8, 0);
-    ctx.lineTo(hl - 10, -hw);
+    ctx.lineTo(hl - 10, -hw * 0.8);
+    ctx.lineTo(hl - 18, -hw);
     ctx.lineTo(-hl, -hw);
     ctx.lineTo(-hl, hw);
-    ctx.lineTo(hl - 10, hw);
+    ctx.lineTo(hl - 18, hw);
+    ctx.lineTo(hl - 10, hw * 0.8);
     ctx.closePath();
+  } else if (body === 5) {
+    ctx.beginPath();
+    ctx.ellipse(0, 0, hl, hw, 0, 0, Math.PI * 2);
   } else {
     roundRectPath(ctx, -hl, -hw, hl * 2, hw * 2, cr);
   }
@@ -1786,32 +1823,114 @@ function drawKart(
   ctx.strokeStyle = 'rgba(0,0,0,0.35)';
   ctx.lineWidth = 2;
   ctx.stroke();
-  ctx.fillStyle = 'rgba(255,255,255,0.75)';
-  if (body === 5) {
-    ctx.fillStyle = 'rgba(186,230,253,0.55)';
-    ctx.beginPath();
-    ctx.arc(2, 0, hw - 3, 0, Math.PI * 2);
+  // Nose stripe and a shine along the top edge
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  roundRectPath(ctx, hl * 0.25, -2, hl * 0.6, 4, 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  roundRectPath(ctx, -hl * 0.8, -hw + 2, hl * 1.5, 3, 1.5);
+  ctx.fill();
+  // Side pods with a dark top stripe
+  if (body === 0 || body === 1) {
+    ctx.fillStyle = col.dark;
+    roundRectPath(ctx, -hl * 0.3, -hw - 1, hl * 0.6, 3.5, 1.5);
     ctx.fill();
-  } else {
-    roundRectPath(ctx, hl - 11, -8, 10, 16, 4);
+    roundRectPath(ctx, -hl * 0.3, hw - 2.5, hl * 0.6, 3.5, 1.5);
     ctx.fill();
   }
-  ctx.fillStyle = col.dark;
-  if (body === 1 || body === 3) {
-    // tail fins
+  // Cockpit: seat, dash and steering wheel
+  ctx.fillStyle = '#1c2230';
+  roundRectPath(ctx, -hl * 0.45, -8, 12, 16, 4);
+  ctx.fill();
+  ctx.fillStyle = '#111827';
+  roundRectPath(ctx, hl * 0.3, -7, 4, 14, 2);
+  ctx.fill();
+  if (driver) {
+    ctx.strokeStyle = '#111827';
+    ctx.lineWidth = 2.2;
     ctx.beginPath();
-    ctx.moveTo(-hl + 2, -hw);
-    ctx.lineTo(-hl - 8, -hw - 7);
-    ctx.lineTo(-hl - 6, -hw + 4);
-    ctx.moveTo(-hl + 2, hw);
-    ctx.lineTo(-hl - 8, hw + 7);
-    ctx.lineTo(-hl - 6, hw - 4);
+    ctx.ellipse(hl * 0.2, 0, 2, 5.5, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  // Engine and exhaust pipes at the back
+  if (body !== 5 && body !== 3) {
+    ctx.fillStyle = '#374151';
+    roundRectPath(ctx, -hl + 2, -6, 9, 12, 2);
     ctx.fill();
-  } else if (body !== 5) {
-    ctx.fillRect(-hl - 5, -hw - 1, 6, hw * 2 + 2);
+    ctx.fillStyle = '#e5e7eb';
+    for (const s of [-4, 4]) {
+      roundRectPath(ctx, -hl - 3, s - 1.3, 7, 2.6, 1.3);
+      ctx.fill();
+    }
+  }
+  if (body === 5) {
+    // glass dome
+    ctx.fillStyle = 'rgba(186,230,253,0.35)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, hl * 0.8, hw - 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  // Rear wing / roll bar
+  ctx.fillStyle = col.dark;
+  if (body === 0 || body === 1 || body === 3) {
+    roundRectPath(ctx, -hl - 4, -hw - 2, 6, hw * 2 + 4, 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillRect(-hl - 3, -hw - 1, 1.5, hw * 2 + 2);
+  } else if (body === 4 || body === 2) {
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 2.5;
+    roundRectPath(ctx, -hl * 0.55, -hw + 2, hl * 0.9, hw * 2 - 4, 4);
+    ctx.stroke();
+  }
+  // Driver: shoulders and arms reaching to the wheel, helmet on top
+  if (driver) {
+    const sw = spinning ? Math.sin(t / 60) * 3 : 0;
+    ctx.fillStyle = col.dark;
+    ctx.strokeStyle = col.dark;
+    ctx.lineWidth = 3.4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-hl * 0.25, -6);
+    ctx.lineTo(hl * 0.2 - 1, -4.5 + sw);
+    ctx.moveTo(-hl * 0.25, 6);
+    ctx.lineTo(hl * 0.2 - 1, 4.5 - sw);
+    ctx.stroke();
+    ctx.fillStyle = '#f8fafc';
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(hl * 0.2 - 0.5, s * 4.5 - s * sw, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = col.dark;
+    ctx.beginPath();
+    ctx.ellipse(-hl * 0.27, 0, 5, 8.5, 0, 0, Math.PI * 2);
+    ctx.fill();
   }
   ctx.restore();
-  if (driver) drawEmoji(ctx, spec.emoji, 0, -8, 42);
+  if (driver) {
+    // Helmet behind the character's face, then the face itself (kept upright)
+    const c = Math.cos(angle + spinA);
+    const sn = Math.sin(angle + spinA);
+    const hx = -c * 7;
+    const hy = -sn * 7 - 8;
+    ctx.fillStyle = col.color;
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 12.5, Math.PI * 1.1, Math.PI * 1.55);
+    ctx.stroke();
+    drawEmoji(ctx, spec.emoji, hx + c * 2, hy + sn * 2, 32);
+  }
   if (toddler || shield) {
     const r = 40 + Math.sin(t / 250) * 3;
     ctx.fillStyle = shield ? 'rgba(186,230,253,0.22)' : 'rgba(56,189,248,0.14)';
@@ -2250,6 +2369,41 @@ function KartPreview({ kartIdx, paint, body, size, driver = true }: { kartIdx: n
   return <canvas ref={ref} style={{ width: size, height: size * 0.75 }} aria-hidden />;
 }
 
+/** A spinning 3D model of the chosen kart and driver, with a 2D fallback. */
+function KartTurntable({ kartIdx, paint, body, size }: { kartIdx: number; paint: number; body: number; size: number }) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const show = useRef<KartShowcase | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    let sc: KartShowcase;
+    try {
+      sc = new KartShowcase(c);
+    } catch {
+      setFailed(true);
+      return;
+    }
+    show.current = sc;
+    sc.setSize(size, Math.round(size * 0.75), window.devicePixelRatio || 1);
+    // Only animate while the preview is on screen
+    const io = new IntersectionObserver((es) => (es[0]?.isIntersecting ? sc.start() : sc.stop()));
+    io.observe(c);
+    return () => {
+      io.disconnect();
+      sc.dispose();
+      show.current = null;
+    };
+  }, [size]);
+  useEffect(() => {
+    const k = KARTS[kartIdx] || KARTS[0];
+    const col = kartColors(kartIdx, paint);
+    show.current?.set({ body, color: col.color, dark: col.dark, emoji: k.emoji, name: k.name, isMe: true });
+  }, [kartIdx, paint, body, size, failed]);
+  if (failed) return <KartPreview kartIdx={kartIdx} paint={paint} body={body} size={size} />;
+  return <canvas ref={ref} style={{ width: size, height: size * 0.75 }} aria-hidden />;
+}
+
 function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
   value: number;
   paint: number;
@@ -2285,7 +2439,7 @@ function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
       <div className="flex flex-col gap-3 rounded-2xl p-3 sm:flex-row sm:items-center" style={{ background: `linear-gradient(135deg, ${col.color}, ${col.dark})` }}>
         <div className="flex items-center gap-2 sm:w-72">
           <span className="rounded-2xl bg-white/25 p-1">
-            <KartPreview kartIdx={value} paint={paint} body={body} size={compact ? 84 : 110} />
+            <KartTurntable kartIdx={value} paint={paint} body={body} size={compact ? 112 : 150} />
           </span>
           <span>
             <span className="block text-xl font-black text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.name}</span>

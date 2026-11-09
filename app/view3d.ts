@@ -4,6 +4,7 @@
 // `a` radians points along (cos a, 0, sin a), which is rotation.y = -a.
 
 import * as THREE from 'three';
+import { animateKart, buildKart, disposeKart, driverEye, emojiSprite, glowTexture, kartKey, textureCache, type KartObj } from './kart3d';
 
 export type CamMode = 'chase' | 'near' | 'driver' | 'orbit' | 'top';
 
@@ -82,91 +83,6 @@ export type FrameView = {
   finishedFor: number; // ms since I finished, or -1
 };
 
-const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","Segoe UI Symbol",sans-serif';
-
-const textureCache = new Map<string, THREE.Texture>();
-function emojiTexture(e: string): THREE.Texture {
-  const hit = textureCache.get(e);
-  if (hit) return hit;
-  const c = document.createElement('canvas');
-  c.width = 128;
-  c.height = 128;
-  const g = c.getContext('2d');
-  if (g) {
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.font = `100px ${EMOJI_FONT}`;
-    g.fillText(e, 64, 70);
-  }
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  textureCache.set(e, t);
-  return t;
-}
-
-function glowTexture(): THREE.Texture {
-  const hit = textureCache.get('__glow');
-  if (hit) return hit;
-  const c = document.createElement('canvas');
-  c.width = 64;
-  c.height = 64;
-  const g = c.getContext('2d');
-  if (g) {
-    const grd = g.createRadialGradient(32, 32, 2, 32, 32, 32);
-    grd.addColorStop(0, 'rgba(255,255,255,1)');
-    grd.addColorStop(0.4, 'rgba(255,255,255,0.45)');
-    grd.addColorStop(1, 'rgba(255,255,255,0)');
-    g.fillStyle = grd;
-    g.fillRect(0, 0, 64, 64);
-  }
-  const t = new THREE.CanvasTexture(c);
-  textureCache.set('__glow', t);
-  return t;
-}
-
-function tagTexture(text: string, color: string): { tex: THREE.Texture; aspect: number } {
-  const c = document.createElement('canvas');
-  const g0 = c.getContext('2d');
-  const font = 'bold 40px system-ui, -apple-system, sans-serif';
-  let w = 200;
-  if (g0) {
-    g0.font = font;
-    w = Math.ceil(g0.measureText(text).width) + 44;
-  }
-  c.width = w;
-  c.height = 64;
-  const g = c.getContext('2d');
-  if (g) {
-    g.fillStyle = 'rgba(15,23,42,0.8)';
-    g.strokeStyle = color;
-    g.lineWidth = 5;
-    const r = 28;
-    g.beginPath();
-    g.moveTo(r, 3);
-    g.arcTo(w - 3, 3, w - 3, 61, r);
-    g.arcTo(w - 3, 61, 3, 61, r);
-    g.arcTo(3, 61, 3, 3, r);
-    g.arcTo(3, 3, w - 3, 3, r);
-    g.closePath();
-    g.fill();
-    g.stroke();
-    g.fillStyle = '#ffffff';
-    g.font = font;
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.fillText(text, w / 2, 34);
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return { tex, aspect: w / 64 };
-}
-
-function emojiSprite(e: string, size: number): THREE.Sprite {
-  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: emojiTexture(e), transparent: true, alphaTest: 0.15 }));
-  s.scale.set(size, size, 1);
-  return s;
-}
-
 const smooth = (k: number, dt: number) => 1 - Math.exp(-k * dt);
 const wrapAngle = (a: number) => {
   let r = a;
@@ -174,169 +90,6 @@ const wrapAngle = (a: number) => {
   while (r < -Math.PI) r += Math.PI * 2;
   return r;
 };
-
-type KartObj = {
-  group: THREE.Group;
-  model: THREE.Group;
-  wheels: THREE.Mesh[];
-  flame: THREE.Mesh;
-  shield: THREE.Mesh;
-  driver: THREE.Sprite;
-  tag: THREE.Sprite | null;
-  key: string;
-  bob: number;
-  bubble: THREE.Sprite | null;
-  bubbleE: string;
-  alpha: number;
-};
-
-// Body sizes: [half length, half width, body height, ride height, wheel radius]
-const BODY_DIMS: number[][] = [
-  [26, 14, 11, 6, 7], // Classic
-  [32, 12, 8, 5, 6.5], // Speedster
-  [26, 16, 13, 17, 13], // Monster Truck
-  [30, 13, 10, 12, 0], // Jet Racer (hovers)
-  [20, 14, 9, 6, 7.5], // Mini Buggy
-  [22, 17, 15, 6, 6], // Bubble Car
-];
-
-function buildKart(k: KartView): KartObj {
-  const group = new THREE.Group();
-  const model = new THREE.Group();
-  group.add(model);
-  const [hl, hw, bh, ride, wr] = BODY_DIMS[k.body] || BODY_DIMS[0];
-  const main = new THREE.MeshLambertMaterial({ color: k.color });
-  const dark = new THREE.MeshLambertMaterial({ color: k.dark });
-  const black = new THREE.MeshLambertMaterial({ color: 0x111827 });
-  const glass = new THREE.MeshLambertMaterial({ color: 0xbae6fd, transparent: true, opacity: 0.55 });
-  const chrome = new THREE.MeshLambertMaterial({ color: 0xe5e7eb });
-
-  const add = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number) => {
-    const m = new THREE.Mesh(geo, mat);
-    m.position.set(x, y, z);
-    model.add(m);
-    return m;
-  };
-
-  // Blob shadow on the road
-  const shadow = new THREE.Mesh(
-    new THREE.CircleGeometry(1, 24),
-    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.28, depthWrite: false }),
-  );
-  shadow.rotation.x = -Math.PI / 2;
-  shadow.scale.set(hl + 8, hw + 10, 1);
-  shadow.position.y = 0.7;
-  group.add(shadow);
-
-  const yBody = ride + bh / 2;
-  if (k.body === 5) {
-    // Bubble Car: a round body with a glass dome
-    const ball = add(new THREE.SphereGeometry(1, 20, 14), main, 0, yBody, 0);
-    ball.scale.set(hl, bh * 0.75, hw);
-    const dome = add(new THREE.SphereGeometry(1, 18, 12, 0, Math.PI * 2, 0, Math.PI / 2), glass, -2, yBody + bh * 0.4, 0);
-    dome.scale.set(hl * 0.6, bh * 0.9, hw * 0.75);
-  } else if (k.body === 3) {
-    // Jet Racer: pointed nose, fins and glowing thrusters
-    add(new THREE.BoxGeometry(hl * 1.5, bh, hw * 2), main, -hl * 0.2, yBody, 0);
-    const nose = add(new THREE.ConeGeometry(hw, hl * 0.8, 4), main, hl * 0.9, yBody, 0);
-    nose.rotation.z = -Math.PI / 2;
-    nose.rotation.x = Math.PI / 4;
-    for (const s of [-1, 1]) {
-      const fin = add(new THREE.BoxGeometry(14, 2, 12), dark, -hl * 0.8, yBody + 2, s * (hw + 5));
-      fin.rotation.x = s * 0.3;
-      const thr = add(
-        new THREE.CylinderGeometry(4.5, 5.5, 10, 12),
-        new THREE.MeshBasicMaterial({ color: 0x38bdf8 }),
-        -hl - 2, yBody - 1, s * 7,
-      );
-      thr.rotation.z = Math.PI / 2;
-    }
-    add(new THREE.BoxGeometry(6, 14, 4), dark, -hl * 0.85, yBody + bh / 2 + 6, 0);
-  } else {
-    add(new THREE.BoxGeometry(hl * 2, bh, hw * 2), main, 0, yBody, 0);
-    // Nose
-    const nose = add(new THREE.BoxGeometry(hl * 0.5, bh * 0.7, hw * 1.5), main, hl * 1.05, yBody - bh * 0.1, 0);
-    nose.rotation.z = -0.15;
-    // Front bumper
-    add(new THREE.BoxGeometry(4, 4, hw * 1.7), chrome, hl * 1.3, ride + 3, 0);
-    if (k.body === 1) {
-      // Speedster: low spoiler and side fins
-      add(new THREE.BoxGeometry(8, 2, hw * 2.6), dark, -hl + 2, yBody + bh + 7, 0);
-      add(new THREE.BoxGeometry(3, 8, 3), dark, -hl + 2, yBody + bh / 2 + 3, -hw * 0.9);
-      add(new THREE.BoxGeometry(3, 8, 3), dark, -hl + 2, yBody + bh / 2 + 3, hw * 0.9);
-    } else if (k.body === 4) {
-      // Mini Buggy: roll cage
-      const bar = new THREE.TorusGeometry(hw * 0.95, 1.6, 6, 16, Math.PI);
-      const cage = add(bar, chrome, -hl * 0.35, yBody + bh / 2, 0);
-      cage.rotation.y = Math.PI / 2;
-    } else {
-      // Classic and Monster Truck: rear wing
-      add(new THREE.BoxGeometry(6, 2.5, hw * 2.4), dark, -hl - 1, yBody + bh / 2 + 7, 0);
-      add(new THREE.BoxGeometry(3, 7, 3), dark, -hl - 1, yBody + bh / 2 + 3, 0);
-    }
-    // Seat back
-    add(new THREE.BoxGeometry(4, 10, hw * 1.1), dark, -hl * 0.35, yBody + bh / 2 + 4, 0);
-    // Windscreen
-    const ws = add(new THREE.BoxGeometry(1.5, 8, hw * 1.3), glass, hl * 0.35, yBody + bh / 2 + 4, 0);
-    ws.rotation.z = 0.5;
-  }
-
-  // Wheels
-  const wheels: THREE.Mesh[] = [];
-  if (wr > 0) {
-    const wgeo = new THREE.CylinderGeometry(wr, wr, wr * 0.9, 14);
-    wgeo.rotateX(Math.PI / 2);
-    const hub = new THREE.CylinderGeometry(wr * 0.45, wr * 0.45, wr * 0.95, 8);
-    hub.rotateX(Math.PI / 2);
-    for (const [fx, sz] of [[0.62, -1], [0.62, 1], [-0.62, -1], [-0.62, 1]]) {
-      const w = new THREE.Mesh(wgeo, black);
-      w.position.set(fx * hl, wr, sz * (hw + wr * 0.35));
-      w.add(new THREE.Mesh(hub, chrome));
-      model.add(w);
-      wheels.push(w);
-    }
-  }
-
-  // Boost flame out the back
-  const flame = new THREE.Mesh(
-    new THREE.ConeGeometry(6, 26, 10),
-    new THREE.MeshBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.9 }),
-  );
-  flame.rotation.z = Math.PI / 2;
-  flame.position.set(-hl - 15, yBody, 0);
-  flame.visible = false;
-  const inner = new THREE.Mesh(new THREE.ConeGeometry(3.5, 18, 8), new THREE.MeshBasicMaterial({ color: 0xfde047 }));
-  inner.position.y = 3;
-  flame.add(inner);
-  model.add(flame);
-
-  // The character rides on top, always facing the camera
-  const driver = emojiSprite(k.emoji, 34);
-  driver.position.set(-hl * 0.1, yBody + bh / 2 + 14, 0);
-  model.add(driver);
-
-  // Toddler Assist bubble
-  const shield = new THREE.Mesh(
-    new THREE.SphereGeometry(42, 20, 14),
-    new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.16, depthWrite: false }),
-  );
-  shield.position.y = 18;
-  shield.visible = false;
-  group.add(shield);
-
-  let tag: THREE.Sprite | null = null;
-  if (!k.isMe) {
-    const { tex, aspect } = tagTexture(k.name, k.color);
-    // Same size on screen at any distance, so names stay readable but never huge
-    tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, sizeAttenuation: false }));
-    tag.scale.set(0.042 * aspect, 0.042, 1);
-    tag.position.y = yBody + bh / 2 + 44;
-    tag.renderOrder = 10;
-    group.add(tag);
-  }
-
-  return { group, model, wheels, flame, shield, driver, tag, key: `${k.body}|${k.color}|${k.emoji}|${k.name}`, bob: Math.random() * 10, bubble: null, bubbleE: '', alpha: 1 };
-}
 
 function disposeTree(o: THREE.Object3D) {
   o.traverse((c) => {
@@ -543,7 +296,7 @@ export class View3D {
     // Clear old moving things; they are rebuilt on demand
     for (const k of this.karts.values()) {
       this.scene.remove(k.group);
-      disposeTree(k.group);
+      disposeKart(k);
     }
     this.karts.clear();
     for (const b of this.boxes) this.scene.remove(b);
@@ -558,11 +311,11 @@ export class View3D {
   }
 
   private kartObj(k: KartView): KartObj {
-    const key = `${k.body}|${k.color}|${k.emoji}|${k.name}`;
+    const key = kartKey(k);
     let o = this.karts.get(k.id);
     if (o && o.key !== key) {
       this.scene.remove(o.group);
-      disposeTree(o.group);
+      disposeKart(o);
       o = undefined;
     }
     if (!o) {
@@ -619,68 +372,15 @@ export class View3D {
     for (const k of f.karts) {
       seen.add(k.id);
       const o = this.kartObj(k);
-      const hover = k.body === 3 ? Math.sin(now / 160 + o.bob) * 2 : 0;
-      o.group.position.set(k.x, hover + (k.air ?? 0), k.y);
-      o.group.rotation.y = -k.yaw;
-      // Lean into drifts and turns
-      const lean = k.drifting ? -k.driftDir * 0.14 : 0;
-      o.model.rotation.x += (lean - o.model.rotation.x) * smooth(10, dt);
-      o.model.rotation.z = k.boost ? 0.05 : 0;
-      const spinRate = (k.speed * dt) / 7;
-      for (const w of o.wheels) w.rotation.z -= spinRate;
-      o.flame.visible = k.boost;
-      if (k.boost) {
-        const s = 0.8 + Math.random() * 0.5;
-        o.flame.scale.set(1, s, 1);
-      }
-      const sh = k.toddler || !!k.shield;
-      o.shield.visible = sh;
-      if (sh) {
-        o.shield.scale.setScalar(1 + Math.sin(now / 250) * 0.05);
-        const sm = o.shield.material as THREE.MeshBasicMaterial;
-        sm.color.set(k.shield ? 0xfde047 : 0x38bdf8);
-        sm.opacity = k.shield ? 0.28 : 0.16;
-      }
-      // Emoji bubble above the kart
-      const be = k.bubble ?? '';
-      if (be !== o.bubbleE) {
-        o.bubbleE = be;
-        if (o.bubble) {
-          o.group.remove(o.bubble);
-          o.bubble.material.dispose();
-          o.bubble = null;
-        }
-        if (be) {
-          o.bubble = emojiSprite(be, 30);
-          o.bubble.position.y = k.isMe ? 70 : 92;
-          o.group.add(o.bubble);
-        }
-      }
-      if (o.bubble) o.bubble.position.y = (k.isMe ? 70 : 92) + Math.sin(now / 200) * 3;
-      // Fade out a kart whose player left
-      const al = k.alpha ?? 1;
-      if (Math.abs(al - o.alpha) > 0.02) {
-        o.alpha = al;
-        o.group.traverse((c) => {
-          const m = (c as THREE.Mesh).material as THREE.Material | undefined;
-          if (!m || Array.isArray(m)) return;
-          if (m.userData.baseOpacity === undefined) {
-            m.userData.baseOpacity = m.opacity;
-            m.userData.baseTransparent = m.transparent;
-          }
-          m.transparent = al < 0.99 || m.userData.baseTransparent;
-          m.opacity = m.userData.baseOpacity * al;
-          m.needsUpdate = true;
-        });
-      }
-      const hideMe = k.isMe && f.mode === 'driver' && !f.lookBack && f.countdownLeft === null && f.finishedFor < 0;
-      o.group.visible = !k.blink;
-      o.driver.visible = !hideMe;
+      // My own driver in the driver's seat view: hide the head and body but
+      // keep the arms and steering wheel in front of the camera.
+      const cockpit = k.isMe && f.mode === 'driver' && !f.lookBack && f.countdownLeft === null && f.finishedFor < 0;
+      animateKart(o, k, { now, dt, hideDriver: false, cockpit, countdown: f.countdownLeft, camera: this.camera });
     }
     for (const [id, o] of this.karts) {
       if (!seen.has(id)) {
         this.scene.remove(o.group);
-        disposeTree(o.group);
+        disposeKart(o);
         this.karts.delete(id);
       }
     }
@@ -884,7 +584,9 @@ export class View3D {
       this.camYaw += wrapAngle(me.yaw * 0.25 + me.heading * 0.75 - this.camYaw) * smooth(14, dt);
       const cx = Math.cos(this.camYaw);
       const cz = Math.sin(this.camYaw);
-      target.set(me.x + cx * 9, 30, me.y + cz * 9);
+      // Sit at the driver's eyes, just behind the steering wheel
+      const eye = driverEye(me.body);
+      target.set(me.x + Math.cos(me.yaw) * eye.fwd, eye.up + (me.air ?? 0), me.y + Math.sin(me.yaw) * eye.fwd);
       look.set(me.x + cx * 220, 22, me.y + cz * 220);
       fov = portrait ? 88 : 78;
       posK = 40;
@@ -929,7 +631,7 @@ export class View3D {
 
   dispose() {
     for (const c of [...this.world.children]) disposeTree(c);
-    for (const k of this.karts.values()) disposeTree(k.group);
+    for (const k of this.karts.values()) disposeKart(k);
     this.renderer.dispose();
   }
 }
