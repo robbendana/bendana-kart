@@ -5,6 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { View3D, CAM_MODES, type CamMode, type KartView, type SceneTrack } from './view3d';
 import { KartShowcase } from './kart3d';
+import { faceCanvas } from './faces';
 import {
   beep, sfx, unlockAudio, setMuted, setMusicOn, setHaptics, startMusic, stopMusic, setMusicIntensity,
   playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning,
@@ -2226,7 +2227,11 @@ function drawKart(
     ctx.beginPath();
     ctx.arc(hx, hy, 12.5, Math.PI * 1.1, Math.PI * 1.55);
     ctx.stroke();
-    drawEmoji(ctx, spec.emoji, hx + c * 2, hy + sn * 2, 32);
+    // Blink now and then; dizzy when spun out, grinning on boosts
+    const blink = (t + kartIdx * 977) % 3400 < 130;
+    const face = faceCanvas(spec.emoji, spinning ? 'dizzy' : boost ? 'happy' : blink ? 'blink' : 'idle');
+    if (face) ctx.drawImage(face, hx + c * 2 - 21, hy + sn * 2 - 21, 42, 42);
+    else drawEmoji(ctx, spec.emoji, hx + c * 2, hy + sn * 2, 32);
   }
   if (toddler || shield) {
     const r = 40 + Math.sin(t / 250) * 3;
@@ -2764,6 +2769,29 @@ function KartTurntable({ kartIdx, paint, body, size }: { kartIdx: number; paint:
   return <canvas ref={ref} style={{ width: size, height: size * 0.75 }} aria-hidden />;
 }
 
+/** A racer's drawn face (falls back to the emoji). Grins when picked. */
+function FaceIcon({ emoji, size, happy }: { emoji: string; size: number; happy?: boolean }) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const [ok, setOk] = useState(true);
+  useEffect(() => {
+    const c = ref.current;
+    const f = faceCanvas(emoji, happy ? 'happy' : 'idle');
+    if (!c || !f) {
+      setOk(false);
+      return;
+    }
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    c.width = Math.round(size * dpr);
+    c.height = Math.round(size * dpr);
+    const g = c.getContext('2d');
+    if (!g) return;
+    g.clearRect(0, 0, c.width, c.height);
+    g.drawImage(f, 0, 0, c.width, c.height);
+  }, [emoji, size, happy]);
+  if (!ok) return <span className="text-4xl drop-shadow">{emoji}</span>;
+  return <canvas ref={ref} style={{ width: size, height: size }} className="drop-shadow" aria-hidden />;
+}
+
 function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
   value: number;
   paint: number;
@@ -2790,7 +2818,7 @@ function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
               className={`flex flex-col items-center rounded-2xl px-1 py-2 transition active:scale-95 ${active ? 'scale-105 shadow-xl ring-4 ring-white' : 'opacity-80 ring-2 ring-white/20 hover:opacity-100'}`}
               style={{ background: `linear-gradient(145deg, ${k.color}, ${k.dark})` }}
             >
-              <span className={`${compact ? 'text-3xl' : 'text-4xl'} drop-shadow`}>{k.emoji}</span>
+              <FaceIcon emoji={k.emoji} size={compact ? 40 : 48} happy={active} />
               <span className="mt-1 text-center text-[10px] font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)] sm:text-[11px]">{k.name}</span>
             </button>
           );
