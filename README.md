@@ -3,6 +3,32 @@
 A family kart racer for phones, tablets and computers. Up to five players
 race each other live, one per device.
 
+## What's new in 4.0 (gameplay)
+
+- **Robots in family races:** with fewer than five people in an online race,
+  robot karts fill the empty seats, so there are always 5 racers. The host can
+  switch them off. They cost no extra network messages, and if the host drops
+  out another device takes them over.
+- **Smarter robots:** they take the racing line, overtake, steer around
+  bananas and hazards, go for item boxes and boost pads, drift for
+  mini-turbos and use items with a reason. Pick 🐢 Chill, 🙂 Fair or 🔥 Fast.
+  Robots give you a break after you have been hit.
+- **3 new items:** 🧲 Coin Magnet (coins fly to you), 🌈 Rainbow Rush (fast,
+  can't be hit, spins out anyone you touch) and 📣 Mega Honk (a shockwave that
+  shoves karts away and clears bananas and blasts).
+- **Track hazards:** mud on Sunny Meadow, syrup on Candy Canyon, snow drifts
+  on Frosty Peaks, sand on Dusty Dunes and lava cracks on Volcano Loop. Steer
+  around them, or boost straight through.
+- **Closer family races:** online, players far behind the leader get a small
+  tailwind.
+- **You know who got you:** "🍌 Mia got you!" and "🎯 You got Dad!".
+- **Fixes:** Sunny Meadow now has its boost pads, ramps and coins on the first
+  race; places in close online battles are right; a results screen left open
+  no longer uses up the network allowance; tracks use much less memory on
+  tablets.
+
+The design is in [docs/v4-gameplay-spec.md](docs/v4-gameplay-spec.md).
+
 ## What's new in 2.0
 
 - **Smooth multiplayer:** karts send a short history of their motion in each
@@ -16,7 +42,7 @@ race each other live, one per device.
 - **Boost pads, jump ramps and tricks:** tap ⭐ (or Space) in the air for a
   trick and a boost when you land.
 - **Coins:** each one adds a little top speed (up to 10). Getting hit drops some.
-- **7 items with a spinning roulette:** 🚀 Turbo Rocket, 🚀 Triple Rockets,
+- **Items with a spinning roulette:** 🚀 Turbo Rocket, 🚀 Triple Rockets,
   🍌 Banana Peel, 🍌 Triple Bananas, 💥 Homing Blast, 🫧 Bubble Shield and
   💤 Snooze Cloud (slows everyone ahead, only for karts at the back).
 - **Slipstream:** stay right behind another kart for a speed boost.
@@ -38,7 +64,7 @@ race each other live, one per device.
 - **Drifting:** hold Shift while turning (on touch screens, just keep holding a turn). Blue, then orange, then purple sparks; let go for a mini-turbo.
 - **Rocket start:** press gas just before GO. Too early and you stall.
 - **Polish:** lap and "Final lap!" banners, wrong-way warning, auto-respawn when you're lost off the road, screen shake, speed lines, engine sound, confetti, and game controller support.
-- **Practice:** race four robot karts on one device.
+- **Practice:** race four robot karts on one device. Robots also fill empty seats online.
 - **Multiplayer:** one player taps **Host Race** and gets a 4-letter code. Everyone else taps **Join Race** and types it in.
 
 ## Controls
