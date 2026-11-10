@@ -3183,10 +3183,12 @@ function spokenFor(banner: string): string {
   return words.charAt(0) + words.slice(1).toLowerCase();
 }
 
+const GFX_KEY = 'bendana-kart-gfx'; // { scale, detail } the 3D view settled on
+
 // ---------- React UI ----------
 type Profile = {
   name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number;
-  cam: CamMode; assist: number; music: boolean; haptics: boolean; laps: number; cup: number;
+  cam: CamMode; assist: number; music: boolean; haptics: boolean; lite: boolean; laps: number; cup: number;
   bots: boolean; // robots fill the empty seats in online races
   botLevel: number; // 0 chill, 1 fair, 2 fast
 };
@@ -3842,7 +3844,7 @@ export default function BendanaKartPage() {
   const [screen, setScreen] = useState<Screen>('menu');
   const [profile, setProfile] = useState<Profile>({
     name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0, cam: 'chase', assist: 2,
-    music: true, haptics: true, laps: 3, cup: -1, bots: true, botLevel: 1,
+    music: true, haptics: true, lite: false, laps: 3, cup: -1, bots: true, botLevel: 1,
   });
   const [joinCode, setJoinCode] = useState('');
   const [room, setRoom] = useState<string | null>(null);
@@ -3939,6 +3941,7 @@ export default function BendanaKartPage() {
           assist: typeof p.assist === 'number' && p.assist >= 0 && p.assist <= 2 ? p.assist : 2,
           music: p.music !== false,
           haptics: p.haptics !== false,
+          lite: p.lite === true,
           laps: p.laps === 2 ? 2 : 3,
           cup: typeof p.cup === 'number' && p.cup >= -1 && p.cup < CUPS.length ? p.cup : -1,
           bots: p.bots !== false,
@@ -4826,6 +4829,14 @@ export default function BendanaKartPage() {
       try {
         view = new View3D(canvas3d, isTouchRef.current);
         view.setSize(w, h, view3dRatio());
+        view.setLite(profileRef.current.lite);
+        // Start at the picture quality this device settled on in its last race
+        try {
+          const q = JSON.parse(localStorage.getItem(GFX_KEY) || 'null') as { scale: number; detail: number } | null;
+          if (q && typeof q.scale === 'number') view.setQuality(q);
+        } catch {
+          /* first race on this device */
+        }
         const sky = SKIES[TRACK_IDX] || SKIES[0];
         const scene: SceneTrack = {
           xs: TRACK.xs, ys: TRACK.ys, tx: TRACK.tx, ty: TRACK.ty, n: TRACK.n, halfW: HALF_W,
@@ -5173,6 +5184,7 @@ export default function BendanaKartPage() {
           });
         });
         const orbit = orbitRef.current;
+        v.setLite(profileRef.current.lite);
         v.render({
           now, dt, karts,
           boxes: G.boxes.map((b) => ({ x: b.x, y: b.y, visible: now >= b.hiddenUntil, ghost: now < b.hiddenUntil && b.hiddenUntil - now <= 500 })),
@@ -5236,7 +5248,7 @@ export default function BendanaKartPage() {
           idx: me0.idx, steer: +me0.steer.toFixed(2), auto: +me0.autoSteer.toFixed(2), spin: me0.spinT > 0, wrong: +me0.wrongT.toFixed(1),
           bots: G.karts.slice(1).map((b) => ({ lap: b.lap, ft: b.finishTime, done: b.finished, drifts: b.st.drifts, hits: b.st.hits, lane: Math.round(b.lane) })),
           extra: { hazards: FEATURES.hazards.length, pads: FEATURES.pads.length, hits: G.hitLog.join(' '), hitBy: me0.st.hitBy, coins: me0.st.coins },
-          music: musicDebug(), closedAt: G.closedAt, podium: podiumOn,
+          gfx: view ? view.stats() : null, music: musicDebug(), closedAt: G.closedAt, podium: podiumOn,
         };
       }
       if (debugRef.current && now - debugAt > 500) {
@@ -5266,6 +5278,13 @@ export default function BendanaKartPage() {
       stopVoice();
       recordRace(null, false, true); // finished but left before the results: it still counts
       if (gameRef.current === G) gameRef.current = null;
+      if (view) {
+        try {
+          localStorage.setItem(GFX_KEY, JSON.stringify(view.quality()));
+        } catch {
+          /* private mode */
+        }
+      }
       view?.dispose();
       view = null;
     };
@@ -5387,6 +5406,7 @@ export default function BendanaKartPage() {
         ['music', profile.music ? '🎵 Music on' : '🎵 Music off', profile.music],
         ['muted', profile.muted ? '🔇 Sound off' : '🔊 Sound on', !profile.muted],
         ['haptics', profile.haptics ? '📳 Buzz on' : '📳 Buzz off', profile.haptics],
+        ['lite', profile.lite ? '⚡ Fast graphics on' : '⚡ Fast graphics off', profile.lite],
       ] as const).map(([k, label, on]) => (
         <button
           key={k}

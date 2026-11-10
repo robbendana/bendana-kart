@@ -826,13 +826,16 @@ export class World3D {
   private pulse: THREE.MeshBasicMaterial[] = [];
   private smoke: THREE.Sprite[] = [];
   private dummy = new THREE.Object3D();
+  private shadowMesh: THREE.Object3D | null = null;
+  private detail = 0;
   /** Places props must avoid (stands, pools): [x, y, radius] */
   private keepOut: [number, number, number][] = [];
 
   constructor(t: SceneTrack, opts: { lowPower: boolean; maxAniso: number }) {
     this.t = t;
     this.low = opts.lowPower;
-    this.aniso = Math.max(1, Math.min(8, opts.maxAniso));
+    // Sharp ground at a distance costs a weak phone GPU a lot per pixel
+    this.aniso = Math.max(1, Math.min(opts.lowPower ? 2 : 8, opts.maxAniso));
     this.litMat = this.mat(new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true }));
     this.glowMat = this.mat(new THREE.MeshBasicMaterial({ vertexColors: true }));
     this.group.add(this.skyGroup);
@@ -1530,6 +1533,7 @@ export class World3D {
       sm.frustumCulled = false;
       sm.renderOrder = 2;
       this.group.add(sm);
+      this.shadowMesh = sm;
     }
     d.scale.set(1, 1, 1);
   }
@@ -1580,11 +1584,25 @@ export class World3D {
     }
   }
 
+  /** 0 = everything, 1 = no weather, floaters, shadows or crowd hops, 2 = also no crowd or clouds. */
+  setDetail(d: number) {
+    this.detail = d;
+    if (this.weather) this.weather.pts.visible = d < 1;
+    for (const f of this.floaters) f.g.visible = d < 1;
+    if (this.shadowMesh) this.shadowMesh.visible = d < 1;
+    if (this.crowd) {
+      this.crowd.bodies.visible = d < 2;
+      this.crowd.heads.visible = d < 2;
+    }
+    if (this.clouds) this.clouds.visible = d < 2;
+  }
+
   // ----- per frame -----
   update(now: number, dt: number, cam: THREE.Camera, s: WorldState) {
     const t = this.t;
     this.skyGroup.position.set(cam.position.x, 0, cam.position.z);
-    if (this.clouds) this.clouds.rotation.y += dt * 0.004;
+    const lite = this.detail > 0;
+    if (this.clouds && !lite) this.clouds.rotation.y += dt * 0.004;
     if (this.padTex) this.padTex.offset.x = -((now / 420) % 1);
     // Start lights: three reds count down, then green
     const cd = s.countdownLeft;
@@ -1592,7 +1610,7 @@ export class World3D {
       const on = cd !== null && cd <= (3 - i) * 1000 && cd > 0;
       m.color.set(cd === null ? 0x4ade80 : on ? 0xef4444 : 0x334155);
     });
-    this.updateCrowd(now, s.excite);
+    if (!lite) this.updateCrowd(now, s.excite);
     // Lava and fire glow breathe
     const breathe = 0.86 + Math.sin(now / 420) * 0.14;
     for (const m of this.pulse) m.color.setRGB(1 * breathe, 0.28 * breathe + 0.06, 0.02);
@@ -1601,12 +1619,12 @@ export class World3D {
       this.glowMat.color.setScalar(flick);
       this.smoke.forEach((sp, i) => (sp.material.opacity = 0.6 + Math.sin(now / 700 + i * 2) * 0.2));
     }
-    for (const f of this.floaters) {
+    for (const f of lite ? [] : this.floaters) {
       f.a += f.w * dt;
       f.g.position.set(t.worldW / 2 + Math.cos(f.a) * f.r, f.y + Math.sin(now / 2600 + f.r) * 18, t.worldH / 2 + Math.sin(f.a) * f.r);
       f.g.rotation.y += dt * 0.05;
     }
-    const w = this.weather;
+    const w = lite ? null : this.weather;
     if (w) {
       const B = 1300;
       const BY = 420;
