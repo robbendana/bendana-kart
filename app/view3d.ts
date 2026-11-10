@@ -5,6 +5,10 @@
 
 import * as THREE from 'three';
 import { animateKart, buildKart, disposeKart, driverEye, emojiSprite, glowTexture, kartKey, textureCache, type KartObj } from './kart3d';
+import { World3D, type SceneTrack } from './world3d';
+import { Fireworks, PodiumStage, SkidMarks } from './fx3d';
+
+export type { SceneTrack, SceneryItem } from './world3d';
 
 export type CamMode = 'chase' | 'near' | 'driver' | 'orbit' | 'top';
 
@@ -15,26 +19,6 @@ export const CAM_MODES: { id: CamMode; icon: string; label: string }[] = [
   { id: 'orbit', icon: '🔄', label: '360° cam' },
   { id: 'top', icon: '🗺️', label: 'Top-down' },
 ];
-
-export type SceneTrack = {
-  xs: Float32Array;
-  ys: Float32Array;
-  tx: Float32Array;
-  ty: Float32Array;
-  n: number;
-  halfW: number;
-  worldW: number;
-  worldH: number;
-  ground: HTMLCanvasElement; // road, curbs and flat scenery, drawn once
-  big: { x: number; y: number; e: string; size: number }[]; // tall scenery
-  sky: string;
-  horizon: string;
-  hills: string;
-  outside: string;
-  edge: string;
-  night: boolean;
-  ramps?: { x: number; y: number; a: number; len: number; width: number }[];
-};
 
 export type KartView = {
   id: string;
@@ -90,6 +74,7 @@ export type FrameView = {
   finishedFor: number; // ms since I finished, or -1
   kicks?: number; // counts my boost starts; a change kicks the FOV
   guide?: { x: number; y: number; c: number; a: number }[] | null; // driving line ahead (c: 0 green, 1 yellow, 2 red)
+  podium?: string[] | null; // race over: kart ids in finishing order, shown on the winners' stage
 };
 
 const smooth = (k: number, dt: number) => 1 - Math.exp(-k * dt);
@@ -137,8 +122,17 @@ export class View3D {
   private blendT = 0;
   private started = false;
   private track: SceneTrack | null = null;
+  private worldFx: World3D | null = null;
+  private skids = new SkidMarks();
+  private fireworks = new Fireworks();
+  private stage: PodiumStage | null = null;
+  private fwAt = 0;
+  private podiumSince = 0;
+  private boxTex: THREE.Texture | null = null;
+  private lowPower = false;
 
   constructor(canvas: HTMLCanvasElement, lowPower: boolean) {
+    this.lowPower = lowPower;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: !lowPower, powerPreference: 'high-performance' });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.scene.add(this.world);
@@ -155,6 +149,8 @@ export class View3D {
     );
     this.points.frustumCulled = false;
     this.scene.add(this.points);
+    this.scene.add(this.skids.mesh);
+    this.scene.add(this.fireworks.points);
   }
 
   // Resolution drops automatically on slow devices so the race stays smooth.
@@ -178,129 +174,28 @@ export class View3D {
 
   setTrack(t: SceneTrack) {
     this.track = t;
+    if (this.worldFx) {
+      this.world.remove(this.worldFx.group);
+      this.worldFx.dispose();
+      this.worldFx = null;
+    }
     for (const c of [...this.world.children]) {
       this.world.remove(c);
       disposeTree(c);
     }
-    const { worldW: W, worldH: H } = t;
-    this.scene.background = new THREE.Color(t.sky);
-    this.scene.fog = new THREE.Fog(t.horizon, 1700, 5200);
-
-    const hemi = new THREE.HemisphereLight(0xffffff, new THREE.Color(t.outside), t.night ? 0.9 : 1.6);
-    this.world.add(hemi);
-    const sun = new THREE.DirectionalLight(t.night ? 0xffb38a : 0xffffff, t.night ? 1.1 : 1.8);
-    sun.position.set(-600, 1200, -400);
-    this.world.add(sun);
-
-    // Ground: the same painted track the top-down view uses
-    const tex = new THREE.CanvasTexture(t.ground);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
-    tex.generateMipmaps = true;
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
-    const groundGeo = new THREE.PlaneGeometry(W, H);
-    groundGeo.rotateX(-Math.PI / 2);
-    const ground = new THREE.Mesh(groundGeo, new THREE.MeshLambertMaterial({ map: tex }));
-    ground.position.set(W / 2, 0, H / 2);
-    this.world.add(ground);
-
-    const outerGeo = new THREE.PlaneGeometry(30000, 30000);
-    outerGeo.rotateX(-Math.PI / 2);
-    const outer = new THREE.Mesh(outerGeo, new THREE.MeshLambertMaterial({ color: t.outside }));
-    outer.position.set(W / 2, -1, H / 2);
-    this.world.add(outer);
-
-    // Low walls around the edge of the world
-    const wallMat = new THREE.MeshLambertMaterial({ color: t.edge });
-    for (const [x, z, w, d] of [[W / 2, -11, W + 44, 22], [W / 2, H + 11, W + 44, 22], [-11, H / 2, 22, H], [W + 11, H / 2, 22, H]]) {
-      const wall = new THREE.Mesh(new THREE.BoxGeometry(w, 26, d), wallMat);
-      wall.position.set(x, 13, z);
-      this.world.add(wall);
+    this.scene.background = new THREE.Color(t.horizon);
+    this.scene.fog = new THREE.Fog(t.horizon, 1500, 5600);
+    this.worldFx = new World3D(t, { lowPower: this.lowPower, maxAniso: this.renderer.capabilities.getMaxAnisotropy() });
+    this.world.add(this.worldFx.group);
+    // Winners' stage, just outside the fence
+    if (this.stage) {
+      this.scene.remove(this.stage.group);
+      this.stage.dispose();
     }
-
-    // Hills on the horizon
-    const hillMat = new THREE.MeshLambertMaterial({ color: t.hills });
-    const rnd = (() => {
-      let s = 1234567;
-      return () => {
-        s = (s * 16807) % 2147483647;
-        return s / 2147483647;
-      };
-    })();
-    for (let i = 0; i < 26; i++) {
-      const a = (i / 26) * Math.PI * 2 + rnd() * 0.2;
-      const r = (2300 + rnd() * 700) * (W / 2400);
-      const hgt = 260 + rnd() * 520;
-      const hill = new THREE.Mesh(new THREE.ConeGeometry(260 + rnd() * 260, hgt, 7), hillMat);
-      hill.position.set(W / 2 + Math.cos(a) * r, hgt / 2 - 20, H / 2 + Math.sin(a) * r * 0.8);
-      this.world.add(hill);
-    }
-
-    // Tall scenery as billboards
-    for (const b of t.big) {
-      const s = emojiSprite(b.e, b.size * 2.1);
-      s.position.set(b.x, b.size * 0.95, b.y);
-      this.world.add(s);
-    }
-
-    // Start / finish arch
-    const i0 = 0;
-    const sx = t.xs[i0];
-    const sz = t.ys[i0];
-    const nx = -t.ty[i0];
-    const nz = t.tx[i0];
-    const postMat = new THREE.MeshLambertMaterial({ color: 0xf8fafc });
-    for (const s of [-1, 1]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(5, 5, 110, 10), postMat);
-      post.position.set(sx + nx * s * (t.halfW + 26), 55, sz + nz * s * (t.halfW + 26));
-      this.world.add(post);
-    }
-    const cc = document.createElement('canvas');
-    cc.width = 256;
-    cc.height = 32;
-    const cg = cc.getContext('2d');
-    if (cg) {
-      for (let i = 0; i < 16; i++) {
-        for (let j = 0; j < 2; j++) {
-          cg.fillStyle = (i + j) % 2 ? '#111827' : '#ffffff';
-          cg.fillRect(i * 16, j * 16, 16, 16);
-        }
-      }
-    }
-    const ctex = new THREE.CanvasTexture(cc);
-    ctex.colorSpace = THREE.SRGBColorSpace;
-    const banner = new THREE.Mesh(new THREE.BoxGeometry(4, 22, (t.halfW + 26) * 2), new THREE.MeshLambertMaterial({ map: ctex }));
-    banner.position.set(sx, 104, sz);
-    banner.rotation.y = -Math.atan2(t.ty[i0], t.tx[i0]);
-    this.world.add(banner);
-
-    // Jump ramps: striped wedges rising toward the jump
-    if (t.ramps) {
-      const rampMat = new THREE.MeshLambertMaterial({ color: 0xf97316 });
-      const stripeMat = new THREE.MeshLambertMaterial({ color: 0xfef3c7 });
-      for (const r of t.ramps) {
-        const rise = 14;
-        const tilt = Math.atan2(rise, r.len);
-        const slope = Math.hypot(rise, r.len);
-        const g = new THREE.Group();
-        const deck = new THREE.Mesh(new THREE.BoxGeometry(slope, 3, r.width), rampMat);
-        deck.rotation.z = tilt;
-        deck.position.set(0, rise / 2, 0);
-        g.add(deck);
-        for (let i = -1; i <= 1; i += 2) {
-          const st = new THREE.Mesh(new THREE.BoxGeometry(slope * 0.98, 3.4, 6), stripeMat);
-          st.rotation.z = tilt;
-          st.position.set(0, rise / 2 + 0.2, i * r.width * 0.25);
-          g.add(st);
-        }
-        const lip = new THREE.Mesh(new THREE.BoxGeometry(3, rise, r.width), new THREE.MeshLambertMaterial({ color: 0x7c2d12 }));
-        lip.position.set(r.len / 2, rise / 2, 0);
-        g.add(lip);
-        g.position.set(r.x, 0, r.y);
-        g.rotation.y = -r.a;
-        this.world.add(g);
-      }
-    }
+    this.stage = new PodiumStage(t.worldW / 2, -620, t.colors.curbB);
+    this.scene.add(this.stage.group);
+    this.skids.clear();
+    this.podiumSince = 0;
 
     // Clear old moving things; they are rebuilt on demand
     for (const k of this.karts.values()) {
@@ -317,6 +212,33 @@ export class View3D {
     this.blasts.forEach((b) => this.scene.remove(b));
     this.blasts.clear();
     this.started = false;
+  }
+
+  /** A white "?" on each face of the item cube; the cube's color cycles under it. */
+  private boxTexture(): THREE.Texture {
+    if (this.boxTex) return this.boxTex;
+    const c = document.createElement('canvas');
+    c.width = 128;
+    c.height = 128;
+    const g = c.getContext('2d');
+    if (g) {
+      g.fillStyle = '#d4d4d8';
+      g.fillRect(0, 0, 128, 128);
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = 12;
+      g.strokeRect(6, 6, 116, 116);
+      g.fillStyle = '#ffffff';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.font = '900 92px system-ui, -apple-system, "Segoe UI", sans-serif';
+      g.shadowColor = 'rgba(0,0,0,0.35)';
+      g.shadowOffsetY = 4;
+      g.fillText('?', 64, 70);
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    this.boxTex = t;
+    return t;
   }
 
   private kartObj(k: KartView): KartObj {
@@ -370,11 +292,48 @@ export class View3D {
     }
   }
 
-  render(f: FrameView) {
+  render(frame: FrameView) {
+    let f = frame;
     if (!this.track) return;
     const { now, dt } = f;
     this.adapt(now, dt);
+    const podium = f.podium && f.podium.length && this.stage ? f.podium : null;
+    if (this.stage) this.stage.group.visible = !!podium;
+    if (podium && this.stage) {
+      // Race over: every kart is shown on the winners' stage instead of the road
+      if (!this.podiumSince) this.podiumSince = now;
+      this.stage.update(now);
+      f = {
+        ...f,
+        karts: f.karts.map((k) => {
+          const place = podium.indexOf(k.id);
+          if (place < 0) return { ...k, alpha: 0 };
+          const sp = this.stage!.spot(place);
+          return {
+            ...k, x: sp.x, y: sp.z, yaw: sp.yaw, heading: sp.yaw, speed: 0, air: sp.y, boost: false, drifting: false,
+            spinning: false, finished: true, blink: false, steer: 0, slip: 0, hop: 0, bump: 0, land: 0, accel: 0, alpha: 1, shield: false,
+          };
+        }),
+        guide: null,
+        particles: [],
+      };
+    } else this.podiumSince = 0;
     const me = f.karts[0];
+    this.skids.update(now, podium ? [] : f.karts);
+    // Fireworks: when I cross the line, and all through the podium
+    if ((f.finishedFor >= 0 && f.finishedFor < 7000) || podium) {
+      if (now > this.fwAt) {
+        this.fwAt = now + 260 + Math.random() * 520;
+        if (podium && this.stage) {
+          this.fireworks.burst(this.stage.cx + (Math.random() - 0.5) * 760, 190 + Math.random() * 190, this.stage.cz - 150 - Math.random() * 220, Math.random(), 70, 170);
+        } else {
+          const a = Math.random() * Math.PI * 2;
+          const r = 160 + Math.random() * 300;
+          this.fireworks.burst(me.x + Math.cos(a) * r, 150 + Math.random() * 200, me.y + Math.sin(a) * r, Math.random(), 60, 150);
+        }
+      }
+    }
+    this.fireworks.update(dt);
 
     // ----- Karts -----
     const seen = new Set<string>();
@@ -383,7 +342,7 @@ export class View3D {
       const o = this.kartObj(k);
       // My own driver in the driver's seat view: hide the head and body but
       // keep the arms and steering wheel in front of the camera.
-      const cockpit = k.isMe && f.mode === 'driver' && !f.lookBack && f.countdownLeft === null && f.finishedFor < 0;
+      const cockpit = k.isMe && f.mode === 'driver' && !f.lookBack && f.countdownLeft === null && f.finishedFor < 0 && !podium;
       animateKart(o, k, { now, dt, hideDriver: false, cockpit, countdown: f.countdownLeft, camera: this.camera });
     }
     for (const [id, o] of this.karts) {
@@ -399,10 +358,11 @@ export class View3D {
       const g = new THREE.Group();
       const cube = new THREE.Mesh(
         new THREE.BoxGeometry(30, 30, 30),
-        new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.8, emissive: 0x333333 }),
+        new THREE.MeshLambertMaterial({ color: 0xffffff, map: this.boxTexture(), transparent: true, opacity: 0.92, emissive: 0x222222 }),
       );
       g.add(cube);
-      const gift = emojiSprite('🎁', 22);
+      const gift = emojiSprite('🎁', 1);
+      gift.visible = false;
       g.add(gift);
       const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture(), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.5 }));
       glow.scale.set(70, 70, 1);
@@ -416,10 +376,10 @@ export class View3D {
       if (!g.visible) return;
       g.position.set(b.x, 26 + Math.sin(now / 300 + b.x) * 4, b.y);
       const cube = g.children[0] as THREE.Mesh;
-      cube.rotation.set(now / 900, now / 700, now / 1100);
+      cube.rotation.set(Math.sin(now / 900 + b.x) * 0.25, now / 700 + b.y, Math.sin(now / 1100 + b.y) * 0.25);
       const mat = cube.material as THREE.MeshLambertMaterial;
-      mat.color.setHSL(((now / 8 + b.x) % 360) / 360, 0.85, 0.6);
-      mat.opacity = b.ghost ? 0.25 : 0.8;
+      mat.color.setHSL(((now / 8 + b.x) % 360) / 360, 0.9, 0.62);
+      mat.opacity = b.ghost ? 0.25 : 0.92;
     });
     for (let i = f.boxes.length; i < this.boxes.length; i++) this.boxes[i].visible = false;
 
@@ -524,6 +484,10 @@ export class View3D {
     // ----- Driving line and camera -----
     this.updateGuide(f);
     this.updateCamera(f, me);
+    this.worldFx?.update(now, dt, this.camera, {
+      countdownLeft: f.countdownLeft,
+      excite: f.finishedFor >= 0 ? 1 : f.countdownLeft !== null ? 0.6 : 0.15,
+    });
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -645,7 +609,23 @@ export class View3D {
     const intro = f.countdownLeft !== null && f.countdownLeft > 900 && f.introMs > 0;
     const victory = f.finishedFor >= 0;
 
-    if (intro) {
+    const stage = f.podium && f.podium.length ? this.stage : null;
+    if (stage) {
+      // Winners' stage: a slow sweep in front of the podium. On tall screens the
+      // camera aims low so the podium sits in the top half, above the results.
+      const t = (now - this.podiumSince) / 1000;
+      const sway = Math.sin(t * 0.35) * (portrait ? 70 : 150);
+      const zoomIn = Math.exp(-t * 0.9);
+      const dist = (portrait ? 560 : 400) + zoomIn * 260;
+      fov = portrait ? 58 : 46;
+      // On wide screens the results sit on the right, so the stage moves left
+      const side = portrait ? 0 : 400 * Math.tan((fov * Math.PI) / 360) * this.camera.aspect * 0.4;
+      target.set(stage.cx + sway + side, (portrait ? 120 : 84) + zoomIn * 120, stage.cz + dist);
+      look.set(stage.cx + side, portrait ? -70 : 34, stage.cz);
+      this.camPos.copy(target);
+      this.camLook.copy(look);
+      this.started = true;
+    } else if (intro) {
       // Opening fly-in: start high above the grid and swoop down behind the kart.
       const t = Math.min(1, Math.max(0, 1 - (f.countdownLeft! - 900) / f.introMs));
       const e = t * t * (3 - 2 * t);
@@ -711,10 +691,10 @@ export class View3D {
       look.set(me.x + cx * ahead + sx, near ? 16 : portrait ? 8 : 18, me.y + cz * ahead + sz);
       fov += 9 * Math.min(1, speedR) ** 1.5;
     }
-    if (!victory && !intro) fov += this.fovKick;
+    if (!victory && !intro && !stage) fov += this.fovKick;
     if (this.blendT > 0) posK = Math.min(posK, 6);
 
-    if (!intro) {
+    if (!intro && !stage) {
       const k = smooth(posK, dt);
       this.camPos.lerp(target, k);
       this.camLook.lerp(look, Math.min(1, k * 1.4));
@@ -725,8 +705,8 @@ export class View3D {
       this.camera.updateProjectionMatrix();
     }
     this.camera.position.copy(this.camPos);
-    if (!intro && !victory) this.camera.position.y -= this.dip;
-    if (f.shake > 0) {
+    if (!intro && !victory && !stage) this.camera.position.y -= this.dip;
+    if (f.shake > 0 && !stage) {
       // Smooth shake: sums of sine waves instead of random jitter
       const t = now / 1000;
       const nz = (a: number) => Math.sin(t * 23 + a) * 0.5 + Math.sin(t * 31 + a * 2.3) * 0.3 + Math.sin(t * 41 + a * 3.1) * 0.2;
@@ -738,15 +718,24 @@ export class View3D {
     if (this.camera.position.y < 6) this.camera.position.y = 6;
     this.camera.lookAt(this.camLook);
     // Driver's seat: roll a little with the turn, and more in drifts
-    if (f.mode === 'driver' && !f.lookBack && !victory) {
+    if (f.mode === 'driver' && !f.lookBack && !victory && !stage) {
       const roll = Math.max(-0.06, Math.min(0.06, -this.yawRate * 0.03)) + (me.drifting ? me.driftDir * 0.05 : 0);
       this.camera.rotateZ(roll);
     }
   }
 
   dispose() {
+    if (this.worldFx) {
+      this.world.remove(this.worldFx.group);
+      this.worldFx.dispose();
+      this.worldFx = null;
+    }
     for (const c of [...this.world.children]) disposeTree(c);
     for (const k of this.karts.values()) disposeKart(k);
+    this.skids.dispose();
+    this.fireworks.dispose();
+    this.stage?.dispose();
+    this.boxTex?.dispose();
     this.renderer.dispose();
   }
 }

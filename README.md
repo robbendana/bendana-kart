@@ -3,6 +3,28 @@
 A family kart racer for phones, tablets and computers. Up to five players
 race each other live, one per device.
 
+## What's new in 4.0: the look, the sound and the menus
+
+- **A built 3D world:** low-poly trees, houses, mountains, grandstands with a
+  cheering crowd, a start gantry with countdown lamps, bend arrows, balloons
+  and weather for each track, all made in code.
+- **A real podium:** the top three stand on a winners' stage with fireworks
+  while the results and awards slide in.
+- **A new home screen:** your racer on a turntable and two big buttons, PLAY
+  and FAMILY RACE. The Garage, race picker, Settings and Help open as panels.
+- **Join by camera:** the lobby shows a QR square. Point a phone or tablet at
+  it and tap Join. The 4-letter code and a "Send invite" button still work.
+- **Saved racers in the new screens:** your level and stars on the home
+  screen, My stats and Leaders buttons, best times on the track picker, and
+  what you just earned on the podium.
+- **Spoken callouts** ("Final lap!", item names) for racers who can't read yet.
+- **Longer music** with a results tune, menu sounds, a speed dial, skid marks
+  and a race menu (Esc).
+- **Add to Home Screen** gives an app icon that opens full screen.
+
+The full write-up is in `docs/v4-presentation-plan.md` and
+`docs/v4-presentation-spec.md`.
+
 ## What's new in 2.0
 
 - **Smooth multiplayer:** karts send a short history of their motion in each
@@ -39,7 +61,7 @@ race each other live, one per device.
 - **Rocket start:** press gas just before GO. Too early and you stall.
 - **Polish:** lap and "Final lap!" banners, wrong-way warning, auto-respawn when you're lost off the road, screen shake, speed lines, engine sound, confetti, and game controller support.
 - **Practice:** race four robot karts on one device.
-- **Multiplayer:** one player taps **Host Race** and gets a 4-letter code. Everyone else taps **Join Race** and types it in.
+- **Multiplayer:** one player taps **Family Race**, then **Start a room**, and gets a 4-letter code and a QR square. Everyone else scans the square, or taps **Family Race** and types the code.
 
 ## Saved racers, stats and the family leaderboard
 
