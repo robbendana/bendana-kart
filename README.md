@@ -3,6 +3,54 @@
 A family kart racer for phones, tablets and computers. Up to five players
 race each other live, one per device.
 
+## What's new in 4.0 (gameplay)
+
+- **Robots in family races:** with fewer than five people in an online race,
+  robot karts fill the empty seats, so there are always 5 racers. The host can
+  switch them off. They cost no extra network messages, and if the host drops
+  out another device takes them over.
+- **Smarter robots:** they take the racing line, overtake, steer around
+  bananas and hazards, go for item boxes and boost pads, drift for
+  mini-turbos and use items with a reason. Pick 🐢 Chill, 🙂 Fair or 🔥 Fast.
+  Robots give you a break after you have been hit.
+- **3 new items:** 🧲 Coin Magnet (coins fly to you), 🌈 Rainbow Rush (fast,
+  can't be hit, spins out anyone you touch) and 📣 Mega Honk (a shockwave that
+  shoves karts away and clears bananas and blasts).
+- **Track hazards:** mud on Sunny Meadow, syrup on Candy Canyon, snow drifts
+  on Frosty Peaks, sand on Dusty Dunes and lava cracks on Volcano Loop. Steer
+  around them, or boost straight through.
+- **Closer family races:** online, players far behind the leader get a small
+  tailwind.
+- **You know who got you:** "🍌 Mia got you!" and "🎯 You got Dad!".
+- **Fixes:** Sunny Meadow now has its boost pads, ramps and coins on the first
+  race; places in close online battles are right; a results screen left open
+  no longer uses up the network allowance; tracks use much less memory on
+  tablets.
+
+The design is in [docs/v4-gameplay-spec.md](docs/v4-gameplay-spec.md).
+
+## What's new in 4.0: the look, the sound and the menus
+
+- **A built 3D world:** low-poly trees, houses, mountains, grandstands with a
+  cheering crowd, a start gantry with countdown lamps, bend arrows, balloons
+  and weather for each track, all made in code.
+- **A real podium:** the top three stand on a winners' stage with fireworks
+  while the results and awards slide in.
+- **A new home screen:** your racer on a turntable and two big buttons, PLAY
+  and FAMILY RACE. The Garage, race picker, Settings and Help open as panels.
+- **Join by camera:** the lobby shows a QR square. Point a phone or tablet at
+  it and tap Join. The 4-letter code and a "Send invite" button still work.
+- **Saved racers in the new screens:** your level and stars on the home
+  screen, My stats and Leaders buttons, best times on the track picker, and
+  what you just earned on the podium.
+- **Spoken callouts** ("Final lap!", item names) for racers who can't read yet.
+- **Longer music** with a results tune, menu sounds, a speed dial, skid marks
+  and a race menu (Esc).
+- **Add to Home Screen** gives an app icon that opens full screen.
+
+The full write-up is in `docs/v4-presentation-plan.md` and
+`docs/v4-presentation-spec.md`.
+
 ## What's new in 2.0
 
 - **Smooth multiplayer:** karts send a short history of their motion in each
@@ -16,7 +64,7 @@ race each other live, one per device.
 - **Boost pads, jump ramps and tricks:** tap ⭐ (or Space) in the air for a
   trick and a boost when you land.
 - **Coins:** each one adds a little top speed (up to 10). Getting hit drops some.
-- **7 items with a spinning roulette:** 🚀 Turbo Rocket, 🚀 Triple Rockets,
+- **Items with a spinning roulette:** 🚀 Turbo Rocket, 🚀 Triple Rockets,
   🍌 Banana Peel, 🍌 Triple Bananas, 💥 Homing Blast, 🫧 Bubble Shield and
   💤 Snooze Cloud (slows everyone ahead, only for karts at the back).
 - **Slipstream:** stay right behind another kart for a speed boost.
@@ -38,8 +86,32 @@ race each other live, one per device.
 - **Drifting:** hold Shift while turning (on touch screens, just keep holding a turn). Blue, then orange, then purple sparks; let go for a mini-turbo.
 - **Rocket start:** press gas just before GO. Too early and you stall.
 - **Polish:** lap and "Final lap!" banners, wrong-way warning, auto-respawn when you're lost off the road, screen shake, speed lines, engine sound, confetti, and game controller support.
-- **Practice:** race four robot karts on one device.
-- **Multiplayer:** one player taps **Host Race** and gets a 4-letter code. Everyone else taps **Join Race** and types it in.
+- **Practice:** race four robot karts on one device. Robots also fill empty seats online.
+- **Multiplayer:** one player taps **Family Race**, then **Start a room**, and gets a 4-letter code and a QR square. Everyone else scans the square, or taps **Family Race** and types the code.
+
+## Saved racers, stats and the family leaderboard
+
+Each device remembers its racers. On the menu, tap your picture to race as
+yourself: your name, character, kart and help level come back, with nothing to
+type. **Add racer** makes a new one, so a shared tablet can hold the whole
+family. A racer who already plays on another device can tap their name under
+**Add racer** to bring their stars and badges along.
+
+Every finished race adds to that racer's stats: races, wins, coins, drifts,
+best times and laps per track, stars, levels and badges. **My stats** shows
+one racer's page and **Leaderboard** ranks the family and lists the track
+records.
+
+All of it is saved in the browser's local storage, so it works offline and
+costs nothing. No database is used. Whenever devices are in a room together
+they swap leaderboards in one small `lb` message each, so every device ends up
+with the same board. The code is in `app/players.ts` (data and merging) and
+`app/family-ui.tsx` (screens).
+
+Because the data lives in the browser, clearing the browser's site data
+erases that device's copy. Racers come back from any other family device the
+next time you share a room. `?store=name` gives a tab its own save data, which
+lets one browser act as several devices in tests.
 
 ## Controls
 

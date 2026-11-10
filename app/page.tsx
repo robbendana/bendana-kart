@@ -8,13 +8,20 @@ import { KartShowcase } from './kart3d';
 import { faceCanvas } from './faces';
 import {
   beep, sfx, unlockAudio, setMuted, setMusicOn, setHaptics, startMusic, stopMusic, setMusicIntensity,
-  playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning,
+  playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning, musicDebug,
 } from './audio';
+import { say, stopVoice, unlockVoice, setVoiceOn, setVoiceMuted, voiceAvailable } from './voice';
+import { HomeBackdrop, Logo, Sheet, QrCode, TrackThumb, type ThumbLook } from './ui';
 import {
   wall, SupabaseRoom, LocalRoom, HostClock, RemoteKart, Sampler, EventLog, WakeLock, parseSamples, readSimOpts,
-  sendIntervalFor, F_SPIN, F_BOOST, F_DRIFT, F_AIR, F_SHIELD, F_DONE, F_SNOOZE, F_DRAFT,
+  sendIntervalFor, F_SPIN, F_BOOST, F_DRIFT, F_AIR, F_SHIELD, F_DONE, F_SNOOZE, F_DRAFT, F_RUSH, F_MAGNET,
   type Room, type Meta, type NetStatus, type NetEvent,
 } from './net';
+import {
+  loadStore, saveStore, activeLocal, syncActive, setActive, addPlayer, adoptPlayer, removeLocal, applyRace, mergeBoard, wireBoard, totals, levelOf,
+  type Store, type Gain,
+} from './players';
+import { WhoRow, GainStrip, FamilySheets, type Kit, type FamilyPanel } from './family-ui';
 
 /* =========================================================================
    Bendana Kart: a family kart racer.
@@ -112,7 +119,7 @@ function kartColors(kartIdx: number, paint: number): { color: string; dark: stri
   return { color: k.color, dark: k.dark };
 }
 
-type ItemKind = 'rocket' | 'rocket3' | 'banana' | 'banana3' | 'blast' | 'shield' | 'snooze';
+type ItemKind = 'rocket' | 'rocket3' | 'banana' | 'banana3' | 'blast' | 'shield' | 'snooze' | 'magnet' | 'rush' | 'honk';
 const ITEMS: Record<ItemKind, { emoji: string; label: string; charges: number }> = {
   rocket: { emoji: '🚀', label: 'Turbo Rocket', charges: 1 },
   rocket3: { emoji: '🚀', label: 'Triple Rockets', charges: 3 },
@@ -121,18 +128,28 @@ const ITEMS: Record<ItemKind, { emoji: string; label: string; charges: number }>
   blast: { emoji: '💥', label: 'Homing Blast', charges: 1 },
   shield: { emoji: '🫧', label: 'Bubble Shield', charges: 1 },
   snooze: { emoji: '💤', label: 'Snooze Cloud', charges: 1 },
+  magnet: { emoji: '🧲', label: 'Coin Magnet', charges: 1 },
+  rush: { emoji: '🌈', label: 'Rainbow Rush', charges: 1 },
+  honk: { emoji: '📣', label: 'Mega Honk', charges: 1 },
 };
-const ITEM_KINDS: ItemKind[] = ['rocket', 'rocket3', 'banana', 'banana3', 'blast', 'shield', 'snooze'];
+const ITEM_KINDS: ItemKind[] = ['rocket', 'rocket3', 'banana', 'banana3', 'blast', 'shield', 'snooze', 'magnet', 'rush', 'honk'];
 // Item odds by how far back you are: [leader, middle, last]
 const ITEM_ODDS: Record<ItemKind, [number, number, number]> = {
-  rocket: [10, 25, 25],
-  rocket3: [0, 10, 25],
-  banana: [45, 15, 0],
-  banana3: [20, 15, 0],
-  blast: [0, 20, 25],
-  shield: [25, 15, 10],
-  snooze: [0, 0, 15],
+  rocket: [10, 22, 20],
+  rocket3: [0, 10, 22],
+  banana: [34, 12, 0],
+  banana3: [14, 10, 0],
+  blast: [0, 18, 20],
+  shield: [20, 12, 8],
+  snooze: [0, 0, 12],
+  magnet: [14, 8, 0], // coins for the front of the pack
+  rush: [0, 4, 16], // the big comeback item
+  honk: [8, 10, 6],
 };
+const RUSH_TIME = 3.5;
+const MAGNET_TIME = 7;
+const MAGNET_REACH = 240;
+const HONK_REACH = 290;
 
 // ---------- Small math helpers ----------
 type Vec = { x: number; y: number };
@@ -323,11 +340,22 @@ let TRACK = buildTrack(TRACKS[0]);
 
 function setTrack(i: number) {
   const idx = clamp(Math.floor(i) || 0, 0, TRACKS.length - 1);
-  if (idx === TRACK_IDX && TRACK) return;
-  TRACK_IDX = idx;
-  THEME = TRACKS[idx];
-  TRACK = buildTrack(THEME);
+  // (The first track is built at load, but its features are worked out here.)
+  if (idx === TRACK_IDX && TRACK && featureCache.has(idx)) return;
+  if (idx !== TRACK_IDX) {
+    TRACK_IDX = idx;
+    THEME = TRACKS[idx];
+    TRACK = buildTrack(THEME);
+  }
   FEATURES = computeFeatures();
+  // Painted tracks are big (about 26 MB each). Keep only this track's, so a
+  // cup of four tracks does not run a tablet out of canvas memory.
+  for (const [key, c] of trackCanvasCache) {
+    if (key.startsWith(`${idx}|`)) continue;
+    c.width = 0;
+    c.height = 0;
+    trackCanvasCache.delete(key);
+  }
 }
 
 function nearestOnTrack(x: number, y: number, hint: number): { idx: number; dist: number } {
@@ -375,13 +403,27 @@ function gridPose(slot: number) {
 // Placed automatically on the straightest stretches of each track.
 type Pad = { idx: number; lat: number; x: number; y: number; a: number };
 type Ramp = { idx: number; x: number; y: number; a: number };
-type Features = { pads: Pad[]; ramps: Ramp[]; coins: { idx: number; lat: number; x: number; y: number }[] };
+// Hazards are round patches on the road that slow a kart down: mud, syrup,
+// snow, sand or lava, one kind per track. They sit off the middle of the road,
+// so a kart that keeps to the centre never touches one.
+type HazardKind = 'mud' | 'syrup' | 'snow' | 'sand' | 'lava';
+type Hazard = { idx: number; lat: number; x: number; y: number; a: number; r: number; kind: HazardKind };
+const HAZARD_KINDS: HazardKind[] = ['mud', 'syrup', 'snow', 'sand', 'lava'];
+const HAZARD_FRACS = [0.18, 0.47, 0.75, 0.93, 0.28, 0.57, 0.84, 0.38, 0.66]; // tried in this order, so they spread around the lap
+const HAZARD_LOOK: Record<HazardKind, { fill: string; rim: string; spot: string; splash: string; emoji: string }> = {
+  mud: { fill: '#6b4423', rim: '#4a2c14', spot: '#8a5a30', splash: '#6b4423', emoji: '💦' },
+  syrup: { fill: '#e11d48', rim: '#9f1239', spot: '#fb7185', splash: '#fb7185', emoji: '🍯' },
+  snow: { fill: '#f8fafc', rim: '#cbd5e1', spot: '#e2e8f0', splash: '#ffffff', emoji: '❄️' },
+  sand: { fill: '#fde68a', rim: '#d97706', spot: '#fcd34d', splash: '#fcd34d', emoji: '🏜️' },
+  lava: { fill: '#f97316', rim: '#7f1d1d', spot: '#fde047', splash: '#fb923c', emoji: '🔥' },
+};
+type Features = { pads: Pad[]; ramps: Ramp[]; coins: { idx: number; lat: number; x: number; y: number }[]; hazards: Hazard[] };
 const PAD_LEN = 70;
 const PAD_W = 76;
 const RAMP_LEN = 36;
 const BOX_FRACS = [0.13, 0.33, 0.52, 0.7, 0.88];
 const COIN_FRACS = [0.22, 0.42, 0.61, 0.79];
-let FEATURES: Features = { pads: [], ramps: [], coins: [] };
+let FEATURES: Features = { pads: [], ramps: [], coins: [], hazards: [] };
 const featureCache = new Map<number, Features>();
 
 function trackAngle(i: number) {
@@ -445,7 +487,27 @@ function computeFeatures(): Features {
       coins.push({ idx, lat, ...trackPoint(idx, lat) });
     }
   });
-  const out = { pads, ramps, coins };
+  // Hazards: alternate sides, clear of the pads, ramps, boxes and coin rows
+  const hazards: Hazard[] = [];
+  const line = raceLine();
+  const rnd = mulberry32(977 + TRACK_IDX * 131);
+  const kind = HAZARD_KINDS[TRACK_IDX % HAZARD_KINDS.length];
+  let side = rnd() < 0.5 ? -1 : 1;
+  for (const fr of HAZARD_FRACS) {
+    if (hazards.length >= 5) break;
+    const idx = Math.floor(fr * n);
+    const jitter = rnd();
+    const size = rnd();
+    if (!far(idx, 34)) continue; // a pad or ramp is right here
+    // Keep off the driving line, so following the coloured dots is always safe
+    const rl = line[idx];
+    if (Math.abs(rl) > 10) side = rl > 0 ? -1 : 1;
+    const lat = side * (68 + jitter * 26) * LANE_K * 0.78;
+    side = -side;
+    const p = trackPoint(idx, lat);
+    hazards.push({ idx, lat, x: p.x, y: p.y, a: p.a, r: 36 + size * 10, kind });
+  }
+  const out = { pads, ramps, coins, hazards };
   featureCache.set(TRACK_IDX, out);
   return out;
 }
@@ -527,6 +589,43 @@ function sceneryItems(): SceneryItem[] {
   }
   sceneryCache.set(TRACK_IDX, out);
   return out;
+}
+
+/** A hazard patch painted flat on the road: a wobbly blob with a rim and spots. */
+function drawHazard(ctx: CanvasRenderingContext2D, hz: Hazard) {
+  const look = HAZARD_LOOK[hz.kind];
+  const rnd = mulberry32(Math.round(hz.x * 7 + hz.y * 13));
+  ctx.save();
+  ctx.translate(hz.x, hz.y);
+  ctx.rotate(hz.a);
+  const blob = (r: number) => {
+    ctx.beginPath();
+    for (let i = 0; i <= 14; i++) {
+      const a = (i / 14) * Math.PI * 2;
+      const rr = r * (0.86 + 0.14 * Math.sin(a * 3 + hz.x) + 0.06 * Math.sin(a * 5 + hz.y));
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr * 1.12, Math.sin(a) * rr * 0.92);
+      else ctx.lineTo(Math.cos(a) * rr * 1.12, Math.sin(a) * rr * 0.92);
+    }
+    ctx.closePath();
+  };
+  blob(hz.r + 5);
+  ctx.fillStyle = look.rim;
+  ctx.fill();
+  blob(hz.r);
+  const g = ctx.createRadialGradient(-hz.r * 0.2, -hz.r * 0.2, 2, 0, 0, hz.r);
+  g.addColorStop(0, look.spot);
+  g.addColorStop(1, look.fill);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.fillStyle = hz.kind === 'lava' ? 'rgba(254,240,138,0.85)' : 'rgba(255,255,255,0.28)';
+  for (let i = 0; i < 5; i++) {
+    const a = rnd() * Math.PI * 2;
+    const d = rnd() * hz.r * 0.6;
+    ctx.beginPath();
+    ctx.ellipse(Math.cos(a) * d, Math.sin(a) * d, 3 + rnd() * 5, 2 + rnd() * 3, rnd() * 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 const trackCanvasCache = new Map<string, HTMLCanvasElement>();
@@ -626,6 +725,7 @@ function getTrackCanvas(flat = false): HTMLCanvasElement {
     ctx.fillRect(RAMP_LEN / 2, -w / 2, 10, w);
     ctx.restore();
   }
+  for (const hz of FEATURES.hazards) drawHazard(ctx, hz);
   // Start / finish checkers
   const { xs, ys, tx, ty } = TRACK;
   ctx.save();
@@ -728,6 +828,17 @@ type Kart = {
   lapClean: boolean;
   lapGrass: number;
   sc: { bendT: number; goodT: number; roadT: number; grassT: number };
+  // Items, hazards and robots (4.0)
+  slot: number; // grid slot
+  rushT: number; // Rainbow Rush: fast and can't be hit
+  magnetT: number; // Coin Magnet
+  mudT: number; // in (or just out of) a hazard patch
+  honkT: number; // dazed by a Mega Honk
+  heldT: number; // how long the current item has been held
+  home: number; // a robot's favourite side of the road
+  tail: number; // catch-up tailwind for the players at the back (0..1)
+  hitAt: number; // performance.now() of the last spin-out or honk (robots give you a break after one)
+  coinClock: number; // robots earn coins over time
 };
 
 type Remote = {
@@ -757,9 +868,13 @@ type Remote = {
   react: { e: string; until: number } | null;
   stats: RaceStats | null;
   slot: number;
+  bot: boolean; // a robot simulated on another device
+  owner: string; // the device that simulates this robot ('' for players)
+  pkProg: number; // progress in the newest message
+  hitAt: number;
 };
-type Box = { id: string; x: number; y: number; hiddenUntil: number };
-type Banana = { id: string; x: number; y: number; owner: string; safeUntil: number };
+type Box = { id: string; x: number; y: number; hiddenUntil: number; idx: number; lat: number };
+type Banana = { id: string; x: number; y: number; owner: string; safeUntil: number; ti?: number; tl?: number };
 type Blast = { id: string; x: number; y: number; angle: number; owner: string; target: string | null; life: number };
 type Coin = { x: number; y: number; hiddenUntil: number };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number };
@@ -801,7 +916,13 @@ type Game = {
   raceScore: number;
   lapAt: number[]; // race ms of each lap line crossing (for tests)
   tip: string | null; // the one coaching tip shown this race, if any
-  emit: (ev: NetEvent) => void; // send an event to the other screens
+  emit: (ev: NetEvent, lazy?: boolean) => void; // send an event to the other screens (lazy: with the next state message)
+  botLevel: number; // 0 chill, 1 fair, 2 fast
+  botOwner: string; // the device that simulates the robots ('' when there are none)
+  botEase: number; // robots go easier when the players have steering help on
+  packRef: number; // the progress robots pace themselves against
+  hitLog: string[]; // what hit me and when (for tests)
+  lagMs: number; // rough one-way network delay, from the clock pings
 };
 
 type Racer = {
@@ -815,6 +936,10 @@ type Racer = {
   finishTime: number;
   isMe: boolean;
   human: boolean;
+  speed: number;
+  safe: boolean; // Toddler Assist: nothing can hit this kart
+  rush: boolean; // Rainbow Rush: touching it spins you out
+  hitAt: number;
 };
 
 const AIR_TIME = 0.75;
@@ -830,15 +955,52 @@ function makeKart(id: string, name: string, kartIdx: number, slot: number, toddl
     offroad: false, item: null, charges: 0, rollT: 0, boostT: 0, spinT: 0, spinA: 0,
     toddler, bot, finished: false, finishTime: 0,
     botTimer: 1 + Math.random() * 2,
-    lane: bot ? [-78, 78, -26, 26][slot % 4] + (Math.random() - 0.5) * 24 : 0, // each robot keeps its own lane
-    skill: bot ? 0.84 + Math.random() * 0.06 : 1,
+    lane: bot ? [-78, 78, -26, 26][slot % 4] : 0, // each robot starts in its own lane
+    skill: bot ? 0.87 : 1,
     drifting: false, driftDir: 0, charge: 0, tier: 0, miniT: 0, stallT: 0,
     invT: 0, offT: 0, wrongT: 0, steerHeldT: 0, assist: 0,
     coins: 0, coinT: 0, padT: 0, airT: 0, airMax: AIR_TIME, rampCool: 0, trickDone: false, trickT: 0, trickA: 0,
     shieldT: 0, snoozeT: 0, draftC: 0, draftT: 0, epoch: 0, react: null, st: newStats(), snoozeUsed: false,
     help: 0, rescue: 0, curb: false, dist: 0, curbT: 0, grassT: 0, hopT: 0, slip: 0, bumpT: 0, landT: 0, accelS: 0, prevFwd: 0,
     boostLvl: 0, kicks: 0, steerIn: 0, autoSteer: 0, lapClean: true, lapGrass: 0, sc: { bendT: 0, goodT: 0, roadT: 0, grassT: 0 },
+    slot, rushT: 0, magnetT: 0, mudT: 0, honkT: 0, heldT: 0, home: bot ? [-78, 78, -26, 26][slot % 4] : 0, tail: 0, hitAt: -1e9, coinClock: 0,
   };
+}
+
+/** A small stable hash, so every device gives a robot the same personality. */
+function hashStr(str: string) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+const BOT_LEVELS = [
+  // speed: top speed factor · turbo: mini-turbo strength · wait: item reaction time
+  // mercy: ms a player is left alone after a hit · chase / wait4 / lead: how hard
+  // robots catch up when behind, and how much and how soon they ease off when ahead
+  { label: 'Chill', icon: '🐢', blurb: 'Slow and gentle robots', speed: 0.93, turbo: 0, wait: 1.6, mercy: 20000, chase: 0.07, wait4: 0.16, lead: 0 },
+  { label: 'Fair', icon: '🙂', blurb: 'A friendly race', speed: 0.95, turbo: 0.3, wait: 1.2, mercy: 20000, chase: 0.12, wait4: 0.16, lead: 0 },
+  { label: 'Fast', icon: '🔥', blurb: 'Robots that drift and fight back', speed: 1.06, turbo: 1, wait: 0.6, mercy: 8000, chase: 0.12, wait4: 0.05, lead: 150 },
+];
+/** Give a robot its skill and favourite lane (the same on every device). */
+function tuneBot(k: Kart, raceId: string, level: number, ease: number) {
+  const rnd = mulberry32(hashStr(raceId + k.id));
+  k.skill = (0.84 + rnd() * 0.06) * (BOT_LEVELS[level] ?? BOT_LEVELS[1]).speed * ease;
+  k.home = [-78, 78, -26, 26][k.slot % 4] + (rnd() - 0.5) * 24;
+  k.botTimer = 1 + rnd() * 2;
+}
+
+// Robot line-up: [racer, kart body] for each robot, picked by the host
+type BotSpec = [number, number];
+function pickBots(count: number, taken: number[], prev: BotSpec[] | null): BotSpec[] {
+  if (count <= 0) return [];
+  // Keep the same robots from race to race (cup points follow them)
+  if (prev && prev.length === count && prev.every((b) => !taken.includes(b[0]))) return prev;
+  const pool = KARTS.map((_, i) => i).filter((i) => !taken.includes(i));
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, count).map((k) => [k, Math.floor(Math.random() * BODIES.length)] as BotSpec);
 }
 
 function makeRemote(id: string, name: string, kartIdx: number, paint: number, body: number, toddler: boolean, slot: number): Remote {
@@ -847,7 +1009,7 @@ function makeRemote(id: string, name: string, kartIdx: number, paint: number, bo
     id, name, kartIdx, paint, body, toddler, net: new RemoteKart(),
     x: p.x, y: p.y, angle: p.angle, vx: 0, vy: 0, speed: 0, spinA: 0, flags: 0,
     lap: 0, idx: p.idx, progress: p.idx, finished: false, finishTime: 0, coins: 0,
-    leftAt: 0, alpha: 1, react: null, stats: null, slot,
+    leftAt: 0, alpha: 1, react: null, stats: null, slot, bot: false, owner: '', pkProg: p.idx, hitAt: -1e9,
   };
 }
 
@@ -859,7 +1021,7 @@ function makeBoxes(): Box[] {
     const nx = -ty[idx];
     const ny = tx[idx];
     [-108, -36, 36, 108].forEach((lane, j) => {
-      out.push({ id: `b${i}_${j}`, x: xs[idx] + nx * lane, y: ys[idx] + ny * lane, hiddenUntil: 0 });
+      out.push({ id: `b${i}_${j}`, x: xs[idx] + nx * lane, y: ys[idx] + ny * lane, hiddenUntil: 0, idx, lat: lane });
     });
   });
   return out;
@@ -869,9 +1031,12 @@ function makeBoxes(): Box[] {
 type Skill = { s: number; n: number };
 const SKILL_KEY = 'bendana-kart-skill';
 const TIPS_KEY = 'bendana-kart-tips';
+// Each saved racer has their own driving score, so a parent's skill never takes help away from a child
+let skillOwner = '';
+const skillKey = () => (skillOwner ? `${SKILL_KEY}:${skillOwner}` : SKILL_KEY);
 function loadSkill(): Skill {
   try {
-    const v = JSON.parse(window.localStorage.getItem(SKILL_KEY) || 'null');
+    const v = JSON.parse(window.localStorage.getItem(skillKey()) || 'null');
     if (v && typeof v.s === 'number' && typeof v.n === 'number') return { s: clamp(v.s, 0, 1), n: Math.max(0, v.n | 0) };
   } catch {
     /* storage blocked */
@@ -880,7 +1045,7 @@ function loadSkill(): Skill {
 }
 function saveSkill(sk: Skill) {
   try {
-    window.localStorage.setItem(SKILL_KEY, JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
+    window.localStorage.setItem(skillKey(), JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
   } catch {
     /* storage blocked */
   }
@@ -952,31 +1117,58 @@ type RaceCfg = {
   cup: number; // -1 single race
   round: number;
   nonce: number;
+  bots: BotSpec[]; // the robots in this race
+  botLevel: number;
+  botOwner: string; // the device that simulates them (the host)
 };
 
 function createGame(cfg: RaceCfg, meId: string, profile: Profile, roster: Map<string, Meta>): Game {
   const karts: Kart[] = [];
   const remotes = new Map<string, Remote>();
+  // Robots go easier when the players have steering help on
+  const easeOf = (toddler: boolean, assist: number) => (toddler ? 0.86 : [1, 0.94, 0.87][assist] ?? 1);
+  let botEase = 1;
+  let botOwner = '';
   if (cfg.mode === 'solo') {
-    const pool = KARTS.map((_, i) => i).filter((i) => i !== profile.kartIdx);
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-    const others = pool.slice(0, 4);
     karts.push(makeKart(meId, profile.name || 'You', profile.kartIdx, 4, profile.toddler, false, profile.paint, profile.body));
-    others.forEach((k, i) => karts.push(makeKart(`bot${i}`, `${KARTS[k].name}`, k, i, false, true, -1, Math.floor(Math.random() * BODIES.length))));
-    // Robots go easier when the player has steering help on
-    const ease = profile.toddler ? 0.86 : [1, 0.94, 0.87][profile.assist] ?? 1;
-    for (const b of karts) if (b.bot) b.skill *= ease;
+    botEase = easeOf(profile.toddler, profile.assist);
+    cfg.bots.forEach(([k, body], i) => {
+      const b = makeKart(`bot${i}`, `${(KARTS[k] || KARTS[0]).name}`, k, i, false, true, -1, body);
+      tuneBot(b, cfg.id, cfg.botLevel, botEase);
+      karts.push(b);
+    });
+    botOwner = meId;
   } else {
     const slot = Math.max(0, cfg.order.indexOf(meId));
     karts.push(makeKart(meId, profile.name || 'Racer', profile.kartIdx, slot, profile.toddler, false, profile.paint, profile.body));
     // Everyone else appears on the grid right away, before their first message
+    let easeSum = easeOf(profile.toddler, profile.assist);
     cfg.order.forEach((id, i) => {
       if (id === meId) return;
       const m = parseMeta(id, roster.get(id));
+      easeSum += easeOf(m.toddler, m.assist);
       remotes.set(id, makeRemote(id, m.name, m.kartIdx, m.paint, m.body, m.toddler, i));
+    });
+    botEase = easeSum / Math.max(1, cfg.order.length);
+    // Robots fill the empty seats. The host's device drives them and sends
+    // their motion inside its own messages; everyone else just draws them.
+    // A device that joins late never starts its own set.
+    const mine = cfg.botOwner === meId && wall() < cfg.goWall + 1500;
+    botOwner = cfg.bots.length ? cfg.botOwner : '';
+    cfg.bots.forEach(([k, body], i) => {
+      const id = `bot${i}`;
+      const s = cfg.order.length + i;
+      const name = (KARTS[k] || KARTS[0]).name;
+      if (mine) {
+        const b = makeKart(id, name, k, s, false, true, -1, body);
+        tuneBot(b, cfg.id, cfg.botLevel, botEase);
+        karts.push(b);
+      } else {
+        const r = makeRemote(id, name, k, -1, body, false, s);
+        r.bot = true;
+        r.owner = cfg.botOwner;
+        remotes.set(id, r);
+      }
     });
   }
   karts[0].assist = profile.toddler ? 2 : profile.assist;
@@ -1014,18 +1206,76 @@ function createGame(cfg: RaceCfg, meId: string, profile: Profile, roster: Map<st
     lapAt: [],
     tip: null,
     emit: () => undefined,
+    botLevel: clamp(cfg.botLevel | 0, 0, 2),
+    botOwner,
+    botEase,
+    packRef: 0,
+    hitLog: [],
+    lagMs: 60,
   };
+}
+
+/** Take over robots another device was driving (it left or went quiet). */
+function adoptBots(G: Game) {
+  const n = TRACK.n;
+  for (const r of [...G.remotes.values()]) {
+    if (!r.bot) continue;
+    const k = makeKart(r.id, r.name, r.kartIdx, r.slot, false, true, r.paint, r.body);
+    tuneBot(k, G.raceId, G.botLevel, G.botEase);
+    if (r.net.ready()) {
+      k.x = r.x;
+      k.y = r.y;
+      k.angle = r.angle;
+      k.vx = r.vx;
+      k.vy = r.vy;
+      k.idx = nearestOnTrack(r.x, r.y, -1).idx;
+      k.lap = Math.round((r.progress - k.idx) / n);
+      k.progress = k.lap * n + k.idx;
+      k.lane = clamp(lateralOf(k.x, k.y, k.idx), -100, 100);
+    }
+    k.finished = r.finished;
+    k.finishTime = r.finishTime;
+    k.coins = r.coins;
+    k.epoch = r.net.epoch + 1 + Math.floor(Math.random() * 1000) * 2;
+    G.karts.push(k);
+    G.remotes.delete(r.id);
+  }
+  G.botOwner = G.meId;
+}
+
+/** Another device is already driving the robots: hand mine over to it. */
+function yieldBots(G: Game, owner: string) {
+  for (const k of G.karts) {
+    if (!k.bot) continue;
+    const r = makeRemote(k.id, k.name, k.kartIdx, k.paint, k.body, false, k.slot);
+    r.bot = true;
+    r.owner = owner;
+    r.x = k.x;
+    r.y = k.y;
+    r.angle = k.angle;
+    r.lap = k.lap;
+    r.idx = k.idx;
+    r.progress = r.pkProg = k.progress;
+    r.finished = k.finished;
+    r.finishTime = k.finishTime;
+    r.coins = k.coins;
+    G.remotes.set(k.id, r);
+  }
+  G.karts = G.karts.filter((k) => !k.bot);
+  G.botOwner = owner;
 }
 
 function racers(G: Game): Racer[] {
   const list: Racer[] = G.karts.map((k) => ({
     id: k.id, name: k.name, kartIdx: k.kartIdx, x: k.x, y: k.y,
     progress: k.progress, finished: k.finished, finishTime: k.finishTime, isMe: k.id === G.meId, human: !k.bot,
+    speed: Math.hypot(k.vx, k.vy), safe: k.toddler, rush: k.rushT > 0, hitAt: k.hitAt,
   }));
   G.remotes.forEach((r) => {
     list.push({
       id: r.id, name: r.name, kartIdx: r.kartIdx, x: r.x, y: r.y,
-      progress: r.progress, finished: r.finished, finishTime: r.finishTime, isMe: false, human: true,
+      progress: r.progress, finished: r.finished, finishTime: r.finishTime, isMe: false, human: !r.bot,
+      speed: r.speed, safe: r.toddler, rush: !!(r.flags & F_RUSH), hitAt: r.hitAt,
     });
   });
   return list;
@@ -1059,7 +1309,7 @@ function react(k: { react: { e: string; until: number } | null }, e: string, ms 
 
 /** A kart on this device got hit. Returns true if it actually spun out. */
 function spinOut(G: Game, k: Kart): boolean {
-  if (k.toddler || k.invT > 0 || k.spinT > 0) return false; // Toddler Assist karts are invincible
+  if (k.toddler || k.invT > 0 || k.spinT > 0 || k.rushT > 0) return false; // Toddler Assist and Rainbow Rush karts are invincible
   const isMe = k.id === G.meId;
   if (k.shieldT > 0) {
     k.shieldT = 0;
@@ -1072,6 +1322,7 @@ function spinOut(G: Game, k: Kart): boolean {
     return false;
   }
   k.spinT = 1;
+  k.hitAt = performance.now();
   k.boostT = 0;
   k.miniT = 0;
   k.padT = 0;
@@ -1146,6 +1397,129 @@ function autopilot(k: Kart): { steer: number; throttle: number; brake: number } 
   return { steer, throttle, brake: 0 };
 }
 
+// ---------- Robot drivers ----------
+// A robot picks a lane a little way ahead, then the autopilot above drives to
+// it. The lane starts from the racing line and the robot's favourite side,
+// goes for item boxes and boost pads, and swerves around bananas, hazards and
+// slower karts. All of it is plain steering, so robots make the same kinds of
+// moves a person does.
+function bananaTrackPos(b: Banana) {
+  if (b.ti === undefined) {
+    b.ti = nearestOnTrack(b.x, b.y, -1).idx;
+    b.tl = lateralOf(b.x, b.y, b.ti);
+  }
+  return { idx: b.ti, lat: b.tl ?? 0 };
+}
+
+function botPlan(G: Game, k: Kart, all: Racer[], dt: number, now: number) {
+  const n = TRACK.n;
+  const line = raceLine();
+  const myLat = lateralOf(k.x, k.y, k.idx);
+  const speed = Math.hypot(k.vx, k.vy);
+  const edge = 102;
+  let want = clamp(line[(k.idx + 14) % n] * 1.1 + k.home * 0.45, -edge, edge);
+  // Something to grab: the nearest item box when the hands are empty, or a boost pad
+  if (!k.item) {
+    let best = 0;
+    let bestD = Infinity;
+    for (const b of G.boxes) {
+      if (now < b.hiddenUntil) continue;
+      const d = idxDelta(b.idx, k.idx);
+      if (d < 3 || d > 48) continue;
+      const off = Math.abs(b.lat - myLat) + d * 0.5;
+      if (off < bestD) {
+        bestD = off;
+        best = b.lat;
+      }
+    }
+    if (bestD < Infinity) want = best;
+  }
+  if (k.padT <= 0) {
+    for (const p of FEATURES.pads) {
+      const d = idxDelta(p.idx, k.idx);
+      if (d > 3 && d < 36 && Math.abs(p.lat - myLat) < 95) want = p.lat;
+    }
+  }
+  // Things to miss
+  const dodge = (oLat: number, d: number, clear: number) => {
+    if (d < 1 || d > 36 || Math.abs(want - oLat) >= clear) return;
+    let side = want !== oLat ? Math.sign(want - oLat) : myLat >= oLat ? 1 : -1;
+    if (Math.abs(oLat + side * clear) > edge) side = -side;
+    want = oLat + side * clear;
+  };
+  for (const o of all) {
+    if (o.id === k.id || o.finished) continue;
+    const oi = ((Math.round(o.progress) % n) + n) % n;
+    const d = idxDelta(oi, k.idx);
+    if (d < 1 || d > 30) continue;
+    // Only go around karts I am catching (or anything rushing at me)
+    if (speed > o.speed + 15 || d < 7) dodge(lateralOf(o.x, o.y, oi), d, 62);
+  }
+  for (const b of G.bananas) {
+    const t = bananaTrackPos(b);
+    dodge(t.lat, idxDelta(t.idx, k.idx), 52);
+  }
+  if (k.rushT <= 0) for (const hz of FEATURES.hazards) dodge(hz.lat, idxDelta(hz.idx, k.idx), hz.r + 34);
+  want = clamp(want, -edge, edge);
+  k.lane += clamp(want - k.lane, -dt * 190, dt * 190);
+}
+
+/** Should this robot use its item right now? */
+function botWantsFire(G: Game, k: Kart, all: Racer[], now: number): boolean {
+  const n = TRACK.n;
+  const lvl = G.botLevel;
+  // Fair play: robots leave alone anyone who was just hit, chill robots never
+  // go after a player, and fair robots give players room to dodge.
+  const mercy = (BOT_LEVELS[lvl] ?? BOT_LEVELS[1]).mercy;
+  const spare = (o: Racer) => o.safe || (lvl === 0 && o.human) || now - o.hitAt < (o.human ? mercy : 5000);
+  const straight = safeSpeed((k.idx + 8) % n, 1) > 0.95;
+  const boosting = k.boostT > 0 || k.padT > 0 || k.miniT > 0 || k.rushT > 0;
+  const incoming = G.blasts.some((b) => b.target === k.id);
+  switch (k.item) {
+    case 'rocket':
+    case 'rocket3':
+      return (straight && !boosting && !k.offroad) || k.heldT > 6;
+    case 'banana':
+    case 'banana3': {
+      // Drop it when someone is right on my tail
+      // Drop it when a robot is right on my tail. Only fast robots do that to
+      // a player; otherwise peels just get left around the track.
+      for (const o of all) {
+        if (o.id === k.id || o.finished || spare(o) || (o.human && lvl < 2)) continue;
+        const d = k.progress - o.progress;
+        if (d > (o.human ? 22 : 5) && d < (o.human ? 60 : 42)) return true;
+      }
+      // Chill and fair robots leave peels off to the side, never in the
+      // middle of the road where the steering help drives
+      if (lvl < 2 && Math.abs(lateralOf(k.x, k.y, k.idx)) < 50 && k.heldT < 20) return false;
+      return k.heldT > 3 + (hashStr(k.id) % 5);
+    }
+    case 'blast': {
+      const t = findTargetAhead(G, k);
+      if (!t) return false;
+      const tr = all.find((o) => o.id === t);
+      if (!tr || tr.progress - k.progress > 190) return k.heldT > 12;
+      // Chill robots only blast other robots, or a player who is leading
+      if (lvl === 0 && tr.human) return !all.some((o) => !o.finished && o.progress > tr.progress) && now - tr.hitAt > mercy;
+      return !spare(tr);
+    }
+    case 'shield':
+      return incoming || k.heldT > 4;
+    case 'honk': {
+      if (incoming) return true;
+      for (const o of all) {
+        if (o.id === k.id || o.finished || spare(o)) continue;
+        if ((o.x - k.x) ** 2 + (o.y - k.y) ** 2 < 170 * 170) return true;
+      }
+      return k.heldT > 15;
+    }
+    case 'rush':
+      return straight || k.heldT > 3;
+    default:
+      return true; // snooze, magnet
+  }
+}
+
 const CURB_W = 18; // rumble strip past the road edge: a warning, not a penalty
 const GRASS_RAMP = 40; // grass slows you more the deeper you go, over this distance
 const smoothK = (rate: number, dt: number) => 1 - Math.exp(-rate * dt);
@@ -1163,22 +1537,27 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   let lat0 = -k.vx * fy + k.vy * fx;
   const air = k.airT > 0;
   const help = k.toddler ? 1 : k.help;
+  const sliding = k.drifting && !k.bot; // robots show a drift but keep their grip
   // Grass: no slowdown on the curb, then a smooth ramp down to the grass limit
   const depth = edgeDist - HALF_W - CURB_W;
-  const grassP = k.toddler || air ? 0 : smoothstep(0, GRASS_RAMP, depth);
+  const grassP = k.toddler || air || k.rushT > 0 ? 0 : smoothstep(0, GRASS_RAMP, depth);
   let grassMul = Math.min(0.75, THEME.offroad * st.offroad);
   grassMul += (1 - grassMul) * help * 0.5;
   const offMul = 1 + (grassMul - 1) * grassP;
   const off = grassP > 0.5;
   // Coins add a little top speed; snooze slows you for a moment
   const coinMul = 1 + 0.01 * k.coins;
-  const snoozeMul = k.snoozeT > 0 ? 0.7 : 1;
-  let maxS = st.maxSpeed * speedMul * offMul * coinMul * snoozeMul;
+  const snoozeMul = (k.snoozeT > 0 ? 0.7 : 1) * (k.honkT > 0 ? 0.72 : 1);
+  // A hazard patch: sticky going unless you are boosting (help softens it)
+  const mud = k.mudT > 0 && !air;
+  const mudMul = mud ? Math.min(0.95, 0.55 + 0.25 * help + (st.offroad > 1.2 ? 0.15 : 0)) : 1;
+  let maxS = st.maxSpeed * speedMul * offMul * coinMul * snoozeMul * mudMul;
   let acc = st.accel;
   // The strongest active boost wins
   let boostMul = 0;
   let accMul = 1;
   if (k.boostT > 0) { boostMul = 1.6; accMul = 2.4; }
+  if (k.rushT > 0 && 1.5 > boostMul) { boostMul = 1.5; accMul = 2.4; }
   if (k.padT > 0 && 1.35 > boostMul) { boostMul = 1.35; accMul = 2; }
   if (k.miniT > 0 && 1.3 > boostMul) { boostMul = 1.3; accMul = 2; }
   if (k.trickT > 0 && 1.25 > boostMul) { boostMul = 1.25; accMul = 1.8; }
@@ -1211,7 +1590,7 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
     fwd -= Math.sign(fwd) * f;
   }
   // Faster than allowed (a boost just ended, or the grass): ease down, don't chop
-  if (fwd > maxS) fwd = Math.max(maxS, fwd - (off ? 900 : 380) * dt);
+  if (fwd > maxS) fwd = Math.max(maxS, fwd - (mud && boostMul === 0 ? 1500 : off ? 900 : 380) * dt);
   fwd *= 1 - 0.12 * dt;
   // Edge cushion: with steering help, sliding away from the road is damped
   if (help > 0 && !k.toddler && edgeDist > HALF_W - 20) {
@@ -1227,12 +1606,12 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
     }
   }
   const sf = Math.min(1, Math.abs(fwd) / 110) ** 0.8; // can still turn when slow (e.g. on grass)
-  const turnRate = st.turn * (k.drifting ? 1.15 : 1) * (air ? 0.35 : 1) * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
+  const turnRate = st.turn * (sliding ? 1.15 : 1) * (air ? 0.35 : 1) * (1 - 0.25 * clamp(Math.abs(fwd) / st.maxSpeed, 0, 1.4));
   const a0 = k.angle;
   k.angle = wrapAngle(k.angle + k.steer * turnRate * sf * (fwd >= 0 ? 1 : -1) * dt);
   k.w = dt > 0 ? wrapAngle(k.angle - a0) / dt : 0;
   const roadGrip = THEME.grip + Math.max(0, 0.9 - THEME.grip) * help;
-  const lat = lat0 * Math.exp(-st.grip * roadGrip * (k.drifting ? 0.55 : 1) * (air ? 0.2 : 1) * dt);
+  const lat = lat0 * Math.exp(-st.grip * roadGrip * (sliding ? 0.55 : 1) * (air ? 0.2 : 1) * dt);
   fx = Math.cos(k.angle);
   fy = Math.sin(k.angle);
   k.vx = fx * fwd - fy * lat;
@@ -1254,7 +1633,7 @@ function drive(k: Kart, dt: number, throttleIn: number, brake: number, speedMul:
   if (k.y > WORLD_H - m) { k.y = WORLD_H - m; k.vy = -Math.abs(k.vy) * 0.3; }
 }
 
-function rollItem(place: number, total: number, snoozeOk: boolean): ItemKind {
+function rollItem(place: number, total: number, snoozeOk: boolean, magnetOk: boolean): ItemKind {
   // Leaders mostly get bananas and shields to defend with; karts at the back
   // get boosts, blasts and the Snooze Cloud to catch up.
   const b = total > 1 ? (place - 1) / (total - 1) : 0.5; // 0 = leader, 1 = last
@@ -1263,6 +1642,8 @@ function rollItem(place: number, total: number, snoozeOk: boolean): ItemKind {
     const [lead, mid, last] = ITEM_ODDS[kind];
     let w = b < 0.5 ? lead + (mid - lead) * (b / 0.5) : mid + (last - mid) * ((b - 0.5) / 0.5);
     if (kind === 'snooze' && (!snoozeOk || total < 3)) w = 0;
+    if (kind === 'magnet' && !magnetOk) w = 0;
+    if ((kind === 'rush' || kind === 'honk') && total < 2) w = 0;
     sum += w;
     return w;
   });
@@ -1278,7 +1659,7 @@ function findTargetAhead(G: Game, k: Kart): string | null {
   let best: string | null = null;
   let bestGap = Infinity;
   for (const r of racers(G)) {
-    if (r.id === k.id || r.finished) continue;
+    if (r.id === k.id || r.finished || r.safe) continue; // a blast would bounce off a Toddler Assist bubble
     const gap = r.progress - k.progress;
     if (gap > 0 && gap < bestGap) {
       bestGap = gap;
@@ -1336,7 +1717,83 @@ function fireItem(G: Game, k: Kart, now: number) {
       sfx('snooze');
       setBanner(G, '💤 Snooze Cloud!', '#c4b5fd', 1400);
     }
+  } else if (item === 'magnet') {
+    k.magnetT = MAGNET_TIME;
+    if (k.bot) k.coins = Math.min(10, k.coins + 3);
+    react(k, '🧲', 1600);
+    if (isMe) {
+      sfx('shieldUp');
+      setBanner(G, '🧲 Coin Magnet!', '#fde047', 1200);
+    }
+  } else if (item === 'rush') {
+    // Fast, can't be hit, drives over grass and hazards, and spins out anyone it touches
+    k.rushT = RUSH_TIME;
+    k.shieldT = Math.max(k.shieldT, RUSH_TIME);
+    k.snoozeT = 0;
+    k.honkT = 0;
+    react(k, '🌈', RUSH_TIME * 1000);
+    if (isMe) {
+      sfx('rocket');
+      vibrate(160);
+      setBanner(G, '🌈 Rainbow Rush!', '#f0abfc', 1400);
+    }
+  } else if (item === 'honk') {
+    const victims = honkAt(G, k.id, k.x, k.y);
+    k.st.hits += victims;
+    if (isMe) setBanner(G, victims ? '📣 HONK! Got them!' : '📣 HONK!', '#fde047', 1200);
+    G.emit({ i: randId(), k: 'honk', o: k.id, x: Math.round(k.x), y: Math.round(k.y) });
+    if (isMe) vibrate([40, 30, 80]);
   }
+}
+
+/** A Mega Honk went off at (x, y): shove and daze the karts simulated here,
+ *  and blow away nearby banana peels and blasts. Returns how many it hit. */
+function honkAt(G: Game, from: string, x: number, y: number): number {
+  const me = G.karts[0];
+  for (let i = 0; i < 44; i++) {
+    if (G.particles.length > 450) G.particles.shift();
+    const a = (i / 44) * Math.PI * 2;
+    G.particles.push({ x: x + Math.cos(a) * 30, y: y + Math.sin(a) * 30, vx: Math.cos(a) * 620, vy: Math.sin(a) * 620, life: 0.42, max: 0.42, color: i % 2 ? '#fde047' : '#ffffff', size: 8 });
+  }
+  if ((me.x - x) ** 2 + (me.y - y) ** 2 < 900 * 900) sfx('horn');
+  const R2 = HONK_REACH * HONK_REACH;
+  G.bananas = G.bananas.filter((b) => (b.x - x) ** 2 + (b.y - y) ** 2 > R2);
+  G.blasts = G.blasts.filter((b) => b.owner === from || (b.x - x) ** 2 + (b.y - y) ** 2 > R2);
+  let hits = 0;
+  for (const k of G.karts) {
+    if (k.id === from || k.finished || k.toddler || k.rushT > 0 || k.airT > 0 || k.invT > 0) continue;
+    const dx = k.x - x;
+    const dy = k.y - y;
+    const d = Math.hypot(dx, dy);
+    if (d > HONK_REACH) continue;
+    hits++;
+    G.emit({ i: randId(), k: 'xhit', b: '-', v: k.id, o: from });
+    if (k.shieldT > 0) {
+      spinOut(G, k); // pops the bubble instead
+      continue;
+    }
+    const push = 300 * (1 - (d / HONK_REACH) * 0.5);
+    k.vx += (dx / (d || 1)) * push;
+    k.vy += (dy / (d || 1)) * push;
+    k.honkT = 1.1;
+    k.hitAt = performance.now();
+    k.boostT = 0;
+    k.miniT = 0;
+    k.drifting = false;
+    k.bumpT = 0.35;
+    react(k, '😵', 1100);
+    if (k.id === G.meId) {
+      G.shake = 10;
+      vibrate([50, 30, 50]);
+      setBanner(G, `📣 ${nameOf(G, from)} honked!`, '#fde047', 1300);
+    }
+  }
+  return hits;
+}
+
+function nameOf(G: Game, id: string): string {
+  const k = G.karts.find((x) => x.id === id);
+  return k ? k.name : G.remotes.get(id)?.name ?? 'Someone';
 }
 
 /** Everyone simulated here who is ahead of `progress` gets sleepy for 1.5 s. */
@@ -1360,11 +1817,12 @@ function racerPos(G: Game, id: string): Vec | null {
 }
 
 function giveItem(G: Game, k: Kart, place: number, total: number) {
-  const it = rollItem(place, total, !k.snoozeUsed);
+  const it = rollItem(place, total, !k.snoozeUsed, k.coins < 8);
   k.item = it;
   k.charges = ITEMS[it].charges;
   k.rollT = k.bot ? 0.6 : 1.2;
-  k.botTimer = 0.8 + Math.random() * 2.5;
+  k.heldT = 0;
+  k.botTimer = (0.5 + Math.random() * 1.2) * (BOT_LEVELS[G.botLevel] ?? BOT_LEVELS[1]).wait;
   if (k.id === G.meId) {
     G.nextTick = 0;
     vibrate(20);
@@ -1377,11 +1835,19 @@ function updateRemotes(G: Game, dt: number, now: number) {
   const w = wall();
   G.remotes.forEach((r, id) => {
     const silent = r.net.silentFor(w);
-    if (r.leftAt && now - r.leftAt > 6000 && silent > 6) {
+    if (!r.bot && r.leftAt && now - r.leftAt > 6000 && silent > 6) {
       G.remotes.delete(id);
       return;
     }
     if (!r.net.ready()) return; // still on the grid, waiting for data
+    // Where it is in the race right now: the newest message, moved forward by
+    // its age, so places do not lag behind or tick over in steps.
+    const lt = r.net.latest();
+    if (lt && !r.finished) {
+      const j = clamp(r.idx, 0, TRACK.n - 1);
+      const along = Math.max(0, lt.s.vx * TRACK.tx[j] + lt.s.vy * TRACK.ty[j]);
+      r.progress = r.pkProg + (along * clamp(w - lt.at + G.lagMs, 0, 900)) / 1000 / SAMPLE_SPACING;
+    }
     const near = Math.hypot(r.x - me.x, r.y - me.y) < 260;
     const p = r.net.pose(w, dt, followTrack, near);
     if (!p) return;
@@ -1394,6 +1860,7 @@ function updateRemotes(G: Game, dt: number, now: number) {
     r.vy = p.vy;
     r.speed = Math.hypot(p.vx, p.vy);
     r.flags = p.f;
+    if (p.f & F_SPIN) r.hitAt = now;
     const target = silent > 1.5 || r.leftAt ? 0.55 : 1;
     r.alpha += (target - r.alpha) * Math.min(1, dt * 4);
   });
@@ -1436,6 +1903,21 @@ function step(G: Game, dt: number, now: number, input: Input) {
   const me = G.karts[0];
   const n = TRACK.n;
   me.help = me.toddler ? 1 : clamp(helpFor(me.assist, G.skill) + (me.assist > 0 ? me.rescue : 0), 0, 1);
+  // Robots pace themselves against me in practice, and against the middle of
+  // the players online. Online, players far behind the leader get a tailwind.
+  let lead = me.progress;
+  let packSum = 0;
+  let packN = 0;
+  for (const r of all) {
+    if (!r.human) continue;
+    if (r.progress > lead) lead = r.progress;
+    if (!r.finished) {
+      packSum += r.progress;
+      packN++;
+    }
+  }
+  G.packRef = G.mode === 'solo' || !packN ? me.progress : packSum / packN;
+  me.tail = G.mode === 'multi' && racing && !me.finished ? smoothstep(120, 700, lead - me.progress) : 0;
   if (!me.toddler && !me.finished) {
     if (!racing && G.autoDrift && me.assist === 2 && me.help <= 0.85) showTip(G, 'unlock', '🔥 New! Hold a turn to drift!', 1);
     if (racing && me.lap === 2 && me.idx > n * 0.5 && me.st.drifts === 0 && !me.drifting && (!G.autoDrift || me.help <= 0.85)) {
@@ -1452,17 +1934,30 @@ function step(G: Game, dt: number, now: number, input: Input) {
     const isMe = k.id === G.meId;
     if (racing && k.spinT <= 0) {
       if (k.bot || k.finished) {
+        if (k.bot && !k.finished) botPlan(G, k, all, dt, now);
         const a = autopilot(k);
         steerTarget = a.steer;
         throttle = k.finished ? 0.5 : a.throttle;
         brake = k.finished ? 0 : a.brake;
+        if (G.closedAt && now - G.closedAt > 2500) {
+          // The race is over: everyone rolls to a stop, so the devices can go quiet
+          throttle = 0;
+          brake = 0.6;
+          if (Math.hypot(k.vx, k.vy) < 30) {
+            brake = 0;
+            k.vx = 0;
+            k.vy = 0;
+          }
+        }
         if (k.bot) {
-          speedMul = k.skill;
-          // Robots only: a gentle pull toward the player
-          if (k.progress < me.progress - 150) speedMul += 0.12;
-          else if (k.progress > me.progress + 260) speedMul -= 0.1;
+          // Robots only: a smooth pull toward the pack, so they stay in the race
+          const gap = k.progress - G.packRef;
+          const lv = BOT_LEVELS[G.botLevel] ?? BOT_LEVELS[1];
+          const band = gap < 0 ? lv.chase * smoothstep(30, 260, -gap) : -lv.wait4 * smoothstep(lv.lead, lv.lead + 280, gap);
+          speedMul = k.skill + band;
         }
       } else if (isMe) {
+        speedMul = 1 + 0.08 * k.tail;
         throttle = input.up ? 1 : 0;
         brake = input.down ? 1 : 0;
         const a = autopilot(k);
@@ -1550,6 +2045,24 @@ function step(G: Game, dt: number, now: number, input: Input) {
         k.tier = tier;
         k.steer = k.driftDir * clamp(0.6 + 0.35 * into, 0.25, 0.95);
       }
+    } else if (k.bot && !k.finished && racing && k.spinT <= 0 && k.airT <= 0) {
+      // Robots: a long hard turn charges a mini-turbo, like a player's drift
+      const turbo = (BOT_LEVELS[G.botLevel] ?? BOT_LEVELS[1]).turbo;
+      if (Math.abs(steerTarget) > 0.42 && Math.hypot(k.vx, k.vy) > k.stats.maxSpeed * 0.5) {
+        k.charge += dt;
+        k.driftDir = Math.sign(steerTarget);
+        k.tier = k.charge >= 2.2 ? 3 : k.charge >= 1.4 ? 2 : k.charge >= 0.8 ? 1 : 0;
+        k.drifting = turbo > 0 && k.charge > 0.35;
+      } else {
+        if (k.tier > 0 && turbo > 0) {
+          k.miniT = [0, 0.6, 0.9, 1.3][k.tier] * turbo;
+          k.st.drifts++;
+          react(k, '🔥', 700);
+        }
+        k.charge = 0;
+        k.tier = 0;
+        k.drifting = false;
+      }
     } else if (k.airT <= 0) {
       k.drifting = false;
     }
@@ -1565,8 +2078,13 @@ function step(G: Game, dt: number, now: number, input: Input) {
         k.invT = 1;
       }
     }
-    const boosting = k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0;
+    const boosting = k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0 || k.rushT > 0;
     if (boosting) k.st.boost += dt;
+    if (k.rushT > 0) k.rushT -= dt;
+    if (k.magnetT > 0) k.magnetT -= dt;
+    if (k.mudT > 0) k.mudT -= dt;
+    if (k.honkT > 0) k.honkT -= dt;
+    if (k.item && k.rollT <= 0) k.heldT += dt;
     if (k.boostT > 0) k.boostT -= dt;
     if (k.miniT > 0) k.miniT -= dt;
     if (k.padT > 0) k.padT -= dt;
@@ -1703,7 +2221,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
     if (!k.finished && k.lap > G.laps) {
       k.finished = true;
       k.finishTime = now - G.goAt;
-      if (!G.firstFinishAt) G.firstFinishAt = now;
+      if (!G.firstFinishAt && !k.bot) G.firstFinishAt = now; // robots never start the hurry-up timer
       if (isMe) {
         scoreRace(G, k);
         G.emit({ i: randId(), k: 'fin', ft: Math.round(k.finishTime), st: k.st });
@@ -1722,14 +2240,14 @@ function step(G: Game, dt: number, now: number, input: Input) {
 
     // Particles for boost and grass
     const speed = Math.hypot(k.vx, k.vy);
-    if (k.boostT > 0 || k.padT > 0) {
+    if (k.boostT > 0 || k.padT > 0 || k.rushT > 0) {
       for (let i = 0; i < 3; i++) {
         if (G.particles.length > 450) G.particles.shift();
         const back = k.angle + Math.PI + (Math.random() - 0.5) * 0.6;
         G.particles.push({
           x: k.x - Math.cos(k.angle) * 28, y: k.y - Math.sin(k.angle) * 28,
           vx: Math.cos(back) * 160 + k.vx * 0.2, vy: Math.sin(back) * 160 + k.vy * 0.2,
-          life: 0.5, max: 0.5, color: k.padT > 0 && k.boostT <= 0 ? (i % 2 ? '#67e8f9' : '#fde047') : `hsl(${(now / 3 + i * 60) % 360},100%,60%)`, size: 9,
+          life: 0.5, max: 0.5, color: k.padT > 0 && k.boostT <= 0 && k.rushT <= 0 ? (i % 2 ? '#67e8f9' : '#fde047') : `hsl(${(now / 3 + i * 60) % 360},100%,60%)`, size: k.rushT > 0 ? 12 : 9,
         });
       }
     } else if (k.miniT > 0 || k.trickT > 0) {
@@ -1791,6 +2309,25 @@ function step(G: Game, dt: number, now: number, input: Input) {
       }
     }
 
+    // Hazard patches: a splash going in, then sticky going (see drive)
+    if (k.airT <= 0 && !k.toddler && k.rushT <= 0) {
+      for (const hz of FEATURES.hazards) {
+        if (Math.abs(idxDelta(k.idx, hz.idx)) > 16) continue;
+        if ((hz.x - k.x) ** 2 + (hz.y - k.y) ** 2 > hz.r * hz.r) continue;
+        if (k.mudT <= 0) {
+          const look = HAZARD_LOOK[hz.kind];
+          spawnParticles(G, k.x, k.y, 14, () => look.splash, 230, 0.5, 8);
+          react(k, look.emoji, 800);
+          if (isMe) {
+            sfx('land');
+            vibrate(30);
+            G.shake = Math.max(G.shake, 3);
+          }
+        }
+        k.mudT = 0.3;
+      }
+    }
+
     // Slipstream: tuck in close behind someone to get pulled along
     if (!k.toddler && k.airT <= 0 && speed > 250) {
       let behind = false;
@@ -1817,11 +2354,29 @@ function step(G: Game, dt: number, now: number, input: Input) {
       } else if (!behind) k.draftC = Math.max(0, k.draftC - dt * 2);
     }
 
-    // Coins (each device has its own coins)
-    if (k.airT <= 0) {
+    // Coins (each device has its own coins). They belong to the player on
+    // this device: robots never take one off the road. A robot's coin count
+    // just ticks up over time instead, and a magnet gives it three at once.
+    if (k.bot) {
+      k.coinClock += dt;
+      if (k.coinClock > 5) {
+        k.coinClock = 0;
+        if (k.coins < [4, 7, 10][G.botLevel]) k.coins++;
+        k.st.coins++;
+      }
+    } else if (k.airT <= 0) {
       for (const c of G.coins) {
         if (now < c.hiddenUntil) continue;
-        if ((c.x - k.x) ** 2 + (c.y - k.y) ** 2 < 30 * 30) {
+        const cd = (c.x - k.x) ** 2 + (c.y - k.y) ** 2;
+        if (cd < (k.magnetT > 0 ? MAGNET_REACH * MAGNET_REACH : 30 * 30)) {
+          if (cd > 60 * 60) {
+            // Pulled in by the magnet: a streak of gold from the coin to the kart
+            for (let q = 0; q < 5; q++) {
+              if (G.particles.length > 450) G.particles.shift();
+              const f = q / 5;
+              G.particles.push({ x: c.x + (k.x - c.x) * f, y: c.y + (k.y - c.y) * f, vx: (k.x - c.x) * 2 + k.vx * 0.6, vy: (k.y - c.y) * 2 + k.vy * 0.6, life: 0.3, max: 0.3, color: '#facc15', size: 7 });
+            }
+          }
           c.hiddenUntil = now + 8000;
           if (k.coins < 10) k.coins++;
           k.st.coins++;
@@ -1836,7 +2391,7 @@ function step(G: Game, dt: number, now: number, input: Input) {
       if (now < b.hiddenUntil) continue;
       if ((b.x - k.x) ** 2 + (b.y - k.y) ** 2 < 36 * 36) {
         b.hiddenUntil = now + BOX_RESPAWN_MS;
-        G.emit({ i: randId(), k: 'box', b: b.id, t: Math.round(now - G.goAt) });
+        G.emit({ i: randId(), k: 'box', b: b.id, t: Math.round(now - G.goAt) }, k.bot); // a robot's pickup can ride with the next message
         spawnParticles(G, b.x, b.y, 16, (i) => `hsl(${i * 40},95%,65%)`, 260, 0.5, 6);
         if (!k.item) {
           const place = ranked.findIndex((r) => r.id === k.id) + 1;
@@ -1854,17 +2409,21 @@ function step(G: Game, dt: number, now: number, input: Input) {
         if (k.toddler) continue; // the bubble rolls right over them
         G.bananas.splice(i, 1);
         G.emit({ i: randId(), k: 'bhit', b: b.id, v: k.id, o: b.owner });
-        if (spinOut(G, k)) creditHit(G, b.owner);
+        if (spinOut(G, k)) {
+          creditHit(G, b.owner, k);
+          ouch(G, k, b.owner, '🍌');
+        }
       }
     }
 
     // Bot item use
-    if (k.bot && k.item && k.rollT <= 0) {
+    if (k.bot && !k.finished && k.item && k.rollT <= 0 && k.spinT <= 0) {
       k.botTimer -= dt;
       if (k.botTimer <= 0) {
-        if (k.item !== 'blast' || findTargetAhead(G, k)) fireItem(G, k, now);
-        else k.botTimer = 1;
-        if (k.item) k.botTimer = 0.6 + Math.random();
+        if (botWantsFire(G, k, all, now)) {
+          fireItem(G, k, now);
+          k.botTimer = 0.5 + Math.random() * 0.8;
+        } else k.botTimer = 0.25; // look again in a moment
       }
     }
   }
@@ -1900,7 +2459,10 @@ function step(G: Game, dt: number, now: number, input: Input) {
         if (!eligible || k.airT > 0) continue;
         if ((bl.x - k.x) ** 2 + (bl.y - k.y) ** 2 < 38 * 38) {
           G.emit({ i: randId(), k: 'xhit', b: bl.id, v: k.id, o: bl.owner });
-          if (spinOut(G, k)) creditHit(G, bl.owner);
+          if (spinOut(G, k)) {
+            creditHit(G, bl.owner, k);
+            ouch(G, k, bl.owner, '💥');
+          }
           gone = true;
           break;
         }
@@ -1928,6 +2490,13 @@ function step(G: Game, dt: number, now: number, input: Input) {
       const remote = G.remotes.get(o.id);
       const reach = KART_RADIUS * 2 * (remote ? 1.1 : 1);
       if (d > 0 && d < reach) {
+        // Rainbow Rush: the rushing kart ploughs through and the other one spins
+        if (o.rush && k.rushT <= 0 && spinOut(G, k)) {
+          creditHit(G, o.id, k);
+          ouch(G, k, o.id, '🌈');
+          G.emit({ i: randId(), k: 'xhit', b: '-', v: k.id, o: o.id });
+        }
+        if (k.rushT > 0 && !o.rush) continue;
         const nx = dx / d;
         const ny = dy / d;
         const push = (reach - d) * (remote ? 1 : 0.5);
@@ -2002,10 +2571,33 @@ function doTrick(G: Game, k: Kart) {
   if (k.id === G.meId) vibrate(15);
 }
 
-/** One of my items hit someone (bots in solo only; remote players report their own). */
-function creditHit(G: Game, owner: string) {
+/** An item of a kart simulated here hit someone (players on other devices report their own). */
+function creditHit(G: Game, owner: string, victim: Kart) {
   const k = G.karts.find((x) => x.id === owner);
-  if (k) k.st.hits++;
+  if (!k || victim.id === owner) return;
+  k.st.hits++;
+  if (k.id === G.meId) setBanner(G, `🎯 You got ${victim.name}!`, '#86efac', 1300);
+}
+
+/** Another device reports that a kart there was hit: react, and credit my items. */
+function gotOne(G: Game, ev: NetEvent) {
+  const me = G.karts[0];
+  const victim = G.remotes.get(String(ev.v ?? ''));
+  if (victim) react(victim, '💫', 1300);
+  if (ev.o === me.id && ev.v !== me.id) {
+    me.st.hits++;
+    if (victim) setBanner(G, `🎯 You got ${victim.name}!`, '#86efac', 1300);
+  } else {
+    const k = G.karts.find((x) => x.id === ev.o); // one of the robots I drive
+    if (k && ev.v !== k.id) k.st.hits++;
+  }
+}
+
+/** Tell me who got me. */
+function ouch(G: Game, k: Kart, owner: string, icon: string) {
+  if (k.id !== G.meId) return;
+  G.hitLog.push(`${icon}${owner === k.id ? 'me' : owner}@${Math.round((performance.now() - G.goAt) / 1000)}`);
+  setBanner(G, owner === k.id ? `${icon} Oops, that was yours!` : `${icon} ${nameOf(G, owner)} got you!`, '#fca5a5', 1300);
 }
 
 // ---------- Rendering ----------
@@ -2534,16 +3126,78 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   ctx.restore();
 }
 
+/** A round speed dial on the race overlay. It sits where thumbs don't cover it. */
+function drawSpeedGauge(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: number, speed: number, maxSpeed: number, boost: boolean, touch: boolean, now: number) {
+  const small = Math.min(w, h) < 520;
+  const r = small ? 34 : 46;
+  // Touch screens: just above the steering buttons, clear of both thumbs
+  const btn = w >= 640 ? 112 : 80;
+  const cx = touch ? r + 18 : w - r - 22;
+  const cy = touch ? h - btn - r - 34 : h - r - 22;
+  const frac = clamp(speed / (maxSpeed * 1.25), 0, 1);
+  const a0 = Math.PI * 0.75;
+  const a1 = Math.PI * 2.25;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(15,23,42,0.62)';
+  ctx.fill();
+  ctx.lineCap = 'round';
+  ctx.lineWidth = small ? 6 : 8;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - 5, a0, a1);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.stroke();
+  if (frac > 0.01) {
+    const g = ctx.createLinearGradient(cx - r, 0, cx + r, 0);
+    g.addColorStop(0, '#4ade80');
+    g.addColorStop(0.6, '#fde047');
+    g.addColorStop(1, boost ? '#f472b6' : '#fb923c');
+    ctx.beginPath();
+    ctx.arc(cx, cy, r - 5, a0, a0 + (a1 - a0) * frac);
+    ctx.strokeStyle = g;
+    if (boost) {
+      ctx.shadowColor = '#fb923c';
+      ctx.shadowBlur = 10 + 6 * Math.sin(now / 60);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.fillStyle = boost ? '#fde047' : '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `900 ${small ? 20 : 26}px system-ui, sans-serif`;
+  ctx.fillText(String(Math.round(speed * 0.22)), cx, cy - 1);
+  ctx.font = `800 ${small ? 8 : 10}px system-ui, sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fillText(boost ? 'BOOST!' : 'km/h', cx, cy + (small ? 15 : 19));
+  ctx.restore();
+}
+
+/** What to say out loud for a banner, or '' to stay quiet. */
+function spokenFor(banner: string): string {
+  // Strip emoji and symbols, keep the words
+  const words = banner.replace(/(\d+)\/(\d+)/g, '$1 of $2').replace(/[^\p{L}\p{N}!?' ]/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (!words || words.length > 40) return '';
+  return words.charAt(0) + words.slice(1).toLowerCase();
+}
+
 // ---------- React UI ----------
 type Profile = {
   name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number;
   cam: CamMode; assist: number; music: boolean; haptics: boolean; laps: number; cup: number;
+  bots: boolean; // robots fill the empty seats in online races
+  botLevel: number; // 0 chill, 1 fair, 2 fast
 };
-// The host's current race: [id, track, order, go (host clock), laps, cup, round]
-type RaceTuple = [string, number, string[], number, number, number, number];
+// The host's current race: [id, track, order, go (host clock), laps, cup, round, robots]
+// robots: [level, the device that drives them, [racer, body] for each one]
+type BotTuple = [number, string, BotSpec[]];
+type RaceTuple = [string, number, string[], number, number, number, number, BotTuple?];
 type LobbyPlayer = {
   id: string; name: string; kartIdx: number; paint: number; body: number; toddler: boolean; assist: number;
   ready: boolean; host: boolean; joinedAt: number; trackIdx: number; laps: number; cup: number; race: RaceTuple | null;
+  bots: boolean; botLevel: number;
 };
 type Standing = { id: string; name: string; kartIdx: number; place: number; time: string | null; isMe: boolean; frac: number; done: boolean };
 type Award = { id: string; name: string; kartIdx: number; place: number; icon: string; title: string; isMe: boolean; time: string | null };
@@ -2572,6 +3226,9 @@ type Hud = {
   improved: boolean;
 };
 type Screen = 'menu' | 'lobby' | 'race';
+type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'help';
+// Settings that live outside the profile (their own storage key)
+type Prefs = { voice: boolean };
 
 const CUPS = [
   { name: 'Sunshine Cup', emoji: '🌼', tracks: [0, 1, 3, 2], card: 'from-yellow-300 to-orange-500' },
@@ -2595,6 +3252,14 @@ function parseMeta(id: string, m: Meta | undefined): LobbyPlayer {
   const r = m?.race;
   if (Array.isArray(r) && r.length >= 7 && typeof r[0] === 'string' && Array.isArray(r[2])) {
     race = [r[0], clamp(num(r[1], 0), 0, TRACKS.length - 1), (r[2] as unknown[]).map(String).slice(0, MAX_PLAYERS), num(r[3], 0), clamp(num(r[4], 3), 1, 5), num(r[5], -1), num(r[6], 0)];
+    const b = r[7];
+    if (Array.isArray(b) && Array.isArray(b[2])) {
+      const specs = (b[2] as unknown[])
+        .filter((x): x is unknown[] => Array.isArray(x))
+        .slice(0, Math.max(0, MAX_PLAYERS - race[2].length))
+        .map((x) => [clamp(Math.floor(num(x[0], 0)), 0, KARTS.length - 1), clamp(Math.floor(num(x[1], 0)), 0, BODIES.length - 1)] as BotSpec);
+      race[7] = [clamp(Math.floor(num(b[0], 1)), 0, 2), String(b[1] ?? ''), specs];
+    }
   }
   return {
     id,
@@ -2610,6 +3275,8 @@ function parseMeta(id: string, m: Meta | undefined): LobbyPlayer {
     trackIdx: clamp(Math.floor(num(o[0], 0)), 0, TRACKS.length - 1),
     laps: clamp(Math.floor(num(o[1], 3)), 1, 5),
     cup: clamp(Math.floor(num(o[2], -1)), -1, CUPS.length - 1),
+    bots: num(o[3], 1) !== 0,
+    botLevel: clamp(Math.floor(num(o[4], 1)), 0, 2),
     race,
   };
 }
@@ -2806,110 +3473,220 @@ function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
   onBody: (i: number) => void;
   compact?: boolean;
 }) {
+  const [tab, setTab] = useState<'racer' | 'kart' | 'paint'>('racer');
   const sel = KARTS[value] || KARTS[0];
   const col = kartColors(value, paint);
   const st = kartStats(value, body);
+  const tabs = [
+    { id: 'racer' as const, label: '😀 Racer' },
+    { id: 'kart' as const, label: '🏎️ Kart' },
+    { id: 'paint' as const, label: '🎨 Paint' },
+  ];
   return (
     <div className="flex flex-col gap-3">
-      <div className={`grid gap-2 ${compact ? 'grid-cols-4 sm:grid-cols-8' : 'grid-cols-4 sm:grid-cols-8'}`}>
-        {KARTS.map((k, i) => {
-          const active = i === value;
-          return (
-            <button
-              key={k.name}
-              type="button"
-              onClick={() => onPick(i)}
-              aria-label={k.name}
-              className={`flex flex-col items-center rounded-2xl px-1 py-2 transition active:scale-95 ${active ? 'scale-105 shadow-xl ring-4 ring-white' : 'opacity-80 ring-2 ring-white/20 hover:opacity-100'}`}
-              style={{ background: `linear-gradient(145deg, ${k.color}, ${k.dark})` }}
-            >
-              <FaceIcon emoji={k.emoji} size={compact ? 40 : 48} happy={active} />
-              <span className="mt-1 text-center text-[10px] font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)] sm:text-[11px]">{k.name}</span>
-            </button>
-          );
-        })}
-      </div>
-      <div className="flex flex-col gap-3 rounded-2xl p-3 sm:flex-row sm:items-center" style={{ background: `linear-gradient(135deg, ${col.color}, ${col.dark})` }}>
-        <div className="flex items-center gap-2 sm:w-72">
+      {/* The chosen racer, always in view while you try things on */}
+      <div className="flex flex-col gap-3 rounded-3xl p-3 shadow-xl ring-2 ring-white/30 sm:flex-row sm:items-center" style={{ background: `linear-gradient(135deg, ${col.color}, ${col.dark})` }}>
+        <div className="flex items-center gap-3 sm:w-80">
           <span className="rounded-2xl bg-white/25 p-1">
-            <KartTurntable kartIdx={value} paint={paint} body={body} size={compact ? 112 : 150} />
+            <KartTurntable kartIdx={value} paint={paint} body={body} size={compact ? 124 : 168} />
           </span>
           <span>
-            <span className="block text-xl font-black text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.name}</span>
-            <span className="block text-sm font-bold text-white/90 drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">
-              {sel.blurb} · {BODIES[body]?.name ?? 'Classic'}
-            </span>
+            <span className="block text-2xl font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.name}</span>
+            <span className="block text-sm font-bold text-white/90 drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.blurb}</span>
+            <span className="mt-1 inline-block rounded-full bg-black/25 px-2 py-0.5 text-xs font-black text-white">{BODIES[body]?.icon} {BODIES[body]?.name ?? 'Classic'} kart</span>
           </span>
         </div>
-        {!compact && (
-          <div className="flex-1 space-y-1 rounded-xl bg-black/25 p-2">
-            <StatBar label="Speed" value={(st.maxSpeed - 470) / 160} />
-            <StatBar label="Accel" value={(st.accel - 280) / 330} />
-            <StatBar label="Steering" value={(st.turn - 2.1) / 1.8} />
-            <StatBar label="Grip" value={(st.grip - 5) / 8} />
-          </div>
-        )}
+        <div className="flex-1 space-y-1 rounded-xl bg-black/25 p-2">
+          <StatBar label="Speed" value={(st.maxSpeed - 470) / 160} />
+          <StatBar label="Accel" value={(st.accel - 280) / 330} />
+          <StatBar label="Steering" value={(st.turn - 2.1) / 1.8} />
+          <StatBar label="Grip" value={(st.grip - 5) / 8} />
+        </div>
       </div>
-      <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
-        {BODIES.map((b, i) => (
+      <div className="grid grid-cols-3 gap-2 rounded-2xl bg-black/25 p-1.5">
+        {tabs.map((t) => (
           <button
-            key={b.name}
+            key={t.id}
             type="button"
-            onClick={() => onBody(i)}
-            aria-label={`${b.name} kart`}
-            className={`flex flex-col items-center rounded-2xl bg-white/15 px-1 py-2 transition active:scale-95 ${body === i ? 'scale-105 bg-white/35 ring-4 ring-white' : 'ring-2 ring-white/20 hover:bg-white/25'}`}
+            onClick={() => {
+              sfx('uiTap');
+              setTab(t.id);
+            }}
+            className={`rounded-xl py-2.5 text-base font-black transition active:scale-95 ${tab === t.id ? 'bg-white text-slate-900 shadow' : 'text-white/90'}`}
           >
-            <KartPreview kartIdx={value} paint={paint} body={i} size={compact ? 56 : 70} driver={false} />
-            <span className="text-[11px] font-black text-white drop-shadow">{b.icon} {b.name}</span>
-            {!compact && <span className="text-[10px] font-bold leading-tight text-white/80">{b.blurb}</span>}
+            {t.label}
           </button>
         ))}
       </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-black text-white">🎨 Paint:</span>
-        <button
-          type="button"
-          onClick={() => onPaint(-1)}
-          className={`h-9 rounded-full px-3 text-xs font-black text-white ring-2 transition active:scale-95 ${paint < 0 ? 'ring-white' : 'ring-white/30'}`}
-          style={{ background: `linear-gradient(135deg, ${sel.color}, ${sel.dark})` }}
-        >
-          Classic
-        </button>
-        {PAINTS.map((pt, i) => (
+      {tab === 'racer' && (
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-8">
+          {KARTS.map((k, i) => {
+            const active = i === value;
+            return (
+              <button
+                key={k.name}
+                type="button"
+                onClick={() => {
+                  sfx('uiTap', { pitch: 1 + (i % 8) * 0.04 });
+                  onPick(i);
+                }}
+                aria-label={k.name}
+                aria-pressed={active}
+                className={`flex flex-col items-center rounded-2xl px-1 py-2 transition active:scale-95 ${active ? 'scale-105 shadow-xl ring-4 ring-white' : 'opacity-85 ring-2 ring-white/20 hover:opacity-100'}`}
+                style={{ background: `linear-gradient(145deg, ${k.color}, ${k.dark})` }}
+              >
+                <FaceIcon emoji={k.emoji} size={compact ? 42 : 50} happy={active} />
+                <span className="mt-1 text-center text-[10px] font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)] sm:text-[11px]">{k.name}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {tab === 'kart' && (
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+          {BODIES.map((b, i) => (
+            <button
+              key={b.name}
+              type="button"
+              onClick={() => {
+                sfx('uiTap');
+                onBody(i);
+              }}
+              aria-label={`${b.name} kart`}
+              aria-pressed={body === i}
+              className={`flex flex-col items-center rounded-2xl bg-white/15 px-1 py-2 transition active:scale-95 ${body === i ? 'scale-105 bg-white/35 ring-4 ring-white' : 'ring-2 ring-white/20 hover:bg-white/25'}`}
+            >
+              <KartPreview kartIdx={value} paint={paint} body={i} size={compact ? 64 : 78} driver={false} />
+              <span className="text-xs font-black text-white drop-shadow">{b.icon} {b.name}</span>
+              <span className="text-[10px] font-bold leading-tight text-white/80">{b.blurb}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {tab === 'paint' && (
+        <div className="grid grid-cols-5 gap-3 sm:grid-cols-9">
           <button
-            key={pt.name}
             type="button"
-            aria-label={`${pt.name} paint`}
-            onClick={() => onPaint(i)}
-            className={`h-9 w-9 rounded-full ring-2 transition active:scale-90 ${paint === i ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
-            style={{ background: `linear-gradient(135deg, ${pt.color}, ${pt.dark})` }}
-          />
-        ))}
-      </div>
+            onClick={() => {
+              sfx('uiTap');
+              onPaint(-1);
+            }}
+            aria-pressed={paint < 0}
+            className={`flex aspect-square items-center justify-center rounded-full text-[11px] font-black text-white ring-2 transition active:scale-90 ${paint < 0 ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
+            style={{ background: `linear-gradient(135deg, ${sel.color}, ${sel.dark})` }}
+          >
+            Classic
+          </button>
+          {PAINTS.map((pt, i) => (
+            <button
+              key={pt.name}
+              type="button"
+              aria-label={`${pt.name} paint`}
+              aria-pressed={paint === i}
+              onClick={() => {
+                sfx('uiTap', { pitch: 0.9 + i * 0.05 });
+                onPaint(i);
+              }}
+              className={`aspect-square rounded-full ring-2 transition active:scale-90 ${paint === i ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
+              style={{ background: `linear-gradient(135deg, ${pt.color}, ${pt.dark})` }}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-function TrackPicker({ value, onPick, disabled }: { value: number; onPick: (i: number) => void; disabled?: boolean }) {
+// Track thumbnails: the real shape of each track, worked out once
+const OUTLINES: (Float32Array | undefined)[] = [];
+const THUMB_LOOKS: (ThumbLook | undefined)[] = [];
+function trackOutline(i: number): Float32Array {
+  let o = OUTLINES[i];
+  if (!o) {
+    const t = buildTrack(TRACKS[i]);
+    const stride = 5;
+    const n = Math.floor(t.n / stride);
+    o = new Float32Array(n * 2);
+    for (let k = 0; k < n; k++) {
+      o[k * 2] = t.xs[k * stride] / WORLD_W;
+      o[k * 2 + 1] = t.ys[k * stride] / WORLD_H;
+    }
+    OUTLINES[i] = o;
+  }
+  return o;
+}
+function TrackMap({ idx, width }: { idx: number; width: number }) {
+  const t = TRACKS[idx] || TRACKS[0];
+  let look = THUMB_LOOKS[idx];
+  if (!look) {
+    look = { grass: t.grassA, grass2: t.grassB, edge: t.edge, road: t.road, curb: t.curbB, line: t.line };
+    THUMB_LOOKS[idx] = look;
+  }
+  return <TrackThumb pts={trackOutline(idx)} look={look} width={width} height={Math.round(width * 0.66)} />;
+}
+
+function TrackPicker({ value, onPick, disabled, best, laps }: { value: number; onPick: (i: number) => void; disabled?: boolean; best?: Record<string, number>; laps?: number }) {
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       {TRACKS.map((t, i) => {
         const active = i === value;
+        const bt = best?.[`${i}:${laps ?? 3}`];
         return (
           <button
             key={t.name}
             type="button"
             disabled={disabled && !active}
-            onClick={() => onPick(i)}
-            className={`rounded-2xl bg-gradient-to-br ${t.card} p-3 text-center transition active:scale-95 disabled:opacity-40 ${active ? 'scale-[1.03] shadow-xl ring-4 ring-white' : 'opacity-85 ring-2 ring-white/20 hover:opacity-100'}`}
+            aria-pressed={active}
+            onClick={() => {
+              sfx('uiTap', { pitch: 0.9 + i * 0.06 });
+              onPick(i);
+            }}
+            className={`flex flex-col items-center rounded-2xl bg-gradient-to-br ${t.card} p-2 text-center transition active:scale-95 disabled:opacity-40 ${active ? 'scale-[1.03] shadow-xl ring-4 ring-white' : 'opacity-90 ring-2 ring-white/20 hover:opacity-100'}`}
           >
-            <div className="text-4xl drop-shadow">{t.emoji}</div>
-            <div className="mt-1 text-sm font-black text-white drop-shadow">{t.name}</div>
-            <div className="mt-0.5 text-[11px] font-bold leading-tight text-white/85">{t.blurb}</div>
+            <span className="relative">
+              <TrackMap idx={i} width={132} />
+              <span className="absolute -left-1 -top-2 text-3xl drop-shadow">{t.emoji}</span>
+            </span>
+            <span className="mt-1 text-sm font-black text-white drop-shadow">{t.name}</span>
+            <span className="text-[11px] font-bold leading-tight text-white/85">{t.blurb}</span>
+            {bt ? <span className="mt-1 rounded-full bg-black/30 px-2 py-0.5 text-[11px] font-black text-yellow-200">⏱️ Best {fmtTime(bt)}</span> : null}
           </button>
         );
       })}
     </div>
+  );
+}
+
+/** How to play, in pictures and few words. */
+function HelpCards({ touch }: { touch: boolean }) {
+  const cards = [
+    { icon: '🟢', title: 'Go!', text: touch ? 'Hold the big green GAS button.' : 'Hold W or the up arrow.' },
+    { icon: '↔️', title: 'Steer', text: touch ? 'Press ◀ and ▶ to turn.' : 'A and D, or the left and right arrows.' },
+    { icon: '🔥', title: 'Drift', text: touch ? 'Hold a turn to slide. Let go for a speed boost!' : 'Hold Shift in a turn to slide. Let go for a speed boost!' },
+    { icon: '🎁', title: 'Items', text: touch ? 'Drive through a ? box, then tap the item button.' : 'Drive through a ? box, then press Space.' },
+    { icon: '⭐', title: 'Tricks', text: touch ? 'Tap ⭐ while you are in the air.' : 'Press Space while you are in the air.' },
+    { icon: '🚀', title: 'Rocket start', text: 'Press GAS just before GO!' },
+    { icon: '💨', title: 'Slipstream', text: 'Follow close behind a kart to get pulled along.' },
+    { icon: '🪙', title: 'Coins', text: 'Each coin makes you a tiny bit faster. Collect 10!' },
+  ];
+  return (
+    <>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {cards.map((c) => (
+          <div key={c.title} className="flex items-center gap-3 rounded-3xl bg-black/25 p-3 text-white ring-1 ring-white/20">
+            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl">{c.icon}</span>
+            <span>
+              <span className="block text-lg font-black leading-tight">{c.title}</span>
+              <span className="block text-sm font-bold text-white/85">{c.text}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="rounded-3xl bg-black/25 p-4 text-sm font-bold text-white/90 ring-1 ring-white/20">
+        Keyboard: W A S D or arrow keys to drive, Shift to drift, Space for items and tricks, C to switch camera, Q to look back, H to honk, Esc for the menu. Game controllers work too.
+        Little racers can turn on Toddler Assist in Settings: the kart steers by itself and nothing can spin it out.
+      </p>
+    </>
   );
 }
 
@@ -2945,6 +3722,48 @@ function AssistPicker({ value, onPick }: { value: number; onPick: (v: number) =>
         ))}
       </div>
       {ready && value > 0 && <div className="mt-2 text-center text-sm font-black text-yellow-200">🌟 You&apos;re driving great! Ready to try less help?</div>}
+    </div>
+  );
+}
+
+/** Robot racers: how fast they are, and whether they fill empty seats online. */
+function RobotPicker({ level, fill, disabled, showFill, onLevel, onFill }: {
+  level: number; fill: boolean; disabled?: boolean; showFill: boolean; onLevel: (v: number) => void; onFill: (v: boolean) => void;
+}) {
+  const lv = BOT_LEVELS[level] ?? BOT_LEVELS[1];
+  return (
+    <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/20">
+      <div className="flex items-center gap-2 text-white">
+        <span className="text-2xl">🤖</span>
+        <span className="text-base font-black">Robot racers</span>
+        <span className="ml-auto text-xs font-semibold text-white/75">{lv.blurb}</span>
+      </div>
+      <div className="mt-2 grid grid-cols-3 gap-2">
+        {BOT_LEVELS.map((b, v) => (
+          <button
+            key={b.label}
+            type="button"
+            disabled={disabled}
+            onClick={() => onLevel(v)}
+            className={`rounded-xl px-2 py-2 text-sm font-black transition active:scale-95 disabled:opacity-60 ${level === v ? 'bg-yellow-300 text-slate-900 shadow' : 'bg-black/25 text-white ring-1 ring-white/25'}`}
+          >
+            {b.icon} {b.label}
+          </button>
+        ))}
+      </div>
+      {showFill && (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onFill(!fill)}
+          className={`mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-black transition active:scale-[0.98] disabled:opacity-60 ${fill ? 'bg-lime-300 text-lime-950' : 'bg-black/25 text-white ring-1 ring-white/25'}`}
+        >
+          <span className="flex-1">{fill ? `Robots fill the empty seats (always ${MAX_PLAYERS} racers)` : 'No robots online: players only'}</span>
+          <span className={`flex h-6 w-11 items-center rounded-full p-0.5 ${fill ? 'justify-end bg-slate-900/80' : 'justify-start bg-black/30'}`}>
+            <span className="h-5 w-5 rounded-full bg-white" />
+          </span>
+        </button>
+      )}
     </div>
   );
 }
@@ -2993,13 +3812,37 @@ function sessionId(): string {
   }
 }
 
+const FAMILY_KIT: Kit = {
+  karts: KARTS,
+  tracks: TRACKS,
+  colors: kartColors,
+  face: (i, size) => <FaceIcon emoji={(KARTS[i] || KARTS[0]).emoji} size={size} happy />,
+  fmtTime,
+};
+
+/** The profile for the racer who is active on this device: their name and kart, plus this device's settings. */
+function playerProfile(st: Store, base: Profile): Profile {
+  const loc = activeLocal(st);
+  const p = loc.prefs;
+  return {
+    ...base,
+    name: st.board[loc.pid]?.n ?? '',
+    kartIdx: p.kartIdx < KARTS.length ? p.kartIdx : 0,
+    paint: p.paint < PAINTS.length ? p.paint : -1,
+    body: p.body < BODIES.length ? p.body : 0,
+    toddler: p.toddler,
+    assist: p.assist,
+    cam: CAM_MODES.some((m) => m.id === p.cam) ? (p.cam as CamMode) : 'chase',
+  };
+}
+
 type CupState = { cup: number; round: number; totals: Record<string, { name: string; kartIdx: number; pts: number }>; scored: string[] };
 
 export default function BendanaKartPage() {
   const [screen, setScreen] = useState<Screen>('menu');
   const [profile, setProfile] = useState<Profile>({
     name: '', kartIdx: 0, toddler: false, trackIdx: 0, muted: false, paint: -1, body: 0, cam: 'chase', assist: 2,
-    music: true, haptics: true, laps: 3, cup: -1,
+    music: true, haptics: true, laps: 3, cup: -1, bots: true, botLevel: 1,
   });
   const [joinCode, setJoinCode] = useState('');
   const [room, setRoom] = useState<string | null>(null);
@@ -3020,6 +3863,20 @@ export default function BendanaKartPage() {
   const [netDebug, setNetDebug] = useState('');
   const [posFx, setPosFx] = useState<{ dir: number; key: number }>({ dir: 0, key: 0 });
   const [autoJoin, setAutoJoin] = useState<string | null>(null);
+  // Saved racers, their stats and the family leaderboard (see players.ts)
+  const [family, setFamily] = useState<Store | null>(null);
+  const [famPanel, setFamPanel] = useState<FamilyPanel>(null);
+  const [gain, setGain] = useState<Gain | null>(null);
+  const familyRef = useRef<Store | null>(null);
+  const boardTimerRef = useRef(0);
+  const peersRef = useRef<Set<string>>(new Set());
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [raceMenu, setRaceMenu] = useState(false);
+  const [leaveArmed, setLeaveArmed] = useState(false);
+  const [panel, setPanel] = useState<Panel>(null);
+  const [prefs, setPrefs] = useState<Prefs>({ voice: true });
+  const [canFullscreen, setCanFullscreen] = useState(false);
+
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvas3dRef = useRef<HTMLCanvasElement | null>(null);
@@ -3039,6 +3896,7 @@ export default function BendanaKartPage() {
   const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false, ax: 0 });
   const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
+  const firstProfileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
   const rosterRef = useRef<Map<string, Meta>>(new Map());
   const myIdRef = useRef('');
@@ -3054,6 +3912,7 @@ export default function BendanaKartPage() {
   const debugRef = useRef(false);
   const autodriveRef = useRef(false);
   const testdriveRef = useRef<string | null>(null); // ?testdrive=0|1|2|t: a scripted driver for testing
+  const botRosterRef = useRef<BotSpec[] | null>(null); // the robots stay the same from race to race
 
   const multiplayerReady = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
@@ -3063,11 +3922,12 @@ export default function BendanaKartPage() {
     myIdRef.current = id;
     setMyId(id);
     wakeRef.current = new WakeLock();
+    let base = firstProfileRef.current;
     try {
       const saved = window.localStorage.getItem('bendana-kart-profile');
       if (saved) {
         const p = JSON.parse(saved) as Partial<Profile>;
-        setProfile({
+        base = {
           name: typeof p.name === 'string' ? p.name.slice(0, 14) : '',
           kartIdx: typeof p.kartIdx === 'number' && p.kartIdx >= 0 && p.kartIdx < KARTS.length ? p.kartIdx : 0,
           toddler: !!p.toddler,
@@ -3081,11 +3941,27 @@ export default function BendanaKartPage() {
           haptics: p.haptics !== false,
           laps: p.laps === 2 ? 2 : 3,
           cup: typeof p.cup === 'number' && p.cup >= -1 && p.cup < CUPS.length ? p.cup : -1,
-        });
+          bots: p.bots !== false,
+          botLevel: p.botLevel === 0 || p.botLevel === 2 ? p.botLevel : 1,
+        };
       }
     } catch {
       /* storage unavailable */
     }
+    try {
+      const pr = JSON.parse(window.localStorage.getItem('bendana-kart-prefs') || 'null') as Partial<Prefs> | null;
+      if (pr && typeof pr === 'object') setPrefs({ voice: pr.voice !== false });
+    } catch {
+      /* storage unavailable */
+    }
+    setCanFullscreen(typeof document.documentElement.requestFullscreen === 'function' && document.fullscreenEnabled !== false);
+    // Saved racers: the racer who played last on this device is ready to go
+    const st = loadStore(base.name, base);
+    familyRef.current = st;
+    setFamily(st);
+    skillOwner = st.active;
+    setProfile(playerProfile(st, base));
+    setProfileLoaded(true);
     const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     isTouchRef.current = touch;
     setIsTouch(touch);
@@ -3097,6 +3973,8 @@ export default function BendanaKartPage() {
         setJoinCode(c);
         // Refreshed while in this room: go straight back in
         if (window.sessionStorage.getItem(`bendana-kart-joined-${c}`)) setAutoJoin(c);
+        else setPanel('family'); // came from an invite link or the QR square: show the join button
+
       }
       debugRef.current = q.has('netdebug');
       autodriveRef.current = q.has('autodrive');
@@ -3161,12 +4039,156 @@ export default function BendanaKartPage() {
     setMuted(profile.muted);
     setMusicOn(profile.music);
     setHaptics(profile.haptics);
+    if (profile === firstProfileRef.current) return; // nothing loaded yet
+    if (!profileLoaded) return; // never overwrite the saved profile before it has been read
     try {
       window.localStorage.setItem('bendana-kart-profile', JSON.stringify(profile));
     } catch {
       /* storage unavailable */
     }
-  }, [profile]);
+    // Name and kart changes belong to the active racer
+    const st = familyRef.current;
+    if (st) {
+      const next = syncActive(st, profile.name, profile);
+      if (next !== st) {
+        familyRef.current = next;
+        setFamily(next);
+        saveStore(next);
+      }
+    }
+  }, [profile, profileLoaded]);
+
+  // Settings kept outside the profile
+  useEffect(() => {
+    setVoiceOn(prefs.voice);
+    if (!profileLoaded) return;
+    try {
+      window.localStorage.setItem('bendana-kart-prefs', JSON.stringify(prefs));
+    } catch {
+      /* storage unavailable */
+    }
+  }, [prefs, profileLoaded]);
+  useEffect(() => {
+    setVoiceMuted(profile.muted);
+  }, [profile.muted]);
+
+  // Screen size, for sizing the big kart on the home screen
+  const [vp, setVp] = useState({ w: 1024, h: 768 });
+  useEffect(() => {
+    const on = () => setVp({ w: window.innerWidth, h: window.innerHeight });
+    on();
+    window.addEventListener('resize', on);
+    return () => window.removeEventListener('resize', on);
+  }, []);
+
+  /** Every tap on a menu wakes up sound and speech (browsers need a touch first). */
+  const wake = useCallback(() => {
+    unlockAudio();
+    unlockVoice();
+  }, []);
+  const openPanel = useCallback((pn: Panel) => {
+    unlockAudio();
+    unlockVoice();
+    sfx(pn ? 'uiOpen' : 'uiBack');
+    setPanel(pn);
+  }, []);
+  const closePanel = useCallback(() => {
+    sfx('uiBack');
+    setPanel(null);
+  }, []);
+
+  const toggleFullscreen = () => {
+    try {
+      if (document.fullscreenElement) void document.exitFullscreen();
+      else void document.documentElement.requestFullscreen();
+    } catch {
+      /* not allowed here */
+    }
+  };
+
+  // A fanfare when the results bring a new best time, a new level or a badge
+  useEffect(() => {
+    if (!gain) return;
+    if (gain.bestTime || gain.bestLap || gain.levelUp) sfx('record');
+    else if (gain.badges.length) sfx('sticker');
+  }, [gain]);
+
+  // Changing screens closes any open panel
+  const prevScreenRef = useRef<Screen>('menu');
+  useEffect(() => {
+    if (prevScreenRef.current === screen) return;
+    prevScreenRef.current = screen;
+    setPanel(null);
+  }, [screen]);
+
+  // Esc opens and closes the race menu
+  useEffect(() => {
+    if (screen !== 'race') {
+      setRaceMenu(false);
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Escape') return;
+      setLeaveArmed(false);
+      setRaceMenu((m) => !m);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [screen]);
+
+  const commitFamily = useCallback((st: Store) => {
+    familyRef.current = st;
+    skillOwner = st.active;
+    setFamily(st);
+    saveStore(st);
+  }, []);
+
+  /** Switch to a saved racer (or one just made): their name, kart and settings come back. */
+  const switchTo = useCallback((st: Store) => {
+    commitFamily(st);
+    const next = playerProfile(st, profileRef.current);
+    profileRef.current = next;
+    setProfile(next);
+    setFamPanel(null);
+  }, [commitFamily]);
+  const pickPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (!st || st.active === pid) return;
+    unlockAudio();
+    sfx('ready');
+    switchTo(setActive(st, pid));
+  };
+  const createPlayer = (name: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(addPlayer(st, name, KARTS.length));
+  };
+  const adoptBoardPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(adoptPlayer(st, pid));
+  };
+  const removePlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(removeLocal(st, pid, KARTS.length));
+  };
+
+  /** Send what this device knows of the leaderboard to the others in the room. */
+  const sendBoard = useCallback((only?: string) => {
+    const st = familyRef.current;
+    const rm = roomRef.current;
+    if (!st || !rm) return;
+    const recs = wireBoard(st, only);
+    if (recs.length) rm.send('lb', { id: myIdRef.current, recs }, { force: true });
+  }, []);
+  /** A moment after someone joins, share the board (spread out so devices do not all talk at once). */
+  const scheduleBoard = useCallback(() => {
+    if (boardTimerRef.current) return;
+    boardTimerRef.current = window.setTimeout(() => {
+      boardTimerRef.current = 0;
+      if (!gameRef.current || gameRef.current.closedAt) sendBoard();
+      else scheduleBoard(); // mid-race: wait for the finish
+    }, 1200 + Math.random() * 1800);
+  }, [sendBoard]);
+  useEffect(() => () => window.clearTimeout(boardTimerRef.current), []);
 
   // Menu music, and keep the screen awake while in a room or a race
   useEffect(() => {
@@ -3204,6 +4226,10 @@ export default function BendanaKartPage() {
   const startRace = useCallback((cfg: RaceCfg) => {
     setHud(EMPTY_HUD);
     setAwards([]);
+    setGain(null);
+    setRaceMenu(false);
+    setPanel(null);
+    setFamPanel(null);
     raceRef.current = cfg;
     playedRef.current.add(cfg.id);
     readyRef.current = false;
@@ -3221,7 +4247,12 @@ export default function BendanaKartPage() {
     if (cupRef.current) cupRef.current.round = round;
     setCupView(cupRef.current ? { ...cupRef.current } : null);
     const t = cup >= 0 ? CUPS[cup].tracks[round] : track;
-    startRace({ mode: 'solo', id: randId(), order: [], track: t, laps: p.toddler ? 2 : p.laps, goWall: wall() + 3800, cup, round, nonce: Math.random() });
+    const bots = pickBots(4, [p.kartIdx], cup >= 0 && round > 0 ? botRosterRef.current : null);
+    botRosterRef.current = bots;
+    startRace({
+      mode: 'solo', id: randId(), order: [], track: t, laps: p.toddler ? 2 : p.laps, goWall: wall() + 3800, cup, round, nonce: Math.random(),
+      bots, botLevel: p.botLevel, botOwner: myIdRef.current,
+    });
   }, [startRace]);
 
   // ---------- The room ----------
@@ -3229,7 +4260,7 @@ export default function BendanaKartPage() {
     const p = profileRef.current;
     const m: Meta = {
       v: 2, n: p.name || 'Racer', c: [p.kartIdx, p.paint, p.body, p.toddler ? 1 : 0, p.assist],
-      r: readyRef.current ? 1 : 0, h: hostClaimRef.current ? 1 : 0, j: joinedAtRef.current, o: [p.trackIdx, p.laps, p.cup],
+      r: readyRef.current ? 1 : 0, h: hostClaimRef.current ? 1 : 0, j: joinedAtRef.current, o: [p.trackIdx, p.laps, p.cup, p.bots ? 1 : 0, p.botLevel],
     };
     if (hostRaceRef.current) m.race = hostRaceRef.current;
     return m;
@@ -3245,6 +4276,7 @@ export default function BendanaKartPage() {
     if (r) void r.close();
     hostRaceRef.current = null;
     rosterRef.current = new Map();
+    peersRef.current = new Set();
     setRoom(null);
     setPlayers([]);
     playersRef.current = [];
@@ -3262,7 +4294,7 @@ export default function BendanaKartPage() {
 
   /** Start (or join late) the host's race, converting GO to my clock. */
   const joinHostRace = useCallback((t: RaceTuple, hintTs?: number, recv?: number) => {
-    const [id, track, order, go, laps, cup, round] = t;
+    const [id, track, order, go, laps, cup, round, bt] = t;
     if (playedRef.current.has(id) || raceRef.current?.id === id) return;
     if (!order.includes(myIdRef.current)) return; // not in this race: wait in the lobby
     const clock = clockRef.current;
@@ -3275,7 +4307,10 @@ export default function BendanaKartPage() {
       cupRef.current.round = round;
     } else cupRef.current = null;
     setCupView(cupRef.current ? { ...cupRef.current } : null);
-    startRace({ mode: 'multi', id, order, track, laps, goWall, cup, round, nonce: Math.random() });
+    startRace({
+      mode: 'multi', id, order, track, laps, goWall, cup, round, nonce: Math.random(),
+      bots: bt ? bt[2] : [], botLevel: bt ? bt[0] : 1, botOwner: bt ? bt[1] : '',
+    });
   }, [startRace]);
 
   const applyEvent = useCallback((from: string, raceId: unknown, ev: NetEvent) => {
@@ -3293,7 +4328,6 @@ export default function BendanaKartPage() {
     if (!G || G.mode !== 'multi' || raceId !== G.raceId) return;
     const now = performance.now();
     const r = G.remotes.get(from);
-    const me = G.karts[0];
     switch (ev.k) {
       case 'box': {
         const b = G.boxes.find((x) => x.id === ev.b);
@@ -3307,8 +4341,7 @@ export default function BendanaKartPage() {
         const b = G.bananas.find((x) => x.id === ev.b);
         if (b) spawnParticles(G, b.x, b.y, 12, () => '#fde047', 200, 0.5, 6);
         G.bananas = G.bananas.filter((x) => x.id !== ev.b);
-        if (ev.o === me.id) me.st.hits++;
-        if (r) react(r, '💫', 1300);
+        gotOne(G, ev);
         break;
       }
       case 'fire': {
@@ -3321,12 +4354,14 @@ export default function BendanaKartPage() {
         const bl = G.blasts.find((b) => b.id === ev.b);
         if (bl) spawnParticles(G, bl.x, bl.y, 18, (j) => (j % 2 ? '#f97316' : '#fde047'), 280, 0.5, 8);
         G.blasts = G.blasts.filter((b) => b.id !== ev.b);
-        if (ev.o === me.id) me.st.hits++;
-        if (r) react(r, '💫', 1300);
+        gotOne(G, ev);
         break;
       }
       case 'snooze':
         snoozeAhead(G, String(ev.o), Number(ev.p) || 0);
+        break;
+      case 'honk':
+        honkAt(G, String(ev.o), Number(ev.x) || 0, Number(ev.y) || 0);
         break;
       case 'fin':
         if (r) {
@@ -3357,6 +4392,16 @@ export default function BendanaKartPage() {
     playersRef.current = list;
     setPlayers(list);
     rm.setPlayers(Math.min(MAX_PLAYERS, list.length));
+    // Someone new in the room: swap leaderboards
+    const seen = peersRef.current;
+    let fresh = false;
+    for (const p of list) {
+      if (p.id !== myIdRef.current && !seen.has(p.id)) {
+        seen.add(p.id);
+        fresh = true;
+      }
+    }
+    if (fresh) scheduleBoard();
     const host = pickHost(list);
     const meHost = !!host && host.id === myIdRef.current;
     clockRef.current.setHost(host?.id ?? '', meHost);
@@ -3375,11 +4420,11 @@ export default function BendanaKartPage() {
     if (G) {
       const now = performance.now();
       G.remotes.forEach((r, id) => {
-        if (pres.has(id)) r.leftAt = 0;
+        if (r.bot || pres.has(id)) r.leftAt = 0;
         else if (!r.leftAt) r.leftAt = now;
       });
     }
-  }, [joinHostRace, leaveRoom]);
+  }, [joinHostRace, leaveRoom, scheduleBoard]);
 
   const joinRoom = useCallback((code: string, asHost: boolean) => {
     unlockAudio();
@@ -3446,6 +4491,42 @@ export default function BendanaKartPage() {
         r.finishTime = Number(p.ft) || 0;
         if (!G.firstFinishAt) G.firstFinishAt = performance.now();
       }
+      r.pkProg = r.progress;
+      // Robots this player's device is driving ride along in the same message
+      if (Array.isArray(p.b) && p.b.length) {
+        // Two devices driving the robots: the lower id keeps them
+        const mine = G.karts.some((k) => k.bot);
+        if (mine && id < G.meId) yieldBots(G, id);
+        if (!mine || id < G.meId) G.botOwner = id;
+        for (const raw of mine && id > G.meId ? [] : (p.b as unknown[]).slice(0, MAX_PLAYERS)) {
+          if (!Array.isArray(raw) || typeof raw[0] !== 'string') continue;
+          const [bid, lap, bi, coins, spinA, ft, be, bs, bk, bb] = raw as [string, number, number, number, number, number, number, unknown, number, number];
+          let br = G.remotes.get(bid);
+          if (!br) {
+            const kIdx = clamp(Math.floor(Number(bk) || 0), 0, KARTS.length - 1);
+            br = makeRemote(bid, KARTS[kIdx].name, kIdx, -1, clamp(Math.floor(Number(bb) || 0), 0, BODIES.length - 1), false, G.remotes.size + 1);
+            br.bot = true;
+            G.remotes.set(bid, br);
+          }
+          if (!br.bot) continue;
+          if (br.owner !== id) {
+            // A new device took these robots over: its clock is different, so start a fresh timeline
+            br.owner = id;
+            br.net = new RemoteKart();
+          }
+          br.net.ingest(parseSamples(bs, Number(be) || 0), Number(p.q) || 0, Number(p.ts) || recv, Number(p.iv) || 0, recv);
+          br.lap = Number(lap) || 0;
+          br.idx = clamp(Number(bi) || 0, 0, TRACK.n - 1);
+          br.progress = br.pkProg = br.lap * TRACK.n + br.idx;
+          br.coins = Number(coins) || 0;
+          br.spinA = Number(spinA) || 0;
+          const bl = br.net.samples[br.net.samples.length - 1];
+          if (bl && bl.f & F_DONE && !br.finished) {
+            br.finished = true;
+            br.finishTime = Number(ft) || 0;
+          }
+        }
+      }
       if (Array.isArray(p.ev)) for (const ev of p.ev as NetEvent[]) applyEvent(id, p.r, ev);
     });
     rm.on('ev', (p) => {
@@ -3466,6 +4547,12 @@ export default function BendanaKartPage() {
       if (!t || !Array.isArray(t) || (host && p.from !== host.id)) return;
       joinHostRace(parseMeta('x', { race: t }).race ?? t, Number(p.ts), recv);
     });
+    rm.on('lb', (p) => {
+      const st = familyRef.current;
+      if (!st) return;
+      const res = mergeBoard(st, p.recs);
+      if (res.changed) commitFamily(res.store);
+    });
     rm.on('lobby', (p) => {
       if (raceRef.current && p.r === raceRef.current.id) {
         raceRef.current = null;
@@ -3480,7 +4567,7 @@ export default function BendanaKartPage() {
     setScreen('lobby');
     // First presence after a short moment (meta must be set before track)
     rm.setMeta(myMeta(), true);
-  }, [applyEvent, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
+  }, [applyEvent, commitFamily, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
 
   useEffect(() => {
     if (!autoJoin || !myId) return;
@@ -3505,7 +4592,7 @@ export default function BendanaKartPage() {
       const rm = roomRef.current;
       if (!rm) return;
       const h = pickHost(playersRef.current);
-      clockRef.current.tick(rm, !!h && h.id === myIdRef.current);
+      clockRef.current.tick(rm, !!h && h.id === myIdRef.current, !!gameRef.current && !gameRef.current.closedAt);
     }, 500);
     return () => window.clearInterval(t);
   }, [room]);
@@ -3528,7 +4615,13 @@ export default function BendanaKartPage() {
     const track = cup >= 0 ? CUPS[cup].tracks[round] : opts?.track ?? p.trackIdx;
     const anyToddler = playersRef.current.some((x) => x.toddler);
     const laps = anyToddler && p.laps > 2 ? p.laps : p.laps;
-    const t: RaceTuple = [randId(), track, order.slice(0, MAX_PLAYERS), wall() + 4500, laps, cup, round];
+    // Robots take the empty seats; they keep their line-up from race to race
+    const humans = order.slice(0, MAX_PLAYERS);
+    const taken = playersRef.current.filter((x) => humans.includes(x.id)).map((x) => x.kartIdx);
+    if (!taken.includes(p.kartIdx)) taken.push(p.kartIdx);
+    const bots = pickBots(p.bots ? MAX_PLAYERS - humans.length : 0, taken, botRosterRef.current);
+    botRosterRef.current = bots;
+    const t: RaceTuple = [randId(), track, humans, wall() + 4500, laps, cup, round, [p.botLevel, myIdRef.current, bots]];
     hostRaceRef.current = t;
     rm.setMeta(myMeta(), true);
     rm.send('start', { race: t, from: myIdRef.current, ts: wall() }, { force: true });
@@ -3537,7 +4630,10 @@ export default function BendanaKartPage() {
       cupRef.current.round = round;
     } else cupRef.current = null;
     setCupView(cupRef.current ? { ...cupRef.current } : null);
-    startRace({ mode: 'multi', id: t[0], order: t[2], track, laps, goWall: t[3], cup, round, nonce: Math.random() });
+    startRace({
+      mode: 'multi', id: t[0], order: t[2], track, laps, goWall: t[3], cup, round, nonce: Math.random(),
+      bots, botLevel: p.botLevel, botOwner: myIdRef.current,
+    });
   }, [myMeta, startRace]);
 
   const backToLobby = () => {
@@ -3607,6 +4703,19 @@ export default function BendanaKartPage() {
     return () => window.clearTimeout(t);
   }, [autoStartAt, hostStart]);
 
+  // A little sound when someone comes into the room or leaves it
+  const seatCountRef = useRef(0);
+  useEffect(() => {
+    if (screen !== 'lobby') {
+      seatCountRef.current = 0;
+      return;
+    }
+    const n = Math.min(players.length, MAX_PLAYERS);
+    if (seatCountRef.current && n > seatCountRef.current) sfx('join');
+    else if (n < seatCountRef.current) sfx('leave');
+    seatCountRef.current = n;
+  }, [players.length, screen]);
+
   // Emote bubbles fade after 2 s
   useEffect(() => {
     const ids = Object.keys(emotes);
@@ -3624,7 +4733,10 @@ export default function BendanaKartPage() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     setTrack(race.track);
-    const track = getTrackCanvas();
+    // The painted top-down track is only made when the top-down view is used
+    // (it is a big canvas, and the 3D view has its own copy of the ground).
+    let track: HTMLCanvasElement = document.createElement('canvas');
+    let trackReady = false;
     const G = createGame(race, myIdRef.current, profileRef.current, rosterRef.current);
     G.autoDrift = isTouchRef.current;
     const testdrive = testdriveRef.current;
@@ -3637,10 +4749,10 @@ export default function BendanaKartPage() {
     events.clear();
     const sampler = samplerRef.current;
     sampler.reset();
-    G.emit = (ev) => {
+    G.emit = (ev, lazy) => {
       if (G.mode !== 'multi') return;
       events.add(ev);
-      roomRef.current?.send('ev', { id: G.meId, r: G.raceId, l: [ev] }, { force: true });
+      if (!lazy) roomRef.current?.send('ev', { id: G.meId, r: G.raceId, l: [ev] }, { force: true });
     };
     gameRef.current = G;
     startMusic(race.track);
@@ -3717,11 +4829,17 @@ export default function BendanaKartPage() {
         const sky = SKIES[TRACK_IDX] || SKIES[0];
         const scene: SceneTrack = {
           xs: TRACK.xs, ys: TRACK.ys, tx: TRACK.tx, ty: TRACK.ty, n: TRACK.n, halfW: HALF_W,
-          worldW: WORLD_W, worldH: WORLD_H, ground: getTrackCanvas(true),
-          big: sceneryItems().filter((it) => it.big),
+          worldW: WORLD_W, worldH: WORLD_H, theme: TRACK_IDX, name: THEME.name,
+          colors: {
+            grassA: THEME.grassA, grassB: THEME.grassB, edge: THEME.edge, outside: THEME.outside, road: THEME.road,
+            roadInner: THEME.roadInner, curbA: THEME.curbA, curbB: THEME.curbB, line: THEME.line, dust: THEME.dust,
+          },
+          scenery: sceneryItems(),
           sky: sky.sky, horizon: sky.horizon, hills: sky.hills, night: sky.night,
-          outside: THEME.outside, edge: THEME.edge,
           ramps: FEATURES.ramps.map((r) => ({ x: r.x, y: r.y, a: r.a, len: RAMP_LEN, width: HALF_W * 2 - 10 })),
+          pads: FEATURES.pads.map((p) => ({ x: p.x, y: p.y, a: p.a, len: PAD_LEN, width: PAD_W })),
+          // Road hazards are added by the gameplay code; draw them if they exist
+          hazards: (FEATURES as { hazards?: SceneTrack['hazards'] }).hazards ?? [],
         };
         view.setTrack(scene);
       } catch {
@@ -3797,13 +4915,62 @@ export default function BendanaKartPage() {
     let lastPlace = 0;
     let scored = false;
     let debugAt = 0;
+    let podiumIds: string[] | null = null;
+    let fireworkAt = 0;
+    let saidBanner = '';
+    let saidItem: ItemKind | null = null;
+    let saidLap = 0;
+    let gaugeV = 0;
+    // Save this race to the racer's stats, once
+    const racerPid = familyRef.current ? activeLocal(familyRef.current).pid : '';
+    let recorded = false;
+    const recordRace = (award: string | null, cupWon: boolean, quiet = false) => {
+      const st = familyRef.current;
+      const me = G.karts[0];
+      if (recorded || !st || !racerPid || !me.finished) return;
+      recorded = true;
+      const ranked = rankRacers(racers(G));
+      const lapsMs = G.lapAt.length === G.laps + 1 ? G.lapAt.slice(1).map((t, i) => t - G.lapAt[i]) : [];
+      const res = applyRace(st, racerPid, {
+        track: race.track, laps: G.laps, place: ranked.findIndex((r) => r.isMe) + 1, total: ranked.length,
+        family: G.mode === 'multi' && ranked.filter((r) => r.human).length >= 2,
+        timeMs: me.finishTime, lapsMs, stats: me.st, cleanLaps: G.cleanLaps, award, cupWon,
+      }, TRACKS.length);
+      if (!res) return;
+      commitFamily(res.store);
+      if (!quiet) setGain(res.gain);
+      if (G.mode === 'multi') window.setTimeout(() => sendBoard(racerPid), 300 + Math.random() * 900);
+    };
+    let botCheckAt = 0;
+    let testItemAt = 0;
+    const testItem = (() => {
+      try {
+        const v = new URLSearchParams(window.location.search).get('item') as ItemKind | null;
+        return v && ITEM_KINDS.includes(v) ? v : null;
+      } catch {
+        return null;
+      }
+    })();
+    const botSamplers = new Map<string, Sampler>();
+    const botEpochs = new Map<string, number>();
+    const flagsOf = (k: Kart) =>
+      (k.spinT > 0 ? F_SPIN : 0) | (k.boostT > 0 || k.miniT > 0 || k.padT > 0 || k.trickT > 0 || k.rushT > 0 ? F_BOOST : 0) |
+      (k.drifting ? F_DRIFT : 0) | (k.airT > 0 ? F_AIR : 0) | (k.shieldT > 0 || k.toddler ? F_SHIELD : 0) |
+      (k.finished ? F_DONE : 0) | (k.snoozeT > 0 ? F_SNOOZE : 0) | (k.draftT > 0 ? F_DRAFT : 0) |
+      (k.rushT > 0 ? F_RUSH : 0) | (k.magnetT > 0 ? F_MAGNET : 0);
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
+      if (!trackReady && (profileRef.current.cam === 'top' || failed3d)) {
+        track = getTrackCanvas();
+        trackReady = true;
+      }
       let dt = (now - last) / 1000;
       last = now;
       if (dt > 0.1) dt = 0.1;
       if (dt < 0) dt = 0;
       const inp = readInput();
+      // Messages take about half my round trip to the host to reach me
+      if (clockRef.current.rtt > 0) G.lagMs = clamp(clockRef.current.rtt / 2, 0, 300);
       updateRemotes(G, dt, now);
       let rem = dt;
       while (rem > 1e-6) {
@@ -3832,10 +4999,39 @@ export default function BendanaKartPage() {
       // ----- Send my kart -----
       const rm = roomRef.current;
       if (G.mode === 'multi' && rm) {
-        const flags = (me.spinT > 0 ? F_SPIN : 0) | (me.boostT > 0 || me.miniT > 0 || me.padT > 0 || me.trickT > 0 ? F_BOOST : 0) |
-          (me.drifting ? F_DRIFT : 0) | (me.airT > 0 ? F_AIR : 0) | (me.shieldT > 0 || me.toddler ? F_SHIELD : 0) |
-          (me.finished ? F_DONE : 0) | (me.snoozeT > 0 ? F_SNOOZE : 0) | (me.draftT > 0 ? F_DRAFT : 0);
+        const flags = flagsOf(me);
         const tw = wall();
+        // The robots I drive: sampled a little more coarsely than my own kart
+        for (const k of G.karts) {
+          if (!k.bot) continue;
+          let bs = botSamplers.get(k.id);
+          if (!bs) {
+            bs = new Sampler(100);
+            botSamplers.set(k.id, bs);
+          }
+          if (botEpochs.get(k.id) !== k.epoch) {
+            // Respawned: a fresh motion history, so nobody glides it across the map
+            botEpochs.set(k.id, k.epoch);
+            bs.reset();
+            bs.force(tw, k.x, k.y, k.angle + k.slip, k.vx, k.vy, k.w, flagsOf(k));
+          } else bs.sample(tw, k.x, k.y, k.angle + k.slip, k.vx, k.vy, k.w, flagsOf(k));
+        }
+        // Robots nobody is driving (their device left or went quiet): the
+        // players take them over in a fixed order, so only one device does.
+        if (now - botCheckAt > 1000 && G.phase === 'racing') {
+          botCheckAt = now;
+          let quiet = 0;
+          let any = false;
+          G.remotes.forEach((r) => {
+            if (!r.bot) return;
+            any = true;
+            quiet = Math.max(quiet, r.net.ready() ? r.net.silentFor(tw) : (now - G.goAt) / 1000);
+          });
+          if (any && quiet > 4) {
+            const here = [G.meId, ...playersRef.current.map((x) => x.id).filter((id) => id !== G.meId && G.remotes.has(id))].sort();
+            if (quiet > 4 + 3 * here.indexOf(G.meId)) adoptBots(G);
+          }
+        }
         if (me.epoch !== sentEpoch) {
           // Respawned: start a fresh motion history so nobody interpolates across it
           sampler.reset();
@@ -3844,16 +5040,33 @@ export default function BendanaKartPage() {
         const moving = Math.hypot(me.vx, me.vy) > 8 || me.spinT > 0;
         if (moving) stillSince = 0;
         else if (!stillSince) stillSince = now;
-        const nPlayers = Math.max(1, Math.min(MAX_PLAYERS, G.remotes.size + 1));
+        let humans = 1;
+        G.remotes.forEach((r) => {
+          if (!r.bot) humans++;
+        });
+        const nPlayers = Math.max(1, Math.min(MAX_PLAYERS, humans));
         const iv = sendIntervalFor(nPlayers);
-        const interval = stillSince && now - stillSince > 1000 && G.phase === 'racing' ? 1500 : G.phase === 'countdown' ? Math.max(iv, 600) : iv;
+        const myBots = G.karts.length > 1;
+        // Once the race is over the karts only cruise, so messages slow right
+        // down: a results screen left open must not eat the monthly allowance.
+        const over = G.closedAt > 0 && now - G.closedAt > 4000;
+        const interval = over ? 5000
+          : stillSince && now - stillSince > 1000 && G.phase === 'racing' && !myBots ? 1500
+            : G.phase === 'countdown' ? Math.max(iv, 600) : iv;
         if (now - lastSend >= interval && rm.canSend()) {
           sampler.force(tw, me.x, me.y, me.angle, me.vx, me.vy, me.w, flags);
           const samples = sampler.take();
+          const b: unknown[] = [];
+          for (const k of G.karts) {
+            const bs = botSamplers.get(k.id);
+            if (!k.bot || !bs) continue;
+            bs.force(tw, k.x, k.y, k.angle + k.slip, k.vx, k.vy, k.w, flagsOf(k));
+            b.push([k.id, k.lap, k.idx, k.coins, +k.spinA.toFixed(2), Math.round(k.finishTime), k.epoch, bs.take(), k.kartIdx, k.body]);
+          }
           const ok = rm.send('st', {
             id: me.id, r: G.raceId, q: sampler.seq, iv, ts: Math.round(tw), s: samples, e: me.epoch,
             l: me.lap, i: me.idx, c: me.coins, sp: +me.spinA.toFixed(2), ft: Math.round(me.finishTime),
-            ev: events.piggyback(),
+            ev: events.piggyback(), ...(b.length ? { b } : {}),
           });
           if (ok) {
             lastSend = now;
@@ -3862,6 +5075,28 @@ export default function BendanaKartPage() {
         }
       }
 
+      if (testItem && G.phase === 'racing' && !me.item && !me.finished && now - testItemAt > 4000) {
+        // ?item=honk: keep handing my kart one item and using it (testing only)
+        testItemAt = now;
+        me.item = testItem;
+        me.charges = 1;
+        me.rollT = 0;
+        input.fire = true;
+      }
+      if (debugRef.current) {
+        // ?netdebug: numbers for the multiplayer tests
+        (window as unknown as { __bkNet: unknown }).__bkNet = {
+          t: wall(), phase: G.phase, raceId: G.raceId, botOwner: G.botOwner, closed: G.closedAt > 0,
+          me: { id: me.id, x: me.x, y: me.y, p: me.progress, fin: me.finished, ft: me.finishTime },
+          local: G.karts.map((k) => ({ id: k.id, x: k.x, y: k.y, p: k.progress, fin: k.finished, bot: k.bot })),
+          remotes: [...G.remotes.values()].map((r) => ({
+            id: r.id, bot: r.bot, owner: r.owner, x: r.x, y: r.y, p: r.progress, fin: r.finished, ready: r.net.ready(),
+            quiet: r.net.silentFor(wall()), extrap: r.net.extrapMs, delay: r.net.delay,
+          })),
+          rank: rankRacers(racers(G)).map((r) => r.id),
+          sent: roomRef.current?.stats().sentPerSec ?? 0, room: roomRef.current?.stats().roomPerSec ?? 0,
+        };
+      }
       if (me.finished && !G.finishedAt) G.finishedAt = now;
       // Race over: score the cup once and work out the awards
       if (G.closedAt && !scored && now - G.closedAt > 1500) {
@@ -3879,13 +5114,34 @@ export default function BendanaKartPage() {
           });
           setCupView({ ...cup, totals: { ...cup.totals } });
         }
-        setAwards(computeAwards(G));
+        const aw = computeAwards(G);
+        setAwards(aw);
+        const mine = aw.find((a) => a.isMe);
+        let cupWon = false;
+        if (cup && race.cup >= 0 && race.round === CUPS[race.cup].tracks.length - 1) {
+          const top = Object.entries(cup.totals).sort((a, b) => b[1].pts - a[1].pts)[0];
+          cupWon = !!top && top[0] === G.meId;
+        }
+        recordRace(mine ? `${mine.icon} ${mine.title}` : null, cupWon);
         sfx('cheer');
       }
 
       const mode = profileRef.current.cam;
-      const v = mode !== 'top' ? getView() : null;
+      // The podium is a 3D stage, so it uses the 3D view even for top-down players
+      const podiumOn = G.closedAt > 0 && now - G.closedAt > 1800;
+      if (podiumOn && !podiumIds) {
+        podiumIds = rankRacers(racers(G)).slice(0, 3).map((r) => r.id);
+        startMusic(-2);
+        fireworkAt = now + 500;
+        const mine = podiumIds.indexOf(G.meId);
+        say(mine === 0 ? 'You win! Hooray!' : mine > 0 ? 'Great race! You are on the podium!' : 'Great racing, everyone!');
+      }
+      const v = mode !== 'top' || podiumOn ? getView() : null;
       const show3d = !!v;
+      if (podiumOn && show3d && now > fireworkAt && now - G.closedAt < 30000) {
+        fireworkAt = now + 500 + Math.random() * 1100;
+        sfx('firework', { pitch: 0.8 + Math.random() * 0.5, vol: 0.5 });
+      }
       if (canvas3d && canvas3d.style.visibility !== (show3d ? 'visible' : 'hidden')) canvas3d.style.visibility = show3d ? 'visible' : 'hidden';
       if (v) {
         const karts: KartView[] = [];
@@ -3927,9 +5183,20 @@ export default function BendanaKartPage() {
           guide: showGuide(G) && me.help * 0.6 > 0.02 ? guideLine(me).map((p) => ({ x: p.x, y: p.y, c: p.c, a: p.a * me.help * 0.75 })) : null,
           orbitYaw: orbit.yaw, orbitPitch: orbit.pitch, orbitDist: orbit.dist,
           finishedFor: G.finishedAt ? now - G.finishedAt : -1,
+          podium: podiumOn ? podiumIds : null,
         });
       }
-      render(ctx, G, track, w, h, dpr, now, show3d);
+      if (podiumOn && show3d) {
+        // Nothing from the race overlay on the podium: the stage is the show
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      } else {
+        render(ctx, G, track, w, h, dpr, now, show3d);
+        if (!me.finished && G.phase === 'racing') {
+          gaugeV += (Math.hypot(me.vx, me.vy) - gaugeV) * Math.min(1, dt * 8);
+          drawSpeedGauge(ctx, w, h, dpr, gaugeV, me.stats.maxSpeed, me.boostT > 0 || me.miniT > 0 || me.padT > 0 || me.trickT > 0, isTouchRef.current, now);
+        }
+      }
       if (now - hudAt > 100) {
         hudAt = now;
         const next = computeHud(G, now);
@@ -3940,6 +5207,18 @@ export default function BendanaKartPage() {
           if (up) vibrate([15, 30, 15]);
         }
         lastPlace = next.place;
+        // Spoken callouts for racers who can't read yet
+        if (next.banner && next.banner !== saidBanner) {
+          const line = spokenFor(next.banner);
+          if (line) say(line);
+        }
+        saidBanner = next.banner ?? '';
+        if (next.item && !next.rolling && next.item !== saidItem) say(`${ITEMS[next.item].label}!`);
+        saidItem = next.rolling ? saidItem : next.item;
+        if (next.lap !== saidLap && G.phase === 'racing') {
+          if (saidLap && next.lap === next.laps && !me.finished) say('Final lap!');
+          saidLap = next.lap;
+        }
         const key = JSON.stringify(next);
         if (key !== hudKey) {
           hudKey = key;
@@ -3955,7 +5234,9 @@ export default function BendanaKartPage() {
           place: rankRacers(racers(G)).findIndex((r) => r.isMe) + 1,
           x: Math.round(me0.x), y: Math.round(me0.y), a: +me0.angle.toFixed(2), d: Math.round(me0.dist), v: Math.round(Math.hypot(me0.vx, me0.vy)),
           idx: me0.idx, steer: +me0.steer.toFixed(2), auto: +me0.autoSteer.toFixed(2), spin: me0.spinT > 0, wrong: +me0.wrongT.toFixed(1),
-          bots: G.karts.slice(1).map((b) => ({ lap: b.lap, ft: b.finishTime, done: b.finished })),
+          bots: G.karts.slice(1).map((b) => ({ lap: b.lap, ft: b.finishTime, done: b.finished, drifts: b.st.drifts, hits: b.st.hits, lane: Math.round(b.lane) })),
+          extra: { hazards: FEATURES.hazards.length, pads: FEATURES.pads.length, hits: G.hitLog.join(' '), hitBy: me0.st.hitBy, coins: me0.st.coins },
+          music: musicDebug(), closedAt: G.closedAt, podium: podiumOn,
         };
       }
       if (debugRef.current && now - debugAt > 500) {
@@ -3982,11 +5263,13 @@ export default function BendanaKartPage() {
       window.removeEventListener('blur', onBlur);
       input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
       engineStop();
+      stopVoice();
+      recordRace(null, false, true); // finished but left before the results: it still counts
       if (gameRef.current === G) gameRef.current = null;
       view?.dispose();
       view = null;
     };
-  }, [screen, race]);
+  }, [screen, race, commitFamily, sendBoard]);
 
   // ---------- Touch controls ----------
   const press = (key: InputKey, on: boolean) => {
@@ -4036,17 +5319,31 @@ export default function BendanaKartPage() {
     }
   };
 
+  const shareLink = async () => {
+    try {
+      if (typeof navigator.share === 'function') {
+        await navigator.share({ title: 'Bendana Kart', text: `Join my race! Room ${room}`, url: shareUrl });
+        return;
+      }
+    } catch {
+      return; // closed the share sheet
+    }
+    void copyLink();
+  };
+
   const nameInput = (
     <input
       value={profile.name}
       onChange={(e) => setProfile((p) => ({ ...p, name: e.target.value.slice(0, 14) }))}
       placeholder="Your name"
+      aria-label="Your name"
+      autoComplete="off"
       maxLength={14}
       className="w-full rounded-2xl border-0 bg-white/90 px-5 py-4 text-xl font-black text-slate-900 placeholder:text-slate-400 shadow-inner outline-none focus:ring-4 focus:ring-yellow-300"
     />
   );
 
-  const raceChoice = (disabled: boolean, value: { track: number; cup: number; laps: number }) => (
+  const raceChoice = (disabled: boolean, value: { track: number; cup: number; laps: number; bots: boolean; botLevel: number }, online = true) => (
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-3 gap-2">
         {[-1, 0, 1].map((c) => (
@@ -4064,7 +5361,7 @@ export default function BendanaKartPage() {
         ))}
       </div>
       {value.cup < 0 && (
-        <TrackPicker value={value.track} disabled={disabled} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
+        <TrackPicker value={value.track} disabled={disabled} best={myRec?.b} laps={value.laps} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
       )}
       <div className="flex items-center gap-2 text-white">
         <span className="text-sm font-black">Laps:</span>
@@ -4080,28 +5377,51 @@ export default function BendanaKartPage() {
           </button>
         ))}
       </div>
+      <RobotPicker level={value.botLevel} fill={value.bots} disabled={disabled} showFill={online} onLevel={(v) => setProfile((p) => ({ ...p, botLevel: v }))} onFill={(v) => setProfile((p) => ({ ...p, bots: v }))} />
     </div>
   );
 
   const toggles = (
     <div className="flex flex-wrap gap-2">
       {([
-        ['music', profile.music ? '🎵 Music on' : '🎵 Music off'],
-        ['muted', profile.muted ? '🔇 Sound off' : '🔊 Sound on'],
-        ['haptics', profile.haptics ? '📳 Buzz on' : '📳 Buzz off'],
-      ] as const).map(([k, label]) => (
+        ['music', profile.music ? '🎵 Music on' : '🎵 Music off', profile.music],
+        ['muted', profile.muted ? '🔇 Sound off' : '🔊 Sound on', !profile.muted],
+        ['haptics', profile.haptics ? '📳 Buzz on' : '📳 Buzz off', profile.haptics],
+      ] as const).map(([k, label, on]) => (
         <button
           key={k}
           type="button"
+          aria-pressed={on}
           onClick={() => {
             unlockAudio();
             setProfile((p) => ({ ...p, [k]: !p[k] }));
+            sfx('uiToggle');
           }}
-          className="rounded-full bg-black/25 px-4 py-2 text-sm font-black text-white ring-1 ring-white/25 active:scale-95"
+          className={`rounded-full px-4 py-2 text-sm font-black ring-1 transition active:scale-95 ${on ? 'bg-white/90 text-slate-900 ring-white' : 'bg-black/25 text-white/80 ring-white/25'}`}
         >
           {label}
         </button>
       ))}
+      {voiceAvailable() && (
+        <button
+          type="button"
+          aria-pressed={prefs.voice}
+          onClick={() => {
+            unlockAudio();
+            unlockVoice();
+            const on = !prefs.voice;
+            setPrefs((p) => ({ ...p, voice: on }));
+            sfx('uiToggle');
+            if (on) {
+              setVoiceOn(true);
+              say('Voice on!');
+            }
+          }}
+          className={`rounded-full px-4 py-2 text-sm font-black ring-1 transition active:scale-95 ${prefs.voice ? 'bg-white/90 text-slate-900 ring-white' : 'bg-black/25 text-white/80 ring-white/25'}`}
+        >
+          {prefs.voice ? '🗣️ Voice on' : '🗣️ Voice off'}
+        </button>
+      )}
     </div>
   );
 
@@ -4111,83 +5431,229 @@ export default function BendanaKartPage() {
     </span>
   );
 
+  const myRec = family ? family.board[family.active] : undefined;
+  const myTotals = myRec ? totals(myRec) : null;
+  const familySheets = (
+    <FamilySheets panel={famPanel} store={family} kit={FAMILY_KIT} setPanel={setFamPanel} onCreate={createPlayer} onAdopt={adoptBoardPlayer} onRemove={removePlayer} />
+  );
+  const whoRow = family && <WhoRow store={family} kit={FAMILY_KIT} onPick={pickPlayer} onAdd={() => setFamPanel({ kind: 'add' })} />;
+  const familyButtons = (
+    <div className="grid grid-cols-2 gap-2">
+      <button
+        type="button"
+        onClick={() => family && setFamPanel({ kind: 'stats', pid: family.active })}
+        className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 px-3 py-3 text-lg font-black text-white shadow-lg active:scale-95"
+      >
+        📊 My stats
+      </button>
+      <button
+        type="button"
+        onClick={() => setFamPanel({ kind: 'board' })}
+        className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 px-3 py-3 text-lg font-black text-slate-900 shadow-lg active:scale-95"
+      >
+        🏆 Leaderboard
+      </button>
+    </div>
+  );
+  // ---------- Panels (slide over the home screen and the lobby) ----------
+  const pickers = (compact: boolean) => (
+    <KartPicker compact={compact} value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
+  );
+  const bigGo = 'bk-tile w-full bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-2xl font-black text-slate-900 disabled:opacity-50';
+  let panelEl: React.ReactNode = null;
+  if (panel === 'garage') {
+    panelEl = (
+      <Sheet title="🔧 Garage" onClose={closePanel} tone="from-sky-600 via-indigo-600 to-violet-700" footer={<button type="button" onClick={closePanel} className={bigGo}>👍 Looks great!</button>}>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="text-lg font-black text-white">Who&apos;s racing?</h3>
+          {whoRow}
+          {nameInput}
+        </section>
+        {pickers(vp.h < 560)}
+      </Sheet>
+    );
+  } else if (panel === 'solo') {
+    panelEl = (
+      <Sheet
+        title="🏁 Pick your race"
+        onClose={closePanel}
+        tone="from-emerald-600 via-teal-600 to-sky-700"
+        footer={
+          <button type="button" onClick={() => startSolo(profile.trackIdx, profile.cup, 0)} className={bigGo}>
+            🏁 START! <span className="text-base font-bold opacity-75">{profile.cup >= 0 ? `${CUPS[profile.cup].emoji} ${CUPS[profile.cup].name}` : `${TRACKS[profile.trackIdx].emoji} ${TRACKS[profile.trackIdx].name}`}</span>
+          </button>
+        }
+      >
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">{raceChoice(false, { track: profile.trackIdx, cup: profile.cup, laps: profile.laps, bots: profile.bots, botLevel: profile.botLevel }, false)}</section>
+        <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+      </Sheet>
+    );
+  } else if (panel === 'family') {
+    panelEl = (
+      <Sheet title="👨‍👩‍👧‍👦 Family race" onClose={closePanel} tone="from-orange-500 via-rose-500 to-fuchsia-600">
+        <p className="rounded-3xl bg-black/25 p-4 text-center text-base font-bold text-white ring-1 ring-white/20">
+          Everyone races on their own phone, tablet or computer. One person starts a room, and up to {MAX_PLAYERS} racers can join it.
+        </p>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h3 className="text-xl font-black text-white">🔑 Join a room</h3>
+            <p className="text-sm font-bold text-white/85">Type the 4 letters from the other screen.</p>
+            <input
+              value={joinCode}
+              onChange={(e) => setJoinCode(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase())}
+              onKeyDown={(e) => e.key === 'Enter' && joinRace()}
+              placeholder="CODE"
+              aria-label="Room code"
+              inputMode="text"
+              autoCapitalize="characters"
+              autoComplete="off"
+              className="w-full rounded-2xl bg-white/95 px-3 py-3 text-center text-4xl font-black tracking-[0.4em] text-slate-900 outline-none placeholder:text-slate-300 focus:ring-4 focus:ring-yellow-300"
+            />
+            <button type="button" onClick={joinRace} disabled={!multiplayerReady || joinCode.length !== 4} className="bk-tile bg-gradient-to-b from-sky-300 to-indigo-500 px-4 py-4 text-2xl font-black text-white disabled:opacity-50">
+              {joinCode.length === 4 ? `Join room ${joinCode}` : 'Join'}
+            </button>
+          </section>
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h3 className="text-xl font-black text-white">📡 Start a room</h3>
+            <p className="text-sm font-bold text-white/85">You get a code and a square to scan. Share it with your family.</p>
+            <button type="button" onClick={hostRace} disabled={!multiplayerReady} className="bk-tile mt-auto bg-gradient-to-b from-yellow-200 to-orange-400 px-4 py-4 text-2xl font-black text-slate-900 disabled:opacity-50">
+              Start a room
+            </button>
+          </section>
+        </div>
+        {netError && <p className="rounded-2xl bg-red-600/85 p-3 text-center font-bold text-white">{netError}</p>}
+      </Sheet>
+    );
+  } else if (panel === 'settings') {
+    panelEl = (
+      <Sheet title="⚙️ Settings" onClose={closePanel} tone="from-slate-700 via-slate-800 to-indigo-900">
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+          {!profile.toddler && <AssistPicker key={family?.active} value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black text-white">Sound</h3>
+          {toggles}
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black text-white">Camera</h3>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {CAM_MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                aria-pressed={profile.cam === m.id}
+                onClick={() => {
+                  sfx('uiTap');
+                  setProfile((p) => ({ ...p, cam: m.id }));
+                }}
+                className={`rounded-xl px-2 py-3 text-sm font-black transition active:scale-95 ${profile.cam === m.id ? 'bg-yellow-300 text-slate-900' : 'bg-white/10 text-white ring-1 ring-white/25'}`}
+              >
+                <span className="block text-2xl">{m.icon}</span>
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 text-white ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black">Screen</h3>
+          {canFullscreen && (
+            <button type="button" onClick={toggleFullscreen} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">
+              ⛶ Full screen
+            </button>
+          )}
+          <p className="mt-2 text-sm font-bold text-white/80">
+            Tip: on a phone or tablet, use your browser&apos;s &quot;Add to Home Screen&quot; to get a Bendana Kart icon that opens full screen, like an app.
+          </p>
+        </section>
+      </Sheet>
+    );
+  } else if (panel === 'help') {
+    panelEl = (
+      <Sheet title="❓ How to play" onClose={closePanel} tone="from-cyan-600 via-sky-700 to-indigo-800">
+        <HelpCards touch={isTouch} />
+      </Sheet>
+    );
+  }
+
   // ---------- Screens ----------
   if (screen === 'menu') {
+    const wide = vp.w > vp.h;
+    const heroSize = Math.round(wide ? clamp(Math.min(vp.w * 0.4, vp.h * 0.58), 150, 430) : clamp(Math.min(vp.w * 0.8, vp.h * 0.34), 160, 400));
+    const meKart = KARTS[profile.kartIdx] || KARTS[0];
+    const small = [
+      { icon: '📊', label: 'My stats', go: () => family && setFamPanel({ kind: 'stats', pid: family.active }) },
+      { icon: '🏆', label: 'Leaders', go: () => setFamPanel({ kind: 'board' }) },
+      { icon: '🔧', label: 'Garage', go: () => setPanel('garage') },
+      { icon: '⚙️', label: 'Settings', go: () => setPanel('settings') },
+      { icon: '❓', label: 'Help', go: () => setPanel('help') },
+    ];
+    const lv = levelOf(myTotals?.st ?? 0);
     return (
-      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-sky-500 via-fuchsia-500 to-amber-400 px-4 py-6 sm:py-10" onPointerDown={() => unlockAudio()}>
-        <div className="mx-auto flex max-w-3xl flex-col gap-5">
-          <header className="text-center">
-            <h1 className="text-5xl font-black tracking-tight text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.25)] sm:text-6xl">
-              Bendana Kart 🏁
-            </h1>
-            <p className="mt-2 text-lg font-bold text-white/90">Race your family from any phone, tablet or computer.</p>
-          </header>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">1. What&apos;s your name?</h2>
-            {nameInput}
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">2. Pick your racer and kart</h2>
-            <KartPicker value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">3. One race or a cup?</h2>
-            {raceChoice(false, { track: profile.trackIdx, cup: profile.cup, laps: profile.laps })}
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
-            <div className="mt-3">{toggles}</div>
-          </section>
-
-          <section className="grid gap-3 rounded-3xl bg-black/20 p-4 backdrop-blur sm:grid-cols-3 sm:p-5">
-            <button
-              type="button"
-              onClick={() => startSolo(profile.trackIdx, profile.cup, 0)}
-              className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 px-4 py-5 text-xl font-black text-slate-900 shadow-lg active:scale-95"
-            >
-              🏁 Practice
-              <span className="block text-sm font-bold opacity-75">vs. 4 robot karts</span>
+      <main className="relative min-h-[100dvh] w-full overflow-x-hidden" onPointerDown={wake}>
+        <HomeBackdrop />
+        <div className={`relative mx-auto grid min-h-[100dvh] max-w-5xl content-center items-center gap-3 px-4 py-[max(1rem,env(safe-area-inset-top))] ${wide ? 'grid-cols-2 gap-6' : 'grid-cols-1'}`}>
+          <div className="flex flex-col items-center">
+            <Logo small={vp.h < 560 || vp.w < 380} />
+            <button type="button" onClick={() => openPanel('garage')} className="group relative mt-1 flex flex-col items-center" aria-label="Change your racer">
+              <span className="absolute bottom-9 h-[18%] w-[70%] rounded-[50%] bg-slate-900/25 blur-md" aria-hidden />
+              <KartTurntable kartIdx={profile.kartIdx} paint={profile.paint} body={profile.body} size={heroSize} />
+              <span className={`-mt-2 flex items-center gap-2 rounded-full bg-slate-900/85 py-1.5 pl-2 pr-4 text-white shadow-xl ring-2 ring-white/50 transition group-active:scale-95 ${profile.name ? '' : 'bk-wiggle'}`}>
+                <FaceIcon emoji={meKart.emoji} size={34} happy />
+                <span className="text-left leading-tight">
+                  <span className="block text-lg font-black">{profile.name || 'Tap to pick your racer'}</span>
+                  <span className="block text-xs font-bold text-white/75">{meKart.name} · {BODIES[profile.body]?.name ?? 'Classic'} kart ✏️</span>
+                </span>
+              </span>
             </button>
-            <button
-              type="button"
-              onClick={hostRace}
-              disabled={!multiplayerReady}
-              className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 px-4 py-5 text-xl font-black text-slate-900 shadow-lg active:scale-95 disabled:opacity-50"
-            >
-              📡 Host Race
-              <span className="block text-sm font-bold opacity-75">get a room code</span>
+            {family && family.locals.length > 1 && <div className="mt-1 max-w-full">{whoRow}</div>}
+          </div>
+
+          <div className="mx-auto flex w-full max-w-md flex-col gap-3">
+            <button type="button" onClick={() => openPanel('solo')} className="bk-tile flex items-center gap-4 bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-left text-slate-900 sm:py-5">
+              <span className="text-5xl drop-shadow sm:text-6xl">🏁</span>
+              <span>
+                <span className="block text-3xl font-black leading-none sm:text-4xl">PLAY</span>
+                <span className="block text-sm font-bold opacity-75 sm:text-base">Race the robot karts</span>
+              </span>
             </button>
-            <div className="flex flex-col gap-2 rounded-2xl bg-white/15 p-3">
-              <input
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase())}
-                placeholder="CODE"
-                inputMode="text"
-                autoCapitalize="characters"
-                className="w-full rounded-xl bg-white/90 px-3 py-2 text-center text-2xl font-black tracking-[0.4em] text-slate-900 outline-none placeholder:text-slate-400 focus:ring-4 focus:ring-yellow-300"
-              />
-              <button
-                type="button"
-                onClick={joinRace}
-                disabled={!multiplayerReady || joinCode.length !== 4}
-                className="rounded-xl bg-gradient-to-b from-sky-300 to-indigo-500 px-3 py-2 text-lg font-black text-white shadow active:scale-95 disabled:opacity-50"
-              >
-                🔑 Join Race
-              </button>
+            <button type="button" onClick={() => openPanel('family')} className="bk-tile flex items-center gap-4 bg-gradient-to-b from-yellow-200 to-orange-400 px-5 py-4 text-left text-slate-900 sm:py-5">
+              <span className="text-5xl drop-shadow sm:text-6xl">👨‍👩‍👧‍👦</span>
+              <span>
+                <span className="block text-3xl font-black leading-none sm:text-4xl">FAMILY RACE</span>
+                <span className="block text-sm font-bold opacity-75 sm:text-base">Everyone on their own screen</span>
+              </span>
+            </button>
+            <div className="grid grid-cols-5 gap-2">
+              {small.map((b) => (
+                <button
+                  key={b.label}
+                  type="button"
+                  onClick={() => {
+                    wake();
+                    sfx('uiOpen');
+                    b.go();
+                  }}
+                  className="bk-tile flex flex-col items-center bg-white/90 px-0.5 py-2.5 text-slate-900"
+                  style={{ borderRadius: '1.25rem' }}
+                >
+                  <span className="text-2xl sm:text-3xl">{b.icon}</span>
+                  <span className="text-[11px] font-black sm:text-sm">{b.label}</span>
+                </button>
+              ))}
             </div>
-          </section>
-
-          {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
-
-          <p className="pb-4 text-center text-sm font-semibold text-white/85">
-            Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item (or do a trick in the air), C to switch camera, Q to look back, H to honk. Game controllers work too. On a tablet, use the big buttons, hold a turn to drift, and tap ⭐ in the air for a trick.
-          </p>
+            {myTotals && myTotals.r > 0 && (
+              <div className="flex flex-wrap justify-center gap-2 text-sm font-black text-slate-900">
+                <span className="rounded-full bg-white/80 px-3 py-1">{lv.icon} Level {lv.lvl} {lv.title}</span>
+                <span className="rounded-full bg-white/80 px-3 py-1">⭐ {myTotals.st} stars</span>
+                {myTotals.w > 0 && <span className="rounded-full bg-white/80 px-3 py-1">🥇 {myTotals.w} win{myTotals.w > 1 ? 's' : ''}</span>}
+              </div>
+            )}
+            {netError && !panel && <p className="rounded-2xl bg-red-600/85 p-3 text-center font-bold text-white">{netError}</p>}
+          </div>
         </div>
+        {panelEl}
+        {familySheets}
       </main>
     );
   }
@@ -4195,104 +5661,149 @@ export default function BendanaKartPage() {
   if (screen === 'lobby') {
     const hostName = host?.name ?? 'the host';
     const hp = host ? parseMeta(host.id, rosterRef.current.get(host.id)) : null;
-    const shown = isHost ? { track: profile.trackIdx, cup: profile.cup, laps: profile.laps } : { track: hp?.trackIdx ?? 0, cup: hp?.cup ?? -1, laps: hp?.laps ?? 3 };
+    const shown = isHost
+      ? { track: profile.trackIdx, cup: profile.cup, laps: profile.laps, bots: profile.bots, botLevel: profile.botLevel }
+      : { track: hp?.trackIdx ?? 0, cup: hp?.cup ?? -1, laps: hp?.laps ?? 3, bots: hp?.bots ?? true, botLevel: hp?.botLevel ?? 1 };
     const conn = rtt < 0 ? null : rtt < 150 ? '🟢' : rtt < 350 ? '🟡' : '🔴';
+    const seats = players.slice(0, MAX_PLAYERS);
+    const meKart = KARTS[profile.kartIdx] || KARTS[0];
+    const waiting = seats.filter((p) => !p.ready && !(host && p.id === host.id)).length;
+    const shortScreen = vp.h < 520;
     return (
-      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 px-4 py-6 sm:py-10" onPointerDown={() => unlockAudio()}>
-        <div className="mx-auto flex max-w-2xl flex-col gap-5">
-          <header className="text-center">
-            <p className="text-sm font-black uppercase tracking-widest text-white/80">Room code</p>
-            <div className="mt-1 text-7xl font-black tracking-[0.25em] text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.3)]">{room}</div>
-            <p className="mt-2 font-bold text-white/90">On the other devices, open Bendana Kart, tap Join Race and type this code.</p>
-            {shareUrl && (
-              <button type="button" onClick={copyLink} className="mt-3 rounded-full bg-white/20 px-4 py-2 text-sm font-bold text-white ring-1 ring-white/40 active:scale-95">
-                {copied ? '✅ Link copied' : '🔗 Copy invite link'}
-              </button>
-            )}
+      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 px-4 pb-32 pt-[max(1rem,env(safe-area-inset-top))]" onPointerDown={wake}>
+        <div className="mx-auto flex max-w-3xl flex-col gap-4">
+          {/* How to get in: the code, the square to scan, and a link to send */}
+          <header className={`flex flex-col items-center rounded-3xl bg-black/25 ring-1 ring-white/20 sm:flex-row sm:justify-center ${shortScreen ? 'gap-3 p-2 sm:gap-5' : 'gap-4 p-4 sm:gap-8'}`}>
+            <div className="text-center">
+              <p className="text-sm font-black uppercase tracking-widest text-white/80">Room code</p>
+              <div className={`font-black tracking-[0.2em] text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.3)] ${shortScreen ? 'text-5xl' : 'text-7xl sm:text-8xl'}`}>{room}</div>
+              <p className="mx-auto mt-1 max-w-xs text-sm font-bold text-white/90">
+                {shortScreen ? 'Scan the square, or tap Family Race and type the code.' : 'On another device, point the camera at the square. Or open Bendana Kart, tap Family Race and type the code.'}
+              </p>
+              {shareUrl && (
+                <div className={`flex flex-wrap justify-center gap-2 ${shortScreen ? 'mt-1' : 'mt-3'}`}>
+                  <button type="button" onClick={shareLink} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">📤 Send invite</button>
+                  <button type="button" onClick={copyLink} className="rounded-full bg-white/20 px-4 py-2 text-sm font-black text-white ring-1 ring-white/40 active:scale-95">
+                    {copied ? '✅ Link copied' : '🔗 Copy link'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {shareUrl && <QrCode text={shareUrl} size={shortScreen ? 116 : 168} />}
           </header>
 
-          <section className="rounded-3xl bg-black/25 p-4 backdrop-blur">
+          <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
             <div className="mb-3 flex items-center justify-between gap-2">
-              <h2 className="text-lg font-black text-white">Racers ({Math.min(players.length, MAX_PLAYERS)}/{MAX_PLAYERS})</h2>
+              <h2 className="text-lg font-black text-white">Racers {seats.length}/{MAX_PLAYERS}</h2>
               <div className="flex items-center gap-2">
                 {!isHost && conn && <span className="rounded-full bg-black/30 px-2 py-1 text-xs font-black text-white">{conn} {rtt} ms</span>}
                 {statusBadge(netStatus)}
               </div>
             </div>
-            <ul className="flex flex-col gap-2">
-              {players.slice(0, MAX_PLAYERS).map((p) => (
-                <li
-                  key={p.id}
-                  className={`relative flex items-center gap-3 rounded-2xl px-4 py-3 text-white shadow transition ${p.ready || (host && p.id === host.id) ? 'ring-4 ring-lime-300' : ''}`}
-                  style={{ background: `linear-gradient(90deg, ${kartColors(p.kartIdx, p.paint).color}, ${kartColors(p.kartIdx, p.paint).dark})` }}
-                >
-                  <span className="text-4xl">{KARTS[p.kartIdx].emoji}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xl font-black">
-                      {p.name} {p.id === myId && <span className="text-sm opacity-80">(you)</span>}
+            <ul className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {Array.from({ length: MAX_PLAYERS }, (_, i) => {
+                const p = seats[i];
+                if (!p) {
+                  return (
+                    <li key={`empty-${i}`} className="flex min-h-[8.5rem] flex-col items-center justify-center rounded-2xl border-2 border-dashed border-white/35 text-white/60">
+                      <span className="text-3xl">＋</span>
+                      <span className="text-xs font-black">{players.length === 0 ? 'Connecting…' : 'Open seat'}</span>
+                    </li>
+                  );
+                }
+                const col = kartColors(p.kartIdx, p.paint);
+                const isH = !!host && p.id === host.id;
+                return (
+                  <li
+                    key={p.id}
+                    className={`relative flex min-h-[8.5rem] flex-col items-center justify-center rounded-2xl px-2 py-2 text-center text-white shadow-lg transition ${p.ready || isH ? 'ring-4 ring-lime-300' : 'ring-2 ring-white/25'}`}
+                    style={{ background: `linear-gradient(160deg, ${col.color}, ${col.dark})`, animation: 'bk-pop 0.35s ease-out both' }}
+                  >
+                    {isH && <span className="absolute -top-3 left-1/2 -translate-x-1/2 text-2xl drop-shadow" title="Host">👑</span>}
+                    {p.toddler && <span className="absolute right-1 top-1 text-lg" title="Toddler Assist">🛡️</span>}
+                    {emotes[p.id] && <span key={emotes[p.id].key} className="absolute -right-1 -top-3 animate-bounce text-4xl">{emotes[p.id].e}</span>}
+                    <FaceIcon emoji={KARTS[p.kartIdx].emoji} size={54} happy={p.ready || isH} />
+                    <span className="mt-1 block max-w-full truncate text-base font-black leading-tight drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">{p.name}</span>
+                    <span className="block text-[11px] font-bold opacity-90">{p.id === myId ? 'That’s you!' : KARTS[p.kartIdx].name}</span>
+                    <span className={`mt-1 rounded-full px-2 py-0.5 text-[11px] font-black ${isH ? 'bg-yellow-300 text-yellow-950' : p.ready ? 'bg-lime-300 text-lime-950' : 'bg-black/30'}`}>
+                      {isH ? 'HOST' : p.ready ? '✅ READY' : 'Getting ready…'}
                     </span>
-                    <span className="block text-sm font-bold opacity-85">{KARTS[p.kartIdx].name} · {BODIES[p.body]?.name ?? 'Classic'}</span>
-                  </span>
-                  {emotes[p.id] && <span key={emotes[p.id].key} className="animate-bounce text-4xl">{emotes[p.id].e}</span>}
-                  {p.toddler && <span className="text-2xl" title="Toddler Assist">🛡️</span>}
-                  {host && p.id === host.id ? <span className="text-2xl" title="Host">👑</span> : p.ready ? <span className="rounded-full bg-lime-300 px-2 py-1 text-xs font-black text-lime-950">✅ READY</span> : <span className="rounded-full bg-black/25 px-2 py-1 text-xs font-black">…</span>}
-                </li>
-              ))}
-              {players.length === 0 && <li className="rounded-2xl bg-white/10 p-4 text-center font-bold text-white/80">Connecting to the room…</li>}
+                  </li>
+                );
+              })}
             </ul>
-            {players.length === 1 && netStatus === 'joined' && (
-              <p className="mt-3 text-center text-sm font-bold text-white/80">Waiting for others to join…</p>
-            )}
             <div className="mt-3 flex flex-wrap justify-center gap-2">
               {EMOTES.map((e) => (
-                <button key={e} type="button" onClick={() => sendEmote(e)} className="h-12 w-12 rounded-full bg-white/15 text-2xl ring-1 ring-white/25 active:scale-90">
+                <button key={e} type="button" onClick={() => sendEmote(e)} aria-label={`Send ${e}`} className="h-12 w-12 rounded-full bg-white/15 text-2xl ring-1 ring-white/25 active:scale-90">
                   {e}
                 </button>
               ))}
             </div>
           </section>
 
-          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
-            <h2 className="text-lg font-black text-white">{isHost ? 'Pick the race' : `Race (👑 ${hostName} picks)`}</h2>
-            {raceChoice(!isHost, shown)}
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h2 className="text-lg font-black text-white">{isHost ? 'Pick the race' : `The race (👑 ${hostName} picks)`}</h2>
+            {isHost ? (
+              raceChoice(false, shown)
+            ) : (
+              <div className={`flex items-center gap-4 rounded-2xl bg-gradient-to-br p-3 text-white ${shown.cup >= 0 ? CUPS[shown.cup].card : TRACKS[shown.track].card}`}>
+                {shown.cup >= 0 ? <span className="text-6xl drop-shadow">{CUPS[shown.cup].emoji}</span> : <TrackMap idx={shown.track} width={132} />}
+                <span>
+                  <span className="block text-2xl font-black leading-tight drop-shadow">{shown.cup >= 0 ? CUPS[shown.cup].name : `${TRACKS[shown.track].emoji} ${TRACKS[shown.track].name}`}</span>
+                  <span className="block text-sm font-bold text-white/90">
+                    {shown.cup >= 0 ? CUPS[shown.cup].tracks.map((t) => TRACKS[t].emoji).join(' ') : TRACKS[shown.track].blurb} · {shown.laps} laps
+                  </span>
+                </span>
+              </div>
+            )}
           </section>
 
-          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
-            <h2 className="text-lg font-black text-white">Your kart</h2>
-            {nameInput}
-            <KartPicker compact value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <div className="flex items-center gap-3 rounded-2xl p-3 text-white" style={{ background: `linear-gradient(135deg, ${kartColors(profile.kartIdx, profile.paint).color}, ${kartColors(profile.kartIdx, profile.paint).dark})` }}>
+              <FaceIcon emoji={meKart.emoji} size={52} happy />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-xl font-black leading-tight drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">{profile.name || 'Racer'}</span>
+                <span className="block text-sm font-bold opacity-90">{meKart.name} · {BODIES[profile.body]?.name ?? 'Classic'} kart</span>
+              </span>
+              <button type="button" onClick={() => openPanel('garage')} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">✏️ Change</button>
+              <button type="button" onClick={() => openPanel('settings')} aria-label="Settings" className="flex h-10 w-10 items-center justify-center rounded-full bg-black/30 text-xl ring-1 ring-white/30 active:scale-95">⚙️</button>
+            </div>
+            {whoRow}
+            {familyButtons}
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
-            {toggles}
           </section>
 
           {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
+        </div>
 
-          <div className="sticky bottom-3 flex flex-col gap-3 pb-6 sm:flex-row">
-            <button type="button" onClick={quitToMenu} className="rounded-2xl bg-white/20 px-5 py-4 text-lg font-black text-white ring-2 ring-white/30 backdrop-blur active:scale-95">
-              ← Leave
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-white/15 bg-slate-950/60 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur-md">
+          <div className="mx-auto flex max-w-3xl gap-3">
+            <button type="button" onClick={quitToMenu} aria-label="Leave the room" className="rounded-2xl bg-white/20 px-4 py-4 text-lg font-black text-white ring-2 ring-white/30 active:scale-95">
+              ←<span className="hidden sm:inline"> Leave</span>
             </button>
             {isHost ? (
               <button
                 type="button"
                 onClick={() => hostStart()}
                 disabled={netStatus !== 'joined'}
-                className="flex-1 rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-2xl font-black text-slate-900 shadow-xl active:scale-95 disabled:opacity-50"
+                className="bk-tile flex-1 bg-gradient-to-b from-lime-300 to-green-500 px-4 py-4 text-xl font-black text-slate-900 disabled:opacity-50 sm:text-2xl"
               >
-                {autoStartAt ? '🏁 Everyone is ready! Starting…' : '🏁 Start Race!'}
+                {autoStartAt ? '🏁 Everyone is ready! Starting…' : seats.length > 1 && waiting > 0 ? `🏁 Start now (${waiting} still getting ready)` : '🏁 Start Race!'}
               </button>
             ) : (
               <button
                 type="button"
                 onClick={toggleReady}
                 disabled={netStatus !== 'joined'}
-                className={`flex-1 rounded-2xl px-5 py-4 text-2xl font-black shadow-xl active:scale-95 disabled:opacity-50 ${ready ? 'bg-lime-300 text-lime-950 ring-4 ring-white' : 'bg-gradient-to-b from-yellow-200 to-orange-400 text-slate-900'}`}
+                className={`bk-tile flex-1 px-4 py-4 text-xl font-black disabled:opacity-50 sm:text-2xl ${ready ? 'bg-lime-300 text-lime-950 ring-4 ring-white' : 'bg-gradient-to-b from-yellow-200 to-orange-400 text-slate-900'}`}
               >
                 {ready ? `✅ Ready! Waiting for 👑 ${hostName}` : '👍 I’m Ready!'}
               </button>
             )}
           </div>
         </div>
+        {panelEl}
+        {familySheets}
       </main>
     );
   }
@@ -4313,7 +5824,7 @@ export default function BendanaKartPage() {
       </div>
 
       {/* Top HUD */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+      <div className={`pointer-events-none absolute inset-x-0 top-0 items-start justify-between gap-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))] ${hud.podium ? 'hidden' : 'flex'}`}>
         <div className="rounded-2xl bg-slate-900/70 px-4 py-2 text-white shadow-lg ring-1 ring-white/20">
           <div
             key={posFx.key}
@@ -4355,34 +5866,31 @@ export default function BendanaKartPage() {
           </button>
           <button
             type="button"
-            onClick={() => setProfile((p) => ({ ...p, muted: !p.muted }))}
-            className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
-            aria-label={profile.muted ? 'Sound on' : 'Sound off'}
-          >
-            {profile.muted ? '🔇' : '🔊'}
-          </button>
-          <button
-            type="button"
-            onClick={race?.mode === 'multi' ? backToLobby : quitToMenu}
+            onClick={() => {
+              sfx('uiOpen');
+              setLeaveArmed(false);
+              setRaceMenu(true);
+            }}
             className="pointer-events-auto whitespace-nowrap rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
-            aria-label="Quit"
+            aria-label="Menu"
+            title="Menu (Esc)"
           >
-            ✕<span className="ml-1 hidden sm:inline">Quit</span>
+            ☰<span className="ml-1 hidden sm:inline">Menu</span>
           </button>
         </div>
       </div>
 
       {/* Race strip: everyone's face along the race */}
-      <div className="pointer-events-none absolute left-1/2 top-[6.6rem] h-9 w-[min(70vw,520px)] -translate-x-1/2 sm:top-[7.4rem]">
+      <div className={`pointer-events-none absolute left-1/2 top-[6.6rem] h-9 w-[min(70vw,520px)] -translate-x-1/2 sm:top-[7.4rem] ${hud.podium ? 'hidden' : ''}`}>
         <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-slate-900/50 ring-1 ring-white/30" />
         <div className="absolute right-0 top-1/2 -translate-y-1/2 translate-x-3 text-lg">🏁</div>
         {hud.standings.map((s) => (
           <div
             key={s.id}
-            className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 transition-[left] duration-100 ${s.isMe ? 'z-10 text-3xl drop-shadow-[0_0_6px_#fde047]' : 'text-2xl'}`}
+            className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 transition-[left] duration-100 ${s.isMe ? 'z-10 drop-shadow-[0_0_6px_#fde047]' : 'opacity-90'}`}
             style={{ left: `${Math.round(s.frac * 1000) / 10}%` }}
           >
-            {KARTS[s.kartIdx].emoji}
+            <FaceIcon emoji={KARTS[s.kartIdx].emoji} size={s.isMe ? 36 : 27} />
           </div>
         ))}
       </div>
@@ -4394,7 +5902,7 @@ export default function BendanaKartPage() {
         <pre className="pointer-events-none absolute bottom-40 left-2 max-w-[90vw] whitespace-pre-wrap rounded-xl bg-black/70 p-2 text-[11px] leading-tight text-lime-200">{netDebug}</pre>
       )}
 
-      {profile.toddler && (
+      {profile.toddler && !hud.finished && hud.countdown === null && (
         <div className="pointer-events-none absolute left-1/2 top-[9.4rem] -translate-x-1/2 rounded-full bg-sky-400/90 px-4 py-1 text-sm font-black text-slate-900 shadow sm:top-40">
           🛡️ Toddler Assist on: just hold GAS!
         </div>
@@ -4426,7 +5934,7 @@ export default function BendanaKartPage() {
           <div className="animate-pulse rounded-3xl bg-red-600/90 px-6 py-3 text-4xl font-black text-white shadow-2xl">↻ WRONG WAY</div>
         </div>
       )}
-      {(hud.tier > 0 || hud.draft) && (
+      {(hud.tier > 0 || hud.draft) && !hud.finished && (
         <div className="pointer-events-none absolute inset-x-0 bottom-36 flex justify-center gap-2 sm:bottom-40">
           {hud.tier > 0 && (
             <div className="rounded-full px-5 py-1 text-xl font-black text-white shadow-lg" style={{ background: ['', '#3b82f6', '#f97316', '#d946ef'][hud.tier] }}>
@@ -4440,6 +5948,14 @@ export default function BendanaKartPage() {
       {/* Countdown with start lights */}
       {hud.countdown !== null && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4">
+          {race && (hud.countdown > 3 || (hud.countdown > 0 && vp.h >= 520)) && (
+            <div className="mx-4 rounded-3xl bg-slate-900/75 px-7 py-4 text-center text-white shadow-2xl ring-2 ring-white/30" style={{ animation: 'bk-pop 0.5s ease-out both' }}>
+              {cupInfo && <div className="text-sm font-black uppercase tracking-widest text-yellow-300">{cupInfo.emoji} {cupInfo.name} · Race {race.round + 1} of {cupInfo.tracks.length}</div>}
+              <div className="text-4xl font-black drop-shadow sm:text-5xl">{TRACKS[race.track].emoji} {TRACKS[race.track].name}</div>
+              <div className="mt-1 text-base font-bold text-white/85">{TRACKS[race.track].blurb} · {hud.laps} laps</div>
+              {hud.countdown > 3 && <div className="mt-1 text-xl font-black text-lime-300">Get ready…</div>}
+            </div>
+          )}
           <div className="flex gap-3 rounded-full bg-slate-900/75 px-4 py-3 shadow-2xl ring-2 ring-white/30">
             {[3, 2, 1].map((n) => {
               const on = hud.countdown !== null && hud.countdown > 0 && hud.countdown <= n;
@@ -4453,7 +5969,6 @@ export default function BendanaKartPage() {
           >
             {hud.countdown === 0 ? 'GO!' : hud.countdown > 3 ? '' : hud.countdown}
           </div>
-          {hud.countdown > 3 && <div className="text-3xl font-black text-white drop-shadow">Get ready…</div>}
         </div>
       )}
       {hud.countdown !== null && hud.countdown > 0 && !isTouch && (
@@ -4513,140 +6028,189 @@ export default function BendanaKartPage() {
         </div>
       )}
 
-      {/* Finished, waiting for the others */}
+      {/* Finished, waiting for the others: a small card, so the victory lap stays in view */}
       {hud.finished && !hud.podium && (
-        <div className="absolute inset-0 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-3xl bg-gradient-to-br from-yellow-300 via-orange-400 to-pink-500 p-1 shadow-2xl">
-            <div className="rounded-[1.4rem] bg-slate-900/90 p-5 text-white">
-              <div className="text-center text-6xl">{hud.place === 1 ? '🏆' : hud.place === 2 ? '🥈' : hud.place === 3 ? '🥉' : '🎉'}</div>
-              <h2 className="mt-1 text-center text-3xl font-black">You finished {ordinal(hud.place)}!</h2>
-              {hud.improved && <p className="mt-1 text-center text-base font-black text-yellow-200">🌟 Your driving is getting better!</p>}
-              <ol className="mt-4 flex flex-col gap-2">
-                {hud.standings.map((s) => (
-                  <li key={s.id} className={`flex items-center gap-3 rounded-xl px-3 py-2 ${s.isMe ? 'bg-white/20 ring-2 ring-yellow-300' : 'bg-white/10'}`}>
-                    <span className="w-10 text-lg font-black">{ordinal(s.place)}</span>
-                    <span className="text-2xl">{KARTS[s.kartIdx].emoji}</span>
-                    <span className="flex-1 truncate font-bold">{s.name}</span>
-                    <span className="text-sm font-bold text-white/80">{s.time ?? (s.done ? '—' : 'racing…')}</span>
-                  </li>
+        <div className="pointer-events-none absolute inset-x-0 top-[8.5rem] flex justify-center px-3 sm:top-[9.5rem] landscape:justify-start">
+          <div className="pointer-events-auto w-full max-w-[19rem] rounded-3xl bg-slate-900/80 p-3 text-white shadow-2xl ring-2 ring-white/25" style={{ animation: 'bk-pop 0.45s ease-out both' }}>
+            <div className="flex items-center gap-2">
+              <span className="text-4xl">{hud.place === 1 ? '🏆' : hud.place === 2 ? '🥈' : hud.place === 3 ? '🥉' : '🎉'}</span>
+              <span>
+                <span className="block text-xl font-black leading-tight">You finished {ordinal(hud.place)}!</span>
+                <span className="block text-xs font-bold text-white/75">{hud.improved ? '🌟 Your driving is getting better!' : 'Waiting for everyone to finish…'}</span>
+              </span>
+            </div>
+            <ol className="mt-2 flex flex-col gap-1">
+              {hud.standings.map((s) => (
+                <li key={s.id} className={`flex items-center gap-2 rounded-xl px-2 py-0.5 text-sm ${s.isMe ? 'bg-white/20 ring-1 ring-yellow-300' : 'bg-white/10'}`}>
+                  <span className="w-8 font-black">{ordinal(s.place)}</span>
+                  <FaceIcon emoji={KARTS[s.kartIdx].emoji} size={22} />
+                  <span className="flex-1 truncate font-bold">{s.name}</span>
+                  <span className="text-xs font-bold text-white/75">{s.time ?? (s.done ? '—' : 'racing…')}</span>
+                </li>
+              ))}
+            </ol>
+            {race?.mode === 'multi' && (
+              <div className="mt-2 flex flex-wrap justify-center gap-1.5">
+                {EMOTES.map((e) => (
+                  <button key={e} type="button" onClick={() => sendEmote(e)} className="h-10 w-10 rounded-full bg-white/15 text-xl active:scale-90">{e}</button>
                 ))}
-              </ol>
-              <p className="mt-4 text-center text-sm font-bold text-white/80">Waiting for everyone to finish…</p>
-              {race?.mode === 'multi' && (
-                <div className="mt-3 flex flex-wrap justify-center gap-2">
-                  {EMOTES.map((e) => (
-                    <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Podium: the winners stand on the 3D stage, the results slide in below (or beside) it */}
+      {hud.podium && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col justify-between landscape:flex-row">
+          <Confetti />
+          <div className="relative flex-1 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] text-center">
+            <h2 className={`inline-block rounded-full bg-slate-900/70 px-5 py-2 font-black text-white shadow-xl ring-2 ring-white/25 ${vp.h < 520 ? 'text-lg' : 'text-2xl sm:text-3xl'}`} style={{ animation: 'bk-pop 0.5s ease-out both' }}>
+              {cupInfo ? `${cupInfo.emoji} ${cupInfo.name} · Race ${race!.round + 1}/${cupInfo.tracks.length}` : `🏁 ${race ? TRACKS[race.track].name : 'Race'} results`}
+            </h2>
+          </div>
+          <div
+            className="pointer-events-auto relative max-h-[54%] overflow-y-auto rounded-t-[2rem] bg-slate-950/80 p-3 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-[0_-10px_40px_rgba(0,0,0,0.45)] ring-1 ring-white/20 backdrop-blur-md landscape:h-full landscape:max-h-full landscape:w-[42%] landscape:max-w-md landscape:rounded-l-[2rem] landscape:rounded-tr-none landscape:pt-[max(0.75rem,env(safe-area-inset-top))]"
+            style={{ animation: 'bk-rise 0.6s 0.2s ease-out both', touchAction: 'pan-y' }}
+          >
+            <div className="mx-auto flex max-w-lg flex-col gap-2.5">
+              {gain && <GainStrip gain={gain} />}
+              <div className="grid gap-1.5 sm:grid-cols-2 landscape:grid-cols-1">
+                {awards.map((a, i) => (
+                  <div
+                    key={a.id}
+                    className={`flex items-center gap-2.5 rounded-2xl px-3 py-1.5 text-white shadow ${a.isMe ? 'bg-white/25 ring-2 ring-yellow-300' : 'bg-white/10'}`}
+                    style={{ animation: `bk-pop 0.4s ${0.6 + i * 0.2}s both` }}
+                  >
+                    <span className="w-8 text-center text-xl font-black">{['🥇', '🥈', '🥉'][a.place - 1] ?? ordinal(a.place)}</span>
+                    <FaceIcon emoji={KARTS[a.kartIdx].emoji} size={34} happy />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-black leading-tight">{a.name}</span>
+                      <span className="block text-sm font-bold leading-tight text-yellow-200">{a.icon} {a.title}</span>
+                    </span>
+                    <span className="text-xs font-bold text-white/70">{a.time ?? ''}</span>
+                  </div>
+                ))}
+              </div>
+              {cupView && cupTable.length > 0 && (
+                <div className="rounded-2xl bg-black/30 p-3 text-white">
+                  <div className="mb-1 text-center text-base font-black">{lastRound ? '🏆 Final cup points' : '📊 Cup points'}</div>
+                  {cupTable.map(([id, t], i) => (
+                    <div key={id} className="flex items-center gap-2 py-0.5 text-sm font-bold">
+                      <span className="w-6">{lastRound && i === 0 ? '🏆' : i + 1}</span>
+                      <FaceIcon emoji={KARTS[t.kartIdx]?.emoji ?? '🏎️'} size={22} />
+                      <span className="flex-1 truncate">{t.name}</span>
+                      <span className="font-black text-yellow-300">{t.pts}</span>
+                    </div>
                   ))}
                 </div>
               )}
+              <div className="flex flex-col gap-2">
+                {race?.mode === 'solo' && (
+                  <button
+                    type="button"
+                    onClick={() => (cupInfo && !lastRound ? startSolo(0, race.cup, race.round + 1) : startSolo(profile.trackIdx, cupInfo ? race.cup : -1, 0))}
+                    className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 shadow-lg active:scale-95"
+                  >
+                    {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : cupInfo ? '🔁 Play the cup again' : '🔁 Race again'}
+                  </button>
+                )}
+                {race?.mode === 'multi' && isHost && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => hostStart(cupInfo && !lastRound ? { nextRound: true } : { track: race.track })}
+                      className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 shadow-lg active:scale-95"
+                    >
+                      {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : '🔁 Race again (everyone)'}
+                    </button>
+                    {!cupInfo && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nt = (race.track + 1) % TRACKS.length;
+                          setProfile((p) => ({ ...p, trackIdx: nt }));
+                          hostStart({ track: nt });
+                        }}
+                        className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 py-2.5 text-lg font-black text-white active:scale-95"
+                      >
+                        ➡️ Next track: {TRACKS[(race.track + 1) % TRACKS.length].emoji} {TRACKS[(race.track + 1) % TRACKS.length].name}
+                      </button>
+                    )}
+                  </>
+                )}
+                {race?.mode === 'multi' && !isHost && (
+                  <p className="text-center text-sm font-bold text-white/80">Waiting for 👑 {host?.name ?? 'the host'} to start the next race…</p>
+                )}
+                {race?.mode === 'multi' && (
+                  <div className="flex flex-wrap justify-center gap-2">
+                    {EMOTES.map((e) => (
+                      <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
+                    ))}
+                  </div>
+                )}
+                <button type="button" onClick={() => setFamPanel({ kind: 'board' })} className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 py-2.5 text-lg font-black text-slate-900 active:scale-95">
+                  🏆 Family leaderboard
+                </button>
+                <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-2.5 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
+                  {race?.mode === 'multi' ? 'Back to lobby' : '🏠 Home'}
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Podium and awards */}
-      {hud.podium && (
-        <div className="absolute inset-0 overflow-y-auto bg-gradient-to-b from-indigo-950/85 via-purple-900/85 to-slate-950/90 p-4 backdrop-blur-sm">
-          <Confetti />
-          <div className="relative mx-auto flex max-w-lg flex-col gap-4 pb-8 pt-[max(1rem,env(safe-area-inset-top))]">
-            <h2 className="text-center text-4xl font-black text-white drop-shadow">
-              {cupInfo ? `${cupInfo.emoji} ${cupInfo.name} · Race ${race!.round + 1}/${cupInfo.tracks.length}` : '🏁 Race results'}
-            </h2>
-            <div className="flex items-end justify-center gap-2">
-              {[1, 0, 2].map((i) => {
-                const a = awards[i];
-                if (!a) return <div key={i} className="w-24" />;
-                const hgt = ['h-36', 'h-24', 'h-16'][i];
-                const col = ['from-yellow-300 to-amber-500', 'from-slate-200 to-slate-400', 'from-orange-300 to-orange-600'][i];
-                return (
-                  <div key={a.id} className="flex w-24 flex-col items-center sm:w-28" style={{ animation: `bk-rise 0.6s ${0.3 + (2 - i) * 0.45}s both` }}>
-                    <div className="text-5xl drop-shadow-lg">{KARTS[a.kartIdx].emoji}</div>
-                    <div className="max-w-full truncate text-sm font-black text-white">{a.name}</div>
-                    <div className={`mt-1 flex w-full ${hgt} items-start justify-center rounded-t-2xl bg-gradient-to-b ${col} pt-2 text-3xl font-black text-slate-900 shadow-xl`}>
-                      {['🥇', '🥈', '🥉'][i]}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {awards.map((a, i) => (
-                <div
-                  key={a.id}
-                  className={`flex items-center gap-3 rounded-2xl px-3 py-2 text-white shadow ${a.isMe ? 'bg-white/25 ring-2 ring-yellow-300' : 'bg-white/10'}`}
-                  style={{ animation: `bk-pop 0.4s ${1.8 + i * 0.25}s both` }}
-                >
-                  <span className="w-8 text-center text-lg font-black">{ordinal(a.place)}</span>
-                  <span className="text-3xl">{KARTS[a.kartIdx].emoji}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-black">{a.name}</span>
-                    <span className="block text-sm font-bold text-yellow-200">{a.icon} {a.title}</span>
-                  </span>
-                  <span className="text-xs font-bold text-white/70">{a.time ?? ''}</span>
-                </div>
-              ))}
-            </div>
-            {cupView && cupTable.length > 0 && (
-              <div className="rounded-2xl bg-black/30 p-3 text-white">
-                <div className="mb-2 text-center text-lg font-black">{lastRound ? '🏆 Final cup points' : '📊 Cup points'}</div>
-                {cupTable.map(([id, t], i) => (
-                  <div key={id} className="flex items-center gap-2 py-0.5 font-bold">
-                    <span className="w-6">{lastRound && i === 0 ? '🏆' : i + 1}</span>
-                    <span className="text-xl">{KARTS[t.kartIdx]?.emoji}</span>
-                    <span className="flex-1 truncate">{t.name}</span>
-                    <span className="font-black text-yellow-300">{t.pts}</span>
-                  </div>
+      {/* Race menu: the race keeps going underneath, so it is quick to get in and out */}
+      {raceMenu && !hud.podium && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm" onPointerDown={(e) => e.target === e.currentTarget && setRaceMenu(false)}>
+          <div className="flex max-h-full w-full max-w-sm flex-col gap-3 overflow-y-auto rounded-3xl bg-slate-900/95 p-4 text-white shadow-2xl ring-2 ring-white/25" style={{ animation: 'bk-pop 0.25s ease-out both', touchAction: 'pan-y' }}>
+            <div className="text-center text-2xl font-black">☰ Menu</div>
+            <button
+              type="button"
+              onClick={() => {
+                sfx('uiBack');
+                setRaceMenu(false);
+              }}
+              className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-4 text-2xl font-black text-slate-900 shadow-lg active:scale-95"
+            >
+              ▶ Keep racing
+            </button>
+            <div>
+              <div className="mb-1 text-sm font-black text-white/80">Camera</div>
+              <div className="grid grid-cols-2 gap-2">
+                {CAM_MODES.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => {
+                      sfx('uiTap');
+                      setProfile((p) => ({ ...p, cam: m.id }));
+                    }}
+                    className={`rounded-xl px-2 py-2 text-sm font-black transition active:scale-95 ${profile.cam === m.id ? 'bg-yellow-300 text-slate-900' : 'bg-white/10 ring-1 ring-white/25'}`}
+                  >
+                    {m.icon} {m.label}
+                  </button>
                 ))}
               </div>
-            )}
-            <div className="flex flex-col gap-2">
-              {race?.mode === 'solo' && (
-                <button
-                  type="button"
-                  onClick={() => (cupInfo && !lastRound ? startSolo(0, race.cup, race.round + 1) : startSolo(profile.trackIdx, cupInfo ? race.cup : -1, 0))}
-                  className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95"
-                >
-                  {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : cupInfo ? '🔁 Play the cup again' : '🔁 Race again'}
-                </button>
-              )}
-              {race?.mode === 'multi' && isHost && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => hostStart(cupInfo && !lastRound ? { nextRound: true } : { track: race.track })}
-                    className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95"
-                  >
-                    {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : '🔁 Race again (everyone)'}
-                  </button>
-                  {!cupInfo && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const nt = (race.track + 1) % TRACKS.length;
-                        setProfile((p) => ({ ...p, trackIdx: nt }));
-                        hostStart({ track: nt });
-                      }}
-                      className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 py-3 text-lg font-black text-white active:scale-95"
-                    >
-                      ➡️ Next track: {TRACKS[(race.track + 1) % TRACKS.length].emoji} {TRACKS[(race.track + 1) % TRACKS.length].name}
-                    </button>
-                  )}
-                </>
-              )}
-              {race?.mode === 'multi' && !isHost && (
-                <p className="text-center text-sm font-bold text-white/80">Waiting for 👑 {host?.name ?? 'the host'} to start the next race…</p>
-              )}
-              {race?.mode === 'multi' && (
-                <div className="flex flex-wrap justify-center gap-2">
-                  {EMOTES.map((e) => (
-                    <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
-                  ))}
-                </div>
-              )}
-              <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-3 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
-                {race?.mode === 'multi' ? 'Back to lobby' : 'Main menu'}
-              </button>
             </div>
+            {toggles}
+            <button
+              type="button"
+              onClick={() => {
+                if (!leaveArmed) {
+                  sfx('uiTap');
+                  setLeaveArmed(true);
+                  return;
+                }
+                sfx('uiBack');
+                setRaceMenu(false);
+                (race?.mode === 'multi' ? backToLobby : quitToMenu)();
+              }}
+              className={`rounded-2xl py-3 text-lg font-black active:scale-95 ${leaveArmed ? 'bg-red-500 text-white' : 'bg-white/10 text-white ring-1 ring-white/25'}`}
+            >
+              {leaveArmed ? 'Tap again to leave' : race?.mode === 'multi' ? (isHost ? '🚪 End race for everyone' : '🚪 Back to the lobby') : '🚪 Quit race'}
+            </button>
           </div>
         </div>
       )}
@@ -4654,6 +6218,7 @@ export default function BendanaKartPage() {
       {hud.boost && (
         <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_120px_rgba(251,146,60,0.55)]" style={{ borderColor: kartColors(meSpec ? profile.kartIdx : 0, profile.paint).color }} />
       )}
+      {familySheets}
     </main>
   );
 }
