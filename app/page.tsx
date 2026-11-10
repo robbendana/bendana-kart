@@ -11,13 +11,17 @@ import {
   playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning, musicDebug,
 } from './audio';
 import { say, stopVoice, unlockVoice, setVoiceOn, setVoiceMuted, voiceAvailable } from './voice';
-import { loadTrophies, recordRace, emptyTrophies, type Trophies, type TrophyNews } from './trophies';
 import { HomeBackdrop, Logo, Sheet, QrCode, TrackThumb, type ThumbLook } from './ui';
 import {
   wall, SupabaseRoom, LocalRoom, HostClock, RemoteKart, Sampler, EventLog, WakeLock, parseSamples, readSimOpts,
   sendIntervalFor, F_SPIN, F_BOOST, F_DRIFT, F_AIR, F_SHIELD, F_DONE, F_SNOOZE, F_DRAFT, F_RUSH, F_MAGNET,
   type Room, type Meta, type NetStatus, type NetEvent,
 } from './net';
+import {
+  loadStore, saveStore, activeLocal, syncActive, setActive, addPlayer, adoptPlayer, removeLocal, applyRace, mergeBoard, wireBoard, totals, levelOf,
+  type Store, type Gain,
+} from './players';
+import { WhoRow, GainStrip, FamilySheets, type Kit, type FamilyPanel } from './family-ui';
 
 /* =========================================================================
    Bendana Kart: a family kart racer.
@@ -1027,9 +1031,12 @@ function makeBoxes(): Box[] {
 type Skill = { s: number; n: number };
 const SKILL_KEY = 'bendana-kart-skill';
 const TIPS_KEY = 'bendana-kart-tips';
+// Each saved racer has their own driving score, so a parent's skill never takes help away from a child
+let skillOwner = '';
+const skillKey = () => (skillOwner ? `${SKILL_KEY}:${skillOwner}` : SKILL_KEY);
 function loadSkill(): Skill {
   try {
-    const v = JSON.parse(window.localStorage.getItem(SKILL_KEY) || 'null');
+    const v = JSON.parse(window.localStorage.getItem(skillKey()) || 'null');
     if (v && typeof v.s === 'number' && typeof v.n === 'number') return { s: clamp(v.s, 0, 1), n: Math.max(0, v.n | 0) };
   } catch {
     /* storage blocked */
@@ -1038,7 +1045,7 @@ function loadSkill(): Skill {
 }
 function saveSkill(sk: Skill) {
   try {
-    window.localStorage.setItem(SKILL_KEY, JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
+    window.localStorage.setItem(skillKey(), JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
   } catch {
     /* storage blocked */
   }
@@ -3219,7 +3226,7 @@ type Hud = {
   improved: boolean;
 };
 type Screen = 'menu' | 'lobby' | 'race';
-type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'trophies' | 'help';
+type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'help';
 // Settings that live outside the profile (their own storage key)
 type Prefs = { voice: boolean };
 
@@ -3623,7 +3630,7 @@ function TrackPicker({ value, onPick, disabled, best, laps }: { value: number; o
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       {TRACKS.map((t, i) => {
         const active = i === value;
-        const bt = best?.[`${i}|${laps ?? 3}`];
+        const bt = best?.[`${i}:${laps ?? 3}`];
         return (
           <button
             key={t.name}
@@ -3647,88 +3654,6 @@ function TrackPicker({ value, onPick, disabled, best, laps }: { value: number; o
         );
       })}
     </div>
-  );
-}
-
-// Every sticker a racer can collect on the trophy shelf (the award titles)
-const STICKERS = [
-  { icon: '🏆', title: 'Race Winner' }, { icon: '🔥', title: 'Drift Master' }, { icon: '🪙', title: 'Coin Collector' },
-  { icon: '🎯', title: 'Sharp Shooter' }, { icon: '🍌', title: 'Banana Boss' }, { icon: '🦘', title: 'Air Ace' },
-  { icon: '🚀', title: 'Speed Demon' }, { icon: '🛡️', title: 'Safe Driver' }, { icon: '💪', title: 'Never Give Up' },
-  { icon: '🤝', title: 'Good Sport' }, { icon: '😄', title: 'Big Smiles' }, { icon: '🌈', title: 'Rainbow Racer' },
-  { icon: '⭐', title: 'Rising Star' },
-];
-
-/** Everything this device's racer has won. */
-function TrophyShelf({ t }: { t: Trophies }) {
-  const earned = STICKERS.filter((x) => t.awards[x.title]).length;
-  return (
-    <>
-      <div className="grid grid-cols-3 gap-3">
-        {[
-          { icon: '🏁', n: t.races, label: 'Races' },
-          { icon: '🥇', n: t.wins, label: 'Wins' },
-          { icon: '🎉', n: t.podiums, label: 'Podiums' },
-        ].map((x) => (
-          <div key={x.label} className="rounded-3xl bg-black/25 p-3 text-center text-white ring-1 ring-white/20">
-            <div className="text-3xl">{x.icon}</div>
-            <div className="text-4xl font-black leading-none">{x.n}</div>
-            <div className="text-sm font-bold text-white/80">{x.label}</div>
-          </div>
-        ))}
-      </div>
-      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
-        <h3 className="mb-2 text-lg font-black text-white">Cups</h3>
-        <div className="grid grid-cols-2 gap-3">
-          {CUPS.map((c, i) => {
-            const n = t.cups[String(i)] ?? 0;
-            return (
-              <div key={c.name} className={`flex items-center gap-3 rounded-2xl p-3 text-white ${n ? `bg-gradient-to-br ${c.card} shadow-lg` : 'bg-white/10'}`}>
-                <span className={`text-5xl ${n ? '' : 'opacity-30 grayscale'}`}>🏆</span>
-                <span>
-                  <span className="block font-black leading-tight">{c.emoji} {c.name}</span>
-                  <span className="block text-sm font-bold text-white/85">{n ? `Won ${n} time${n > 1 ? 's' : ''}` : 'Not won yet'}</span>
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
-        <h3 className="mb-2 text-lg font-black text-white">Stickers <span className="text-sm font-bold text-white/70">{earned} of {STICKERS.length}</span></h3>
-        <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
-          {STICKERS.map((x) => {
-            const n = t.awards[x.title] ?? 0;
-            return (
-              <div key={x.title} className={`relative flex flex-col items-center rounded-2xl p-2 text-center ${n ? 'bg-white/90 shadow-lg' : 'bg-white/10'}`}>
-                <span className={`text-4xl ${n ? '' : 'opacity-25 grayscale'}`}>{n ? x.icon : '❔'}</span>
-                <span className={`mt-1 text-[10px] font-black leading-tight ${n ? 'text-slate-900' : 'text-white/60'}`}>{x.title}</span>
-                {n > 1 && <span className="absolute -right-1 -top-1 rounded-full bg-orange-500 px-1.5 text-xs font-black text-white">×{n}</span>}
-              </div>
-            );
-          })}
-        </div>
-        <p className="mt-2 text-center text-xs font-bold text-white/70">Everyone gets a sticker after every race. Can you collect them all?</p>
-      </section>
-      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
-        <h3 className="mb-2 text-lg font-black text-white">Best times</h3>
-        <div className="flex flex-col gap-2">
-          {TRACKS.map((tr, i) => (
-            <div key={tr.name} className="flex items-center gap-3 rounded-2xl bg-white/10 p-2 text-white">
-              <TrackMap idx={i} width={72} />
-              <span className="min-w-0 flex-1 truncate font-black">{tr.emoji} {tr.name}</span>
-              <span className="text-right text-sm font-bold">
-                {[3, 2].map((l) => {
-                  const b = t.best[`${i}|${l}`];
-                  return b ? <span key={l} className="block text-yellow-200">{l} laps · {fmtTime(b)}</span> : null;
-                })}
-                {!t.best[`${i}|3`] && !t.best[`${i}|2`] && <span className="text-white/50">No time yet</span>}
-              </span>
-            </div>
-          ))}
-        </div>
-      </section>
-    </>
   );
 }
 
@@ -3887,6 +3812,30 @@ function sessionId(): string {
   }
 }
 
+const FAMILY_KIT: Kit = {
+  karts: KARTS,
+  tracks: TRACKS,
+  colors: kartColors,
+  face: (i, size) => <FaceIcon emoji={(KARTS[i] || KARTS[0]).emoji} size={size} happy />,
+  fmtTime,
+};
+
+/** The profile for the racer who is active on this device: their name and kart, plus this device's settings. */
+function playerProfile(st: Store, base: Profile): Profile {
+  const loc = activeLocal(st);
+  const p = loc.prefs;
+  return {
+    ...base,
+    name: st.board[loc.pid]?.n ?? '',
+    kartIdx: p.kartIdx < KARTS.length ? p.kartIdx : 0,
+    paint: p.paint < PAINTS.length ? p.paint : -1,
+    body: p.body < BODIES.length ? p.body : 0,
+    toddler: p.toddler,
+    assist: p.assist,
+    cam: CAM_MODES.some((m) => m.id === p.cam) ? (p.cam as CamMode) : 'chase',
+  };
+}
+
 type CupState = { cup: number; round: number; totals: Record<string, { name: string; kartIdx: number; pts: number }>; scored: string[] };
 
 export default function BendanaKartPage() {
@@ -3914,15 +3863,20 @@ export default function BendanaKartPage() {
   const [netDebug, setNetDebug] = useState('');
   const [posFx, setPosFx] = useState<{ dir: number; key: number }>({ dir: 0, key: 0 });
   const [autoJoin, setAutoJoin] = useState<string | null>(null);
+  // Saved racers, their stats and the family leaderboard (see players.ts)
+  const [family, setFamily] = useState<Store | null>(null);
+  const [famPanel, setFamPanel] = useState<FamilyPanel>(null);
+  const [gain, setGain] = useState<Gain | null>(null);
+  const familyRef = useRef<Store | null>(null);
+  const boardTimerRef = useRef(0);
+  const peersRef = useRef<Set<string>>(new Set());
   const [profileLoaded, setProfileLoaded] = useState(false);
   const [raceMenu, setRaceMenu] = useState(false);
   const [leaveArmed, setLeaveArmed] = useState(false);
   const [panel, setPanel] = useState<Panel>(null);
   const [prefs, setPrefs] = useState<Prefs>({ voice: true });
-  const [trophies, setTrophies] = useState<Trophies>(emptyTrophies);
-  const [news, setNews] = useState<TrophyNews | null>(null);
   const [canFullscreen, setCanFullscreen] = useState(false);
-  const recordedRef = useRef('');
+
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvas3dRef = useRef<HTMLCanvasElement | null>(null);
@@ -3942,6 +3896,7 @@ export default function BendanaKartPage() {
   const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false, ax: 0 });
   const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
+  const firstProfileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
   const rosterRef = useRef<Map<string, Meta>>(new Map());
   const myIdRef = useRef('');
@@ -3967,11 +3922,12 @@ export default function BendanaKartPage() {
     myIdRef.current = id;
     setMyId(id);
     wakeRef.current = new WakeLock();
+    let base = firstProfileRef.current;
     try {
       const saved = window.localStorage.getItem('bendana-kart-profile');
       if (saved) {
         const p = JSON.parse(saved) as Partial<Profile>;
-        setProfile({
+        base = {
           name: typeof p.name === 'string' ? p.name.slice(0, 14) : '',
           kartIdx: typeof p.kartIdx === 'number' && p.kartIdx >= 0 && p.kartIdx < KARTS.length ? p.kartIdx : 0,
           toddler: !!p.toddler,
@@ -3987,7 +3943,7 @@ export default function BendanaKartPage() {
           cup: typeof p.cup === 'number' && p.cup >= -1 && p.cup < CUPS.length ? p.cup : -1,
           bots: p.bots !== false,
           botLevel: p.botLevel === 0 || p.botLevel === 2 ? p.botLevel : 1,
-        });
+        };
       }
     } catch {
       /* storage unavailable */
@@ -3998,8 +3954,13 @@ export default function BendanaKartPage() {
     } catch {
       /* storage unavailable */
     }
-    setTrophies(loadTrophies());
     setCanFullscreen(typeof document.documentElement.requestFullscreen === 'function' && document.fullscreenEnabled !== false);
+    // Saved racers: the racer who played last on this device is ready to go
+    const st = loadStore(base.name, base);
+    familyRef.current = st;
+    setFamily(st);
+    skillOwner = st.active;
+    setProfile(playerProfile(st, base));
     setProfileLoaded(true);
     const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     isTouchRef.current = touch;
@@ -4078,11 +4039,22 @@ export default function BendanaKartPage() {
     setMuted(profile.muted);
     setMusicOn(profile.music);
     setHaptics(profile.haptics);
+    if (profile === firstProfileRef.current) return; // nothing loaded yet
     if (!profileLoaded) return; // never overwrite the saved profile before it has been read
     try {
       window.localStorage.setItem('bendana-kart-profile', JSON.stringify(profile));
     } catch {
       /* storage unavailable */
+    }
+    // Name and kart changes belong to the active racer
+    const st = familyRef.current;
+    if (st) {
+      const next = syncActive(st, profile.name, profile);
+      if (next !== st) {
+        familyRef.current = next;
+        setFamily(next);
+        saveStore(next);
+      }
     }
   }, [profile, profileLoaded]);
 
@@ -4134,31 +4106,12 @@ export default function BendanaKartPage() {
     }
   };
 
-  // After each race: add it to the trophy shelf (once per race)
+  // A fanfare when the results bring a new best time, a new level or a badge
   useEffect(() => {
-    if (!awards.length) return;
-    const G = gameRef.current;
-    const cfg = raceRef.current;
-    if (!G || !cfg || recordedRef.current === cfg.id) return;
-    const mine = awards.find((a) => a.isMe);
-    if (!mine) return;
-    recordedRef.current = cfg.id;
-    let cupWon = -1;
-    const cup = cupRef.current;
-    if (cup && cfg.cup >= 0 && cfg.round >= CUPS[cfg.cup].tracks.length - 1) {
-      const top = Object.entries(cup.totals).sort((a, b) => b[1].pts - a[1].pts)[0];
-      if (top && top[0] === G.meId) cupWon = cfg.cup;
-    }
-    const me = G.karts[0];
-    const res = recordRace({
-      place: mine.place, racers: awards.length, award: mine.title, track: cfg.track, laps: G.laps,
-      timeMs: me.finished && me.finishTime > 0 ? me.finishTime : 0, cupWon,
-    });
-    setTrophies(res.trophies);
-    setNews(res.news);
-    if (res.news.newBest || res.news.cupWon) sfx('record');
-    else if (res.news.newAward) sfx('sticker');
-  }, [awards]);
+    if (!gain) return;
+    if (gain.bestTime || gain.bestLap || gain.levelUp) sfx('record');
+    else if (gain.badges.length) sfx('sticker');
+  }, [gain]);
 
   // Changing screens closes any open panel
   const prevScreenRef = useRef<Screen>('menu');
@@ -4182,6 +4135,60 @@ export default function BendanaKartPage() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [screen]);
+
+  const commitFamily = useCallback((st: Store) => {
+    familyRef.current = st;
+    skillOwner = st.active;
+    setFamily(st);
+    saveStore(st);
+  }, []);
+
+  /** Switch to a saved racer (or one just made): their name, kart and settings come back. */
+  const switchTo = useCallback((st: Store) => {
+    commitFamily(st);
+    const next = playerProfile(st, profileRef.current);
+    profileRef.current = next;
+    setProfile(next);
+    setFamPanel(null);
+  }, [commitFamily]);
+  const pickPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (!st || st.active === pid) return;
+    unlockAudio();
+    sfx('ready');
+    switchTo(setActive(st, pid));
+  };
+  const createPlayer = (name: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(addPlayer(st, name, KARTS.length));
+  };
+  const adoptBoardPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(adoptPlayer(st, pid));
+  };
+  const removePlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(removeLocal(st, pid, KARTS.length));
+  };
+
+  /** Send what this device knows of the leaderboard to the others in the room. */
+  const sendBoard = useCallback((only?: string) => {
+    const st = familyRef.current;
+    const rm = roomRef.current;
+    if (!st || !rm) return;
+    const recs = wireBoard(st, only);
+    if (recs.length) rm.send('lb', { id: myIdRef.current, recs }, { force: true });
+  }, []);
+  /** A moment after someone joins, share the board (spread out so devices do not all talk at once). */
+  const scheduleBoard = useCallback(() => {
+    if (boardTimerRef.current) return;
+    boardTimerRef.current = window.setTimeout(() => {
+      boardTimerRef.current = 0;
+      if (!gameRef.current || gameRef.current.closedAt) sendBoard();
+      else scheduleBoard(); // mid-race: wait for the finish
+    }, 1200 + Math.random() * 1800);
+  }, [sendBoard]);
+  useEffect(() => () => window.clearTimeout(boardTimerRef.current), []);
 
   // Menu music, and keep the screen awake while in a room or a race
   useEffect(() => {
@@ -4219,9 +4226,10 @@ export default function BendanaKartPage() {
   const startRace = useCallback((cfg: RaceCfg) => {
     setHud(EMPTY_HUD);
     setAwards([]);
-    setNews(null);
+    setGain(null);
     setRaceMenu(false);
     setPanel(null);
+    setFamPanel(null);
     raceRef.current = cfg;
     playedRef.current.add(cfg.id);
     readyRef.current = false;
@@ -4268,6 +4276,7 @@ export default function BendanaKartPage() {
     if (r) void r.close();
     hostRaceRef.current = null;
     rosterRef.current = new Map();
+    peersRef.current = new Set();
     setRoom(null);
     setPlayers([]);
     playersRef.current = [];
@@ -4383,6 +4392,16 @@ export default function BendanaKartPage() {
     playersRef.current = list;
     setPlayers(list);
     rm.setPlayers(Math.min(MAX_PLAYERS, list.length));
+    // Someone new in the room: swap leaderboards
+    const seen = peersRef.current;
+    let fresh = false;
+    for (const p of list) {
+      if (p.id !== myIdRef.current && !seen.has(p.id)) {
+        seen.add(p.id);
+        fresh = true;
+      }
+    }
+    if (fresh) scheduleBoard();
     const host = pickHost(list);
     const meHost = !!host && host.id === myIdRef.current;
     clockRef.current.setHost(host?.id ?? '', meHost);
@@ -4405,7 +4424,7 @@ export default function BendanaKartPage() {
         else if (!r.leftAt) r.leftAt = now;
       });
     }
-  }, [joinHostRace, leaveRoom]);
+  }, [joinHostRace, leaveRoom, scheduleBoard]);
 
   const joinRoom = useCallback((code: string, asHost: boolean) => {
     unlockAudio();
@@ -4528,6 +4547,12 @@ export default function BendanaKartPage() {
       if (!t || !Array.isArray(t) || (host && p.from !== host.id)) return;
       joinHostRace(parseMeta('x', { race: t }).race ?? t, Number(p.ts), recv);
     });
+    rm.on('lb', (p) => {
+      const st = familyRef.current;
+      if (!st) return;
+      const res = mergeBoard(st, p.recs);
+      if (res.changed) commitFamily(res.store);
+    });
     rm.on('lobby', (p) => {
       if (raceRef.current && p.r === raceRef.current.id) {
         raceRef.current = null;
@@ -4542,7 +4567,7 @@ export default function BendanaKartPage() {
     setScreen('lobby');
     // First presence after a short moment (meta must be set before track)
     rm.setMeta(myMeta(), true);
-  }, [applyEvent, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
+  }, [applyEvent, commitFamily, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
 
   useEffect(() => {
     if (!autoJoin || !myId) return;
@@ -4890,6 +4915,32 @@ export default function BendanaKartPage() {
     let lastPlace = 0;
     let scored = false;
     let debugAt = 0;
+    let podiumIds: string[] | null = null;
+    let fireworkAt = 0;
+    let saidBanner = '';
+    let saidItem: ItemKind | null = null;
+    let saidLap = 0;
+    let gaugeV = 0;
+    // Save this race to the racer's stats, once
+    const racerPid = familyRef.current ? activeLocal(familyRef.current).pid : '';
+    let recorded = false;
+    const recordRace = (award: string | null, cupWon: boolean, quiet = false) => {
+      const st = familyRef.current;
+      const me = G.karts[0];
+      if (recorded || !st || !racerPid || !me.finished) return;
+      recorded = true;
+      const ranked = rankRacers(racers(G));
+      const lapsMs = G.lapAt.length === G.laps + 1 ? G.lapAt.slice(1).map((t, i) => t - G.lapAt[i]) : [];
+      const res = applyRace(st, racerPid, {
+        track: race.track, laps: G.laps, place: ranked.findIndex((r) => r.isMe) + 1, total: ranked.length,
+        family: G.mode === 'multi' && ranked.filter((r) => r.human).length >= 2,
+        timeMs: me.finishTime, lapsMs, stats: me.st, cleanLaps: G.cleanLaps, award, cupWon,
+      }, TRACKS.length);
+      if (!res) return;
+      commitFamily(res.store);
+      if (!quiet) setGain(res.gain);
+      if (G.mode === 'multi') window.setTimeout(() => sendBoard(racerPid), 300 + Math.random() * 900);
+    };
     let botCheckAt = 0;
     let testItemAt = 0;
     const testItem = (() => {
@@ -4907,12 +4958,6 @@ export default function BendanaKartPage() {
       (k.drifting ? F_DRIFT : 0) | (k.airT > 0 ? F_AIR : 0) | (k.shieldT > 0 || k.toddler ? F_SHIELD : 0) |
       (k.finished ? F_DONE : 0) | (k.snoozeT > 0 ? F_SNOOZE : 0) | (k.draftT > 0 ? F_DRAFT : 0) |
       (k.rushT > 0 ? F_RUSH : 0) | (k.magnetT > 0 ? F_MAGNET : 0);
-    let podiumIds: string[] | null = null;
-    let fireworkAt = 0;
-    let saidBanner = '';
-    let saidItem: ItemKind | null = null;
-    let saidLap = 0;
-    let gaugeV = 0;
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
       if (!trackReady && (profileRef.current.cam === 'top' || failed3d)) {
@@ -5069,7 +5114,15 @@ export default function BendanaKartPage() {
           });
           setCupView({ ...cup, totals: { ...cup.totals } });
         }
-        setAwards(computeAwards(G));
+        const aw = computeAwards(G);
+        setAwards(aw);
+        const mine = aw.find((a) => a.isMe);
+        let cupWon = false;
+        if (cup && race.cup >= 0 && race.round === CUPS[race.cup].tracks.length - 1) {
+          const top = Object.entries(cup.totals).sort((a, b) => b[1].pts - a[1].pts)[0];
+          cupWon = !!top && top[0] === G.meId;
+        }
+        recordRace(mine ? `${mine.icon} ${mine.title}` : null, cupWon);
         sfx('cheer');
       }
 
@@ -5211,11 +5264,12 @@ export default function BendanaKartPage() {
       input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
       engineStop();
       stopVoice();
+      recordRace(null, false, true); // finished but left before the results: it still counts
       if (gameRef.current === G) gameRef.current = null;
       view?.dispose();
       view = null;
     };
-  }, [screen, race]);
+  }, [screen, race, commitFamily, sendBoard]);
 
   // ---------- Touch controls ----------
   const press = (key: InputKey, on: boolean) => {
@@ -5307,7 +5361,7 @@ export default function BendanaKartPage() {
         ))}
       </div>
       {value.cup < 0 && (
-        <TrackPicker value={value.track} disabled={disabled} best={trophies.best} laps={value.laps} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
+        <TrackPicker value={value.track} disabled={disabled} best={myRec?.b} laps={value.laps} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
       )}
       <div className="flex items-center gap-2 text-white">
         <span className="text-sm font-black">Laps:</span>
@@ -5377,6 +5431,30 @@ export default function BendanaKartPage() {
     </span>
   );
 
+  const myRec = family ? family.board[family.active] : undefined;
+  const myTotals = myRec ? totals(myRec) : null;
+  const familySheets = (
+    <FamilySheets panel={famPanel} store={family} kit={FAMILY_KIT} setPanel={setFamPanel} onCreate={createPlayer} onAdopt={adoptBoardPlayer} onRemove={removePlayer} />
+  );
+  const whoRow = family && <WhoRow store={family} kit={FAMILY_KIT} onPick={pickPlayer} onAdd={() => setFamPanel({ kind: 'add' })} />;
+  const familyButtons = (
+    <div className="grid grid-cols-2 gap-2">
+      <button
+        type="button"
+        onClick={() => family && setFamPanel({ kind: 'stats', pid: family.active })}
+        className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 px-3 py-3 text-lg font-black text-white shadow-lg active:scale-95"
+      >
+        📊 My stats
+      </button>
+      <button
+        type="button"
+        onClick={() => setFamPanel({ kind: 'board' })}
+        className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 px-3 py-3 text-lg font-black text-slate-900 shadow-lg active:scale-95"
+      >
+        🏆 Leaderboard
+      </button>
+    </div>
+  );
   // ---------- Panels (slide over the home screen and the lobby) ----------
   const pickers = (compact: boolean) => (
     <KartPicker compact={compact} value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
@@ -5387,7 +5465,8 @@ export default function BendanaKartPage() {
     panelEl = (
       <Sheet title="🔧 Garage" onClose={closePanel} tone="from-sky-600 via-indigo-600 to-violet-700" footer={<button type="button" onClick={closePanel} className={bigGo}>👍 Looks great!</button>}>
         <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
-          <h3 className="mb-2 text-lg font-black text-white">What&apos;s your name?</h3>
+          <h3 className="text-lg font-black text-white">Who&apos;s racing?</h3>
+          {whoRow}
           {nameInput}
         </section>
         {pickers(vp.h < 560)}
@@ -5450,7 +5529,7 @@ export default function BendanaKartPage() {
       <Sheet title="⚙️ Settings" onClose={closePanel} tone="from-slate-700 via-slate-800 to-indigo-900">
         <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
           <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-          {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
+          {!profile.toddler && <AssistPicker key={family?.active} value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
         </section>
         <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
           <h3 className="mb-2 text-lg font-black text-white">Sound</h3>
@@ -5489,12 +5568,6 @@ export default function BendanaKartPage() {
         </section>
       </Sheet>
     );
-  } else if (panel === 'trophies') {
-    panelEl = (
-      <Sheet title="🏆 Trophy shelf" onClose={closePanel} tone="from-amber-500 via-orange-600 to-rose-700">
-        <TrophyShelf t={trophies} />
-      </Sheet>
-    );
   } else if (panel === 'help') {
     panelEl = (
       <Sheet title="❓ How to play" onClose={closePanel} tone="from-cyan-600 via-sky-700 to-indigo-800">
@@ -5509,11 +5582,13 @@ export default function BendanaKartPage() {
     const heroSize = Math.round(wide ? clamp(Math.min(vp.w * 0.4, vp.h * 0.58), 150, 430) : clamp(Math.min(vp.w * 0.8, vp.h * 0.34), 160, 400));
     const meKart = KARTS[profile.kartIdx] || KARTS[0];
     const small = [
-      { id: 'trophies' as const, icon: '🏆', label: 'Trophies' },
-      { id: 'garage' as const, icon: '🔧', label: 'Garage' },
-      { id: 'settings' as const, icon: '⚙️', label: 'Settings' },
-      { id: 'help' as const, icon: '❓', label: 'Help' },
+      { icon: '📊', label: 'My stats', go: () => family && setFamPanel({ kind: 'stats', pid: family.active }) },
+      { icon: '🏆', label: 'Leaders', go: () => setFamPanel({ kind: 'board' }) },
+      { icon: '🔧', label: 'Garage', go: () => setPanel('garage') },
+      { icon: '⚙️', label: 'Settings', go: () => setPanel('settings') },
+      { icon: '❓', label: 'Help', go: () => setPanel('help') },
     ];
+    const lv = levelOf(myTotals?.st ?? 0);
     return (
       <main className="relative min-h-[100dvh] w-full overflow-x-hidden" onPointerDown={wake}>
         <HomeBackdrop />
@@ -5531,6 +5606,7 @@ export default function BendanaKartPage() {
                 </span>
               </span>
             </button>
+            {family && family.locals.length > 1 && <div className="mt-1 max-w-full">{whoRow}</div>}
           </div>
 
           <div className="mx-auto flex w-full max-w-md flex-col gap-3">
@@ -5548,25 +5624,36 @@ export default function BendanaKartPage() {
                 <span className="block text-sm font-bold opacity-75 sm:text-base">Everyone on their own screen</span>
               </span>
             </button>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-5 gap-2">
               {small.map((b) => (
-                <button key={b.id} type="button" onClick={() => openPanel(b.id)} className="bk-tile flex flex-col items-center bg-white/90 px-1 py-2.5 text-slate-900" style={{ borderRadius: '1.25rem' }}>
-                  <span className="text-3xl">{b.icon}</span>
-                  <span className="text-xs font-black sm:text-sm">{b.label}</span>
+                <button
+                  key={b.label}
+                  type="button"
+                  onClick={() => {
+                    wake();
+                    sfx('uiOpen');
+                    b.go();
+                  }}
+                  className="bk-tile flex flex-col items-center bg-white/90 px-0.5 py-2.5 text-slate-900"
+                  style={{ borderRadius: '1.25rem' }}
+                >
+                  <span className="text-2xl sm:text-3xl">{b.icon}</span>
+                  <span className="text-[11px] font-black sm:text-sm">{b.label}</span>
                 </button>
               ))}
             </div>
-            {trophies.races > 0 && (
+            {myTotals && myTotals.r > 0 && (
               <div className="flex flex-wrap justify-center gap-2 text-sm font-black text-slate-900">
-                <span className="rounded-full bg-white/80 px-3 py-1">🏁 {trophies.races} race{trophies.races > 1 ? 's' : ''}</span>
-                {trophies.wins > 0 && <span className="rounded-full bg-white/80 px-3 py-1">🥇 {trophies.wins} win{trophies.wins > 1 ? 's' : ''}</span>}
-                <span className="rounded-full bg-white/80 px-3 py-1">⭐ {STICKERS.filter((x) => trophies.awards[x.title]).length}/{STICKERS.length} stickers</span>
+                <span className="rounded-full bg-white/80 px-3 py-1">{lv.icon} Level {lv.lvl} {lv.title}</span>
+                <span className="rounded-full bg-white/80 px-3 py-1">⭐ {myTotals.st} stars</span>
+                {myTotals.w > 0 && <span className="rounded-full bg-white/80 px-3 py-1">🥇 {myTotals.w} win{myTotals.w > 1 ? 's' : ''}</span>}
               </div>
             )}
             {netError && !panel && <p className="rounded-2xl bg-red-600/85 p-3 text-center font-bold text-white">{netError}</p>}
           </div>
         </div>
         {panelEl}
+        {familySheets}
       </main>
     );
   }
@@ -5681,6 +5768,8 @@ export default function BendanaKartPage() {
               <button type="button" onClick={() => openPanel('garage')} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">✏️ Change</button>
               <button type="button" onClick={() => openPanel('settings')} aria-label="Settings" className="flex h-10 w-10 items-center justify-center rounded-full bg-black/30 text-xl ring-1 ring-white/30 active:scale-95">⚙️</button>
             </div>
+            {whoRow}
+            {familyButtons}
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
           </section>
 
@@ -5714,6 +5803,7 @@ export default function BendanaKartPage() {
           </div>
         </div>
         {panelEl}
+        {familySheets}
       </main>
     );
   }
@@ -5984,14 +6074,7 @@ export default function BendanaKartPage() {
             style={{ animation: 'bk-rise 0.6s 0.2s ease-out both', touchAction: 'pan-y' }}
           >
             <div className="mx-auto flex max-w-lg flex-col gap-2.5">
-              {news && (news.newBest || news.newAward || news.cupWon || news.firstWin) && (
-                <div className="flex flex-wrap justify-center gap-1.5">
-                  {news.cupWon && cupInfo && <span className="rounded-full bg-yellow-300 px-3 py-1 text-sm font-black text-yellow-950" style={{ animation: 'bk-pop 0.4s 1.2s both' }}>🏆 You won the {cupInfo.name}!</span>}
-                  {news.firstWin && <span className="rounded-full bg-yellow-300 px-3 py-1 text-sm font-black text-yellow-950" style={{ animation: 'bk-pop 0.4s 1.3s both' }}>🥇 Your first win!</span>}
-                  {news.newBest && <span className="rounded-full bg-lime-300 px-3 py-1 text-sm font-black text-lime-950" style={{ animation: 'bk-pop 0.4s 1.4s both' }}>⏱️ New best time!</span>}
-                  {news.newAward && <span className="rounded-full bg-fuchsia-300 px-3 py-1 text-sm font-black text-fuchsia-950" style={{ animation: 'bk-pop 0.4s 1.5s both' }}>⭐ New sticker for your shelf!</span>}
-                </div>
-              )}
+              {gain && <GainStrip gain={gain} />}
               <div className="grid gap-1.5 sm:grid-cols-2 landscape:grid-cols-1">
                 {awards.map((a, i) => (
                   <div
@@ -6066,6 +6149,9 @@ export default function BendanaKartPage() {
                     ))}
                   </div>
                 )}
+                <button type="button" onClick={() => setFamPanel({ kind: 'board' })} className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 py-2.5 text-lg font-black text-slate-900 active:scale-95">
+                  🏆 Family leaderboard
+                </button>
                 <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-2.5 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
                   {race?.mode === 'multi' ? 'Back to lobby' : '🏠 Home'}
                 </button>
@@ -6132,6 +6218,7 @@ export default function BendanaKartPage() {
       {hud.boost && (
         <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_120px_rgba(251,146,60,0.55)]" style={{ borderColor: kartColors(meSpec ? profile.kartIdx : 0, profile.paint).color }} />
       )}
+      {familySheets}
     </main>
   );
 }

@@ -12,7 +12,7 @@ and the rules each piece follows.
 | `app/view3d.ts` | Owns the renderer, karts, items and camera; creates the above |
 | `app/ui.tsx` | `HomeBackdrop`, `Logo`, `Sheet`, `QrCode`, `TrackThumb` |
 | `app/qr.ts` | `qrMatrix(text)`, `qrPath(matrix)` |
-| `app/trophies.ts` | `loadTrophies()`, `recordRace(result)` |
+| `app/players.ts`, `app/family-ui.tsx` | Saved racers, stats and leaderboard (not part of this change; the screens here host them) |
 | `app/voice.ts` | `say(text)`, `setVoiceOn`, `setVoiceMuted`, `unlockVoice` |
 | `app/audio.ts` | Music data and synth, new UI sounds, `musicDebug()` |
 | `app/manifest.ts`, `app/icon.svg`, `app/apple-icon.tsx`, `app/icon-512.png/route.tsx`, `app/app-icon.tsx` | Install icon and manifest |
@@ -73,7 +73,7 @@ the 2D map.
 `Screen` is still `'menu' | 'lobby' | 'race'`. Menus add a `Panel`:
 
 ```ts
-type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'trophies' | 'help';
+type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'help';
 ```
 
 A panel is a `Sheet` (full-screen, slides up, Esc or the back arrow closes).
@@ -101,14 +101,17 @@ Everything is `localStorage`, per browser:
 | --- | --- |
 | `bendana-kart-profile` | name, racer, kart, paint, track, laps, cup, camera, assists, sound |
 | `bendana-kart-prefs` | `{ voice: boolean }` |
-| `bendana-kart-trophies` | `{ races, wins, podiums, cups, awards, best }` |
+| `bendana-kart-family` | saved racers, stats and the leaderboard (see `players.ts`) |
 
 The profile is only written after it has been read once (`profileLoaded`),
 so a slow start can never overwrite a saved profile with defaults.
 
-`recordRace` runs once per race id when the awards appear. A "new best" needs
-an earlier time on the same track and lap count, so the first run never
-claims a record. A cup win needs the last round and the top points.
+Stats are recorded by `players.ts` (`applyRace`). The screens only read
+them: `totals(rec)` and `levelOf(stars)` for the home chips, `rec.b` (best
+race time by `track:laps`) for the race picker, and the `Gain` from the last
+race for the podium strip. The stats and leaderboard sheets (`FamilyPanel`)
+are a second, independent layer that opens above the menu panels, so "Add
+racer" works from inside the Garage.
 
 ## Voice
 
@@ -132,6 +135,6 @@ drum fill.
 - Screens checked at 390×800 (phone), 800×380 (phone on its side),
   1024×768 (tablet) and 1280×760 (desktop).
 - A full solo race reaches the podium with the results tune playing and the
-  trophy shelf updated.
+  racer's stats updated.
 - Two to five local tabs (`?net=local`) join one room, ready up, race and
   return to the lobby.

@@ -62,11 +62,11 @@ weather particles and no anisotropic filtering.
 ### 3. A front door (app/page.tsx, app/ui.tsx)
 
 The home screen is the logo, your racer on a turntable, and two big buttons:
-**PLAY** and **FAMILY RACE**. Trophies, Garage, Settings and Help are four
-small buttons underneath. Everything else moved into panels that slide over
+**PLAY** and **FAMILY RACE**. My stats, Leaders, Garage, Settings and Help
+are five small buttons underneath. Everything else moved into panels that slide over
 the home screen:
 
-- **Garage:** your name, then Racer, Kart and Paint tabs under a live
+- **Garage:** who's racing and your name, then Racer, Kart and Paint tabs under a live
   turntable with the stat bars.
 - **Pick your race:** one race or a cup, tracks shown as little maps drawn
   from the real track shape with your best time, laps, and one START button.
@@ -85,12 +85,20 @@ The lobby itself is now five seats with faces, a HOST and READY badge, open
 seats drawn as dashed boxes, and a bar at the bottom with the one button you
 need. A sound plays when someone joins or leaves.
 
-### 5. A trophy shelf (app/trophies.ts)
+### 5. Saved racers on the front door
 
-Races, wins, podiums, cups won, best time per track and a sticker book of
-the 13 awards are saved in the browser (localStorage only: no accounts, no
-database). The podium tells you about a new best time, a new sticker, a first
-win or a cup win.
+The saved racers, stats, stars, badges and family leaderboard come from
+`app/players.ts` and `app/family-ui.tsx` (their own change). This version
+gives them a home in the new screens rather than a second system:
+
+- the home screen shows the active racer on the turntable with their level
+  and stars, and a row of saved racers to switch between when the device
+  holds more than one;
+- **My stats** and **Leaders** are two of the small home buttons;
+- the Garage opens with "Who's racing?";
+- the race picker shows the active racer's best time on each track;
+- the podium shows the stars, level-ups and badges just earned, and a button
+  to the family leaderboard.
 
 ### 6. Spoken callouts (app/voice.ts)
 

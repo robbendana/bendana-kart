@@ -37,12 +37,12 @@ The design is in [docs/v4-gameplay-spec.md](docs/v4-gameplay-spec.md).
 - **A real podium:** the top three stand on a winners' stage with fireworks
   while the results and awards slide in.
 - **A new home screen:** your racer on a turntable and two big buttons, PLAY
-  and FAMILY RACE. The Garage, race picker, Settings, Trophies and Help open
-  as panels.
+  and FAMILY RACE. The Garage, race picker, Settings and Help open as panels.
 - **Join by camera:** the lobby shows a QR square. Point a phone or tablet at
   it and tap Join. The 4-letter code and a "Send invite" button still work.
-- **Trophy shelf:** races, wins, cups, best times and a sticker book, saved
-  on the device.
+- **Saved racers in the new screens:** your level and stars on the home
+  screen, My stats and Leaders buttons, best times on the track picker, and
+  what you just earned on the podium.
 - **Spoken callouts** ("Final lap!", item names) for racers who can't read yet.
 - **Longer music** with a results tune, menu sounds, a speed dial, skid marks
   and a race menu (Esc).
@@ -88,6 +88,30 @@ The full write-up is in `docs/v4-presentation-plan.md` and
 - **Polish:** lap and "Final lap!" banners, wrong-way warning, auto-respawn when you're lost off the road, screen shake, speed lines, engine sound, confetti, and game controller support.
 - **Practice:** race four robot karts on one device. Robots also fill empty seats online.
 - **Multiplayer:** one player taps **Family Race**, then **Start a room**, and gets a 4-letter code and a QR square. Everyone else scans the square, or taps **Family Race** and types the code.
+
+## Saved racers, stats and the family leaderboard
+
+Each device remembers its racers. On the menu, tap your picture to race as
+yourself: your name, character, kart and help level come back, with nothing to
+type. **Add racer** makes a new one, so a shared tablet can hold the whole
+family. A racer who already plays on another device can tap their name under
+**Add racer** to bring their stars and badges along.
+
+Every finished race adds to that racer's stats: races, wins, coins, drifts,
+best times and laps per track, stars, levels and badges. **My stats** shows
+one racer's page and **Leaderboard** ranks the family and lists the track
+records.
+
+All of it is saved in the browser's local storage, so it works offline and
+costs nothing. No database is used. Whenever devices are in a room together
+they swap leaderboards in one small `lb` message each, so every device ends up
+with the same board. The code is in `app/players.ts` (data and merging) and
+`app/family-ui.tsx` (screens).
+
+Because the data lives in the browser, clearing the browser's site data
+erases that device's copy. Racers come back from any other family device the
+next time you share a room. `?store=name` gives a tab its own save data, which
+lets one browser act as several devices in tests.
 
 ## Controls
 
