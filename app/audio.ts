@@ -25,6 +25,7 @@ let master: GainNode | null = null;
 let sfxBus: GainNode | null = null;
 let musicFilter: BiquadFilterNode | null = null;
 let musicGain: GainNode | null = null;
+let musicSend: GainNode | null = null; // melody voices also feed a soft echo
 let noiseBuf: AudioBuffer | null = null;
 
 let muted = false;
@@ -93,6 +94,22 @@ function buildGraph(c: AudioContext): void {
   musicFilter.frequency.value = 2800;
   musicFilter.Q.value = 0.5;
   musicFilter.connect(musicGain);
+
+  // A quiet echo on the melody gives the music some room. Three nodes, made once.
+  musicSend = c.createGain();
+  musicSend.gain.value = 0.3;
+  const echo = c.createDelay(1);
+  echo.delayTime.value = 0.27;
+  const fb = c.createGain();
+  fb.gain.value = 0.28;
+  const damp = c.createBiquadFilter();
+  damp.type = 'lowpass';
+  damp.frequency.value = 1800;
+  musicSend.connect(echo);
+  echo.connect(damp);
+  damp.connect(fb);
+  fb.connect(echo);
+  damp.connect(musicGain);
 
   // One second of white noise, made once and reused by every noisy sound.
   noiseBuf = c.createBuffer(1, c.sampleRate, c.sampleRate);
@@ -232,11 +249,12 @@ export function beep(freq: number, dur: number, type: OscillatorType = 'sine', v
 export type Sfx = 'countdown' | 'go' | 'itemRoll' | 'itemGet' | 'rocket' | 'banana' | 'blast' | 'hit'
   | 'bump' | 'coin' | 'boostPad' | 'jump' | 'land' | 'trick' | 'driftTier1' | 'driftTier2' | 'driftTier3'
   | 'miniTurbo' | 'shieldUp' | 'shieldPop' | 'snooze' | 'lap' | 'finalLap' | 'finish' | 'posUp' | 'posDown'
-  | 'ready' | 'emote' | 'horn' | 'win' | 'cheer' | 'whoosh' | 'clean';
+  | 'ready' | 'emote' | 'horn' | 'win' | 'cheer' | 'whoosh' | 'clean'
+  | 'uiTap' | 'uiBack' | 'uiToggle' | 'uiOpen' | 'join' | 'leave' | 'sticker' | 'tick' | 'firework' | 'record';
 
 // Last time each effect played, so the same sound can't machine-gun.
 const lastPlayed: Partial<Record<Sfx, number>> = {};
-const MIN_GAP: Partial<Record<Sfx, number>> = { itemRoll: 0.045, bump: 0.12, coin: 0.04, land: 0.1, cheer: 0.8, horn: 0.3, emote: 0.25 };
+const MIN_GAP: Partial<Record<Sfx, number>> = { itemRoll: 0.045, bump: 0.12, coin: 0.04, land: 0.1, cheer: 0.8, horn: 0.3, emote: 0.25, firework: 0.22, uiTap: 0.05, tick: 0.2 };
 
 /** Play a named sound effect. opts.pitch is a semitone offset, opts.vol a volume multiplier. */
 export function sfx(name: Sfx, opts?: { pitch?: number; vol?: number }): void {
@@ -329,6 +347,27 @@ export function sfx(name: Sfx, opts?: { pitch?: number; vol?: number }): void {
         noise(t + 0.08, 1.2, 0.05 * v, 'bandpass', 2200, 2600, 1.2, 0.35);
         break;
       case 'win': playFanfare(1); break;
+      // ----- Menus -----
+      case 'uiTap':
+        tone(660 * r, t, 0.06, 'triangle', 0.07 * v);
+        tone(990 * r, t + 0.035, 0.08, 'sine', 0.05 * v);
+        break;
+      case 'uiBack': tone(520 * r, t, 0.09, 'triangle', 0.06 * v, 390 * r); break;
+      case 'uiToggle': tone(780 * r, t, 0.05, 'sine', 0.06 * v); break;
+      case 'uiOpen': seq(t, [['G5', 0, 0.07], ['C6', 0.05, 0.07], ['E6', 0.1, 0.12]], 'sine', 0.05 * v, r); break;
+      case 'join': seq(t, [['E5', 0, 0.1], ['A5', 0.09, 0.1], ['C#6', 0.18, 0.22]], 'triangle', 0.08 * v, r); break; // someone arrived
+      case 'leave': seq(t, [['A5', 0, 0.1], ['E5', 0.1, 0.2]], 'triangle', 0.05 * v, r); break;
+      case 'sticker': // a new sticker for the trophy shelf
+        seq(t, [['C6', 0, 0.08], ['E6', 0.07, 0.08], ['G6', 0.14, 0.08], ['C7', 0.21, 0.3]], 'sine', 0.06 * v, r);
+        noise(t + 0.2, 0.25, 0.02 * v, 'highpass', 5000, 8000, 0.7, 0.01);
+        break;
+      case 'record': seq(t, [['G5', 0, 0.1], ['G5', 0.12, 0.1], ['D6', 0.24, 0.1], ['G6', 0.36, 0.4]], 'triangle', 0.09 * v, r); break;
+      case 'tick': tone(1000 * r, t, 0.04, 'square', 0.03 * v); break;
+      case 'firework':
+        noise(t, 0.5, 0.05 * v, 'lowpass', 2400, 300, 0.6, 0.004);
+        noise(t + 0.06, 0.6, 0.025 * v, 'highpass', 4000, 7000, 0.8, 0.05);
+        tone(160 * r, t, 0.25, 'sine', 0.07 * v, 60 * r);
+        break;
     }
   } catch { /* ignore */ }
 }
@@ -393,16 +432,34 @@ export function playFanfare(place: number): void {
 interface TrackDef {
   bpm: number; swing: number; leadWave: OscillatorType; bell: boolean; leadVol: number;
   bassWave: OscillatorType; chords: string[]; bass: string; lead: string[]; drums: string[];
+  // The second half of the tune (optional): its own chords and melody
+  chordsB?: string[]; leadB?: string[];
+  // Harmony: the 7 notes of the key (0 = C), and a plucked pattern over each chord.
+  // Pattern digits: 0 root, 1 third, 2 fifth, 3 octave, "." rest.
+  scale: number[]; arp: string; arpVol: number;
 }
 
 const TRACKS: Record<number, TrackDef> = {
+  // Results / podium: a proud, bright C major march.
+  [-2]: {
+    bpm: 118, swing: 0, leadWave: 'square', bell: false, leadVol: 0.3, bassWave: 'triangle',
+    chords: ['C3', 'F2', 'G2', 'C3', 'A2', 'F2', 'G2', 'C3'], bass: 'R.F.R.O.',
+    lead: ['G5 . E5 G5 C6 - G5 .', 'A5 . F5 A5 C6 - A5 .', 'B5 . G5 B5 D6 - B5 .', 'C6 - G5 . E5 . G5 .',
+      'E6 . C6 A5 E5 - A5 C6', 'F5 . A5 C6 F6 - C6 A5', 'G5 . B5 D6 G6 - F6 D6', 'C6 - - . G5 . C5 .'],
+    drums: ['k', 'h', 's', 'h', 'k', 'k', 's', 'h'],
+    scale: [0, 2, 4, 5, 7, 9, 11], arp: '02130213', arpVol: 0.13,
+  },
   // Menu / lobby: gentle G major, ~100 bpm.
   [-1]: {
     bpm: 100, swing: 0, leadWave: 'triangle', bell: false, leadVol: 0.5, bassWave: 'triangle',
     chords: ['G2', 'E2', 'C3', 'D3', 'G2', 'E2', 'C3', 'D3'], bass: 'R---F---',
     lead: ['B4 - D5 . G5 - D5 .', 'E5 - - . B4 - . .', 'C5 - E5 . G5 - E5 .', 'D5 - - . F#5 - A5 .',
       'G5 - F#5 . E5 - D5 .', 'B4 - - . G4 - B4 .', 'C5 - E5 . A5 - G5 .', 'F#5 - D5 . G5 - - .'],
-    drums: ['k', '.', '.', '.', 's', '.', '.', '.'],
+    chordsB: ['C3', 'G2', 'A2', 'D3', 'C3', 'G2', 'D3', 'G2'],
+    leadB: ['E5 - G5 . C6 - G5 .', 'D5 - B4 . G4 - B4 D5', 'C5 - E5 . A5 - E5 .', 'F#5 - A5 . D5 - - .',
+      'E5 - G5 . C6 - B5 A5', 'G5 - D5 . B4 - D5 .', 'A5 - F#5 . D5 - F#5 A5', 'G5 - - . . . D5 .'],
+    drums: ['k', '.', 'h', '.', 's', '.', 'h', '.'],
+    scale: [7, 9, 11, 0, 2, 4, 6], arp: '0.1.2.1.', arpVol: 0.16,
   },
   // 0 Sunny Meadow: bright C major, bouncy 128 bpm.
   0: {
@@ -410,7 +467,11 @@ const TRACKS: Record<number, TrackDef> = {
     chords: ['C3', 'G2', 'A2', 'F2', 'C3', 'F2', 'G2', 'C3'], bass: 'R.F.O.F.',
     lead: ['E5 . G5 E5 C5 - D5 E5', 'D5 - B4 . G4 - . .', 'C5 . E5 C5 A4 - B4 C5', 'A4 - F4 . A4 - C5 .',
       'E5 . G5 E5 A5 - G5 E5', 'F5 - E5 D5 C5 - A4 .', 'B4 . D5 G5 F5 - D5 B4', 'C5 - - . G4 . C5 .'],
+    chordsB: ['F2', 'C3', 'G2', 'A2', 'F2', 'C3', 'G2', 'G2'],
+    leadB: ['A5 . F5 A5 C6 - A5 F5', 'G5 - E5 . C5 - E5 G5', 'D5 . G5 B5 D6 - B5 G5', 'C6 - A5 . E5 - . .',
+      'A5 . C6 A5 F5 - A5 C6', 'G5 . E5 G5 C6 - G5 E5', 'D5 . E5 F5 G5 - A5 B5', 'D6 - B5 . G5 . G4 .'],
     drums: ['k', 'h', 's', 'h', 'k', 'kh', 's', 'h'],
+    scale: [0, 2, 4, 5, 7, 9, 11], arp: '02120212', arpVol: 0.13,
   },
   // 1 Candy Canyon: playful F major with swing, 120 bpm.
   1: {
@@ -418,7 +479,11 @@ const TRACKS: Record<number, TrackDef> = {
     chords: ['F2', 'D3', 'Bb2', 'C3', 'F2', 'D3', 'G2', 'C3'], bass: 'R-.FR-.F',
     lead: ['C5 A4 C5 F5 . E5 F5 .', 'D5 . A4 . D5 F5 A5 .', 'G5 F5 D5 Bb4 - . C5 D5', 'E5 - G5 - E5 . C5 .',
       'C5 A4 C5 F5 . G5 A5 .', 'F5 . D5 . A4 D5 F5 .', 'G5 . Bb5 G5 E5 . C5 E5', 'F5 - - . C5 . F4 .'],
+    chordsB: ['Bb2', 'F2', 'G2', 'C3', 'Bb2', 'A2', 'D3', 'C3'],
+    leadB: ['D5 F5 Bb5 . A5 G5 F5 .', 'C5 . F5 . A5 F5 C5 .', 'Bb4 D5 G5 . F5 D5 Bb4 .', 'C5 - E5 - G5 . Bb5 .',
+      'D5 F5 Bb5 . D6 Bb5 F5 .', 'E5 . A5 . C6 A5 E5 .', 'F5 . A5 D6 . A5 F5 D5', 'E5 - G5 . C6 . C5 .'],
     drums: ['k', '.', 's', 'h', '.', 'k', 's', 'h'],
+    scale: [5, 7, 9, 10, 0, 2, 4], arp: '0.21.021', arpVol: 0.15,
   },
   // 2 Frosty Peaks: sparkly bells in D lydian (the G# is the magic note), 112 bpm.
   2: {
@@ -426,7 +491,11 @@ const TRACKS: Record<number, TrackDef> = {
     chords: ['D3', 'E3', 'D3', 'E3', 'D3', 'E3', 'B2', 'A2'], bass: 'R---F---',
     lead: ['A5 F#5 D5 F#5 G#5 . A5 .', 'B5 . G#5 E5 B4 - . E5', 'F#5 A5 D6 A5 G#5 F#5 E5 .', 'G#5 - B5 - E5 . . .',
       'A5 F#5 D5 F#5 G#5 . A5 .', 'B5 . E6 . B5 G#5 E5 .', 'D5 F#5 B5 F#5 C#5 E5 A5 .', 'A5 - - . G#5 . A5 .'],
+    chordsB: ['B2', 'A2', 'D3', 'E3', 'B2', 'A2', 'E3', 'D3'],
+    leadB: ['F#5 . B5 . D6 . B5 F#5', 'E5 . A5 . C#6 - A5 .', 'F#5 A5 D6 . A5 F#5 D5 .', 'G#5 - B5 . E6 - . .',
+      'D6 . B5 . F#5 . B5 D6', 'C#6 . A5 . E5 . A5 C#6', 'B5 G#5 E5 G#5 B5 . E6 .', 'D6 - - . A5 . F#5 .'],
     drums: ['k', 'h', '.', 'h', 's', 'h', '.', 'h'],
+    scale: [2, 4, 6, 8, 9, 11, 1], arp: '01232123', arpVol: 0.11,
   },
   // 3 Dusty Dunes: E phrygian-dominant flavour (F and G# over E), 124 bpm.
   3: {
@@ -434,20 +503,28 @@ const TRACKS: Record<number, TrackDef> = {
     chords: ['E2', 'E2', 'F2', 'E2', 'E2', 'D2', 'F2', 'E2'], bass: 'R.RF.RO.',
     lead: ['E5 F5 G#5 . F5 E5 . B4', 'C5 B4 G#4 . E4 - . .', 'A4 B4 C5 D5 C5 B4 G#4 .', 'B4 - - . E5 . B4 .',
       'E5 F5 G#5 . A5 G#5 F5 E5', 'D5 . F5 D5 A4 - . .', 'F5 E5 D5 C5 B4 C5 G#4 .', 'E4 - - . B4 . E5 .'],
+    chordsB: ['A2', 'A2', 'E2', 'E2', 'F2', 'D2', 'E2', 'E2'],
+    leadB: ['A5 . C6 A5 E5 . A5 .', 'C6 B5 A5 . E5 - . .', 'G#5 . B5 G#5 E5 . G#5 B5', 'E6 - D6 C6 B5 - . .',
+      'A5 C6 F6 . E6 C6 A5 .', 'F5 A5 D6 . C6 A5 F5 .', 'E5 F5 G#5 A5 B5 C6 D6 .', 'E6 - - . B5 . E5 .'],
     drums: ['k', '.', 'h', 'k', 's', '.', 'h', 'h'],
+    scale: [4, 5, 8, 9, 11, 0, 2], arp: '0.2.1.2.', arpVol: 0.12,
   },
   // 4 Volcano Loop: driving A minor, 136 bpm.
   4: {
     bpm: 136, swing: 0, leadWave: 'sawtooth', bell: false, leadVol: 0.28, bassWave: 'square',
     chords: ['A2', 'F2', 'G2', 'A2', 'A2', 'F2', 'G2', 'E2'], bass: 'RRORRFRO',
     lead: ['A4 . C5 E5 A5 . G5 E5', 'F5 . E5 C5 A4 - C5 .', 'D5 . B4 G4 D5 . G5 F5', 'E5 - C5 . A4 - . .',
-      'A4 . C5 E5 A5 . B5 C6', 'A5 . F5 . C5 F5 A5 .', 'G5 . D5 . B4 D5 G5 B5', 'G#5 - E5 . B4 . E5 .'],
+      'A4 . C5 E5 A5 . B5 C6', 'A5 . F5 . C5 F5 A5 .', 'G5 . D5 . B4 D5 G5 B5', 'E5 - B4 . E5 . B5 .'],
+    chordsB: ['D2', 'A2', 'F2', 'G2', 'D2', 'A2', 'E2', 'E2'],
+    leadB: ['F5 . A5 D6 . A5 F5 D5', 'E5 . A5 C6 . A5 E5 .', 'F5 . A5 C6 F6 . C6 A5', 'G5 - B5 . D6 - . .',
+      'D6 . A5 F5 D5 . F5 A5', 'C6 . A5 E5 C5 . E5 A5', 'B5 . G5 E5 B4 . E5 G5', 'B5 - - . E5 . E6 .'],
     drums: ['k', 'h', 's', 'h', 'k', 'kh', 's', 'kh'],
+    scale: [9, 11, 0, 2, 4, 5, 7], arp: '02320232', arpVol: 0.1,
   },
 };
 
 interface NoteEv { m: number; len: number }
-interface Parsed { def: TrackDef; n: number; lead: Array<NoteEv | null>; bass: Array<NoteEv | null> }
+interface Parsed { def: TrackDef; n: number; lead: Array<NoteEv | null>; bass: Array<NoteEv | null>; arp: Array<number | null> }
 
 /** Turn a list of tokens into note events with lengths (counting "-" holds). */
 function toEvents(tokens: string[], toMidi: (tok: string, i: number) => number): Array<NoteEv | null> {
@@ -464,18 +541,42 @@ function toEvents(tokens: string[], toMidi: (tok: string, i: number) => number):
   return out;
 }
 
+/** The chord built on a bass note from the notes of the key: [root, third, fifth, octave]. */
+function triad(root: number, scale: number[]): number[] {
+  const pc = ((root % 12) + 12) % 12;
+  const i = scale.indexOf(pc);
+  if (i < 0) return [root, root + 4, root + 7, root + 12];
+  const up = (deg: number) => {
+    let d = scale[(i + deg) % 7] - pc;
+    if (d <= 0) d += 12;
+    return root + d;
+  };
+  return [root, up(2), up(4), root + 12];
+}
+
 function parseTrack(def: TrackDef): Parsed {
-  const n = def.chords.length * 8;
-  const leadTok = def.lead.join(' ').trim().split(/\s+/);
+  const chords = def.chordsB ? [...def.chords, ...def.chordsB] : def.chords;
+  const leadBars = def.leadB ? [...def.lead, ...def.leadB] : def.lead;
+  const n = chords.length * 8;
+  const leadTok = leadBars.join(' ').trim().split(/\s+/);
   while (leadTok.length < n) leadTok.push('.');
   leadTok.length = n;
   const bassTok: string[] = [];
-  for (let b = 0; b < def.chords.length; b++) for (let i = 0; i < 8; i++) bassTok.push(def.bass[i] || '.');
+  for (let b = 0; b < chords.length; b++) for (let i = 0; i < 8; i++) bassTok.push(def.bass[i] || '.');
   const off: Record<string, number> = { R: 0, F: 7, O: 12 };
+  const arp: Array<number | null> = [];
+  for (let b = 0; b < chords.length; b++) {
+    const tr = triad(noteToMidi(chords[b]), def.scale);
+    for (let i = 0; i < 8; i++) {
+      const ch = def.arp[i] ?? '.';
+      const d = ch >= '0' && ch <= '3' ? ch.charCodeAt(0) - 48 : -1;
+      arp.push(d < 0 ? null : tr[d] + 24);
+    }
+  }
   return {
-    def, n,
+    def, n, arp,
     lead: toEvents(leadTok, (tok) => noteToMidi(tok)),
-    bass: toEvents(bassTok, (tok, i) => noteToMidi(def.chords[Math.floor(i / 8)]) + (off[tok] ?? 0)),
+    bass: toEvents(bassTok, (tok, i) => noteToMidi(chords[Math.floor(i / 8)]) + (off[tok] ?? 0)),
   };
 }
 
@@ -483,6 +584,7 @@ function parseTrack(def: TrackDef): Parsed {
 
 interface Voices {
   lead: OscillatorNode; lead2: OscillatorNode | null; leadG: GainNode;
+  arp: OscillatorNode; arpG: GainNode;
   bass: OscillatorNode; bassG: GainNode; kick: OscillatorNode; kickG: GainNode;
   noise: AudioBufferSourceNode; hatG: GainNode; snG: GainNode; all: AudioNode[];
 }
@@ -521,7 +623,11 @@ function makeVoices(c: AudioContext, def: TrackDef): Voices {
     return g;
   };
   const leadG = gain(dest);
+  if (musicSend) leadG.connect(musicSend);
   const lead = osc(def.leadWave, leadG);
+  const arpG = gain(dest);
+  if (musicSend) arpG.connect(musicSend);
+  const arp = osc(def.bell ? 'sine' : 'triangle', arpG);
   let lead2: OscillatorNode | null = null;
   if (def.bell) {
     // A quiet octave-up partial makes the sine sound like a little bell.
@@ -552,7 +658,7 @@ function makeVoices(c: AudioContext, def: TrackDef): Voices {
   nz.connect(snF); snF.connect(snG);
   nz.start();
   all.push(nz, hatF, snF);
-  return { lead, lead2, leadG, bass, bassG, kick, kickG, noise: nz, hatG, snG, all };
+  return { lead, lead2, leadG, arp, arpG, bass, bassG, kick, kickG, noise: nz, hatG, snG, all };
 }
 
 /** Book every sound for one step at audio time t. */
@@ -579,6 +685,13 @@ function scheduleStep(s: number, t: number): void {
       g.setTargetAtTime(0, t + Math.max(0.05, le.len * sd * 0.85), 0.03);
     }
   }
+  const an = p.arp[i];
+  if (an !== null && an !== undefined) {
+    v.arp.frequency.setTargetAtTime(mtof(an + tr), t, 0.003);
+    const g = v.arpG.gain;
+    g.setTargetAtTime(p.def.arpVol, t, 0.004);
+    g.setTargetAtTime(0, t + 0.03, p.def.bell ? 0.16 : 0.07); // plucked
+  }
   const be = p.bass[i];
   if (be) {
     v.bass.frequency.setTargetAtTime(mtof(be.m + tr), t, 0.004);
@@ -588,7 +701,9 @@ function scheduleStep(s: number, t: number): void {
     g.setTargetAtTime(pk * 0.6, t + 0.05, 0.1);
     g.setTargetAtTime(0, t + Math.max(0.06, be.len * sd * 0.85), 0.03);
   }
-  const d = p.def.drums[i % p.def.drums.length] || '.';
+  let d = p.def.drums[i % p.def.drums.length] || '.';
+  // A little drum fill at the end of every fourth bar leads into the next phrase
+  if (Math.floor(i / 8) % 4 === 3 && i % 8 >= 6) d += 's';
   if (d.includes('k')) {
     v.kick.frequency.setValueAtTime(150, t);
     v.kick.frequency.exponentialRampToValueAtTime(45, t + 0.12);
@@ -639,11 +754,11 @@ function stopVoices(): void {
   if (!v || !ctx) return;
   try {
     const t = ctx.currentTime;
-    for (const g of [v.leadG, v.bassG, v.kickG, v.hatG, v.snG]) {
+    for (const g of [v.leadG, v.arpG, v.bassG, v.kickG, v.hatG, v.snG]) {
       g.gain.cancelScheduledValues(t);
       g.gain.setTargetAtTime(0, t, 0.04);
     }
-    for (const s of [v.lead, v.lead2, v.bass, v.kick, v.noise]) if (s) s.stop(t + 0.3);
+    for (const s of [v.lead, v.lead2, v.arp, v.bass, v.kick, v.noise]) if (s) s.stop(t + 0.3);
     v.noise.onended = () => { for (const n of v.all) { try { n.disconnect(); } catch { /* ignore */ } } };
   } catch { /* ignore */ }
 }
@@ -662,7 +777,7 @@ function beginTrack(idx: number): void {
   tick();
 }
 
-/** Start a music loop. -1 = menu, 0..4 = race tracks. Safe to call before unlock. */
+/** Start a music loop. -2 = results, -1 = menu, 0..4 = race tracks. Safe to call before unlock. */
 export function startMusic(trackIdx: number): void {
   try {
     wantedTrack = trackIdx;
@@ -812,4 +927,9 @@ export function vibrate(pattern: number | number[]): void {
     if (nav.userActivation && !nav.userActivation.hasBeenActive) return; // browsers block it before the first tap
     if (typeof nav.vibrate === 'function') nav.vibrate(pattern);
   } catch { /* ignore */ }
+}
+
+/** For tests: what the music player is doing right now. */
+export function musicDebug(): { track: number | null; step: number; steps: number; running: boolean } {
+  return { track: playingIdx, step, steps: current ? current.n : 0, running: !!voices && live() !== null };
 }

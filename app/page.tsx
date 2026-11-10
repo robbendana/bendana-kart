@@ -8,8 +8,11 @@ import { KartShowcase } from './kart3d';
 import { faceCanvas } from './faces';
 import {
   beep, sfx, unlockAudio, setMuted, setMusicOn, setHaptics, startMusic, stopMusic, setMusicIntensity,
-  playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning,
+  playFanfare, engineStart, engineUpdate, engineStop, vibrate, isAudioRunning, musicDebug,
 } from './audio';
+import { say, stopVoice, unlockVoice, setVoiceOn, setVoiceMuted, voiceAvailable } from './voice';
+import { loadTrophies, recordRace, emptyTrophies, type Trophies, type TrophyNews } from './trophies';
+import { HomeBackdrop, Logo, Sheet, QrCode, TrackThumb, type ThumbLook } from './ui';
 import {
   wall, SupabaseRoom, LocalRoom, HostClock, RemoteKart, Sampler, EventLog, WakeLock, parseSamples, readSimOpts,
   sendIntervalFor, F_SPIN, F_BOOST, F_DRIFT, F_AIR, F_SHIELD, F_DONE, F_SNOOZE, F_DRAFT,
@@ -2534,6 +2537,63 @@ function render(ctx: CanvasRenderingContext2D, G: Game, track: HTMLCanvasElement
   ctx.restore();
 }
 
+/** A round speed dial on the race overlay. It sits where thumbs don't cover it. */
+function drawSpeedGauge(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: number, speed: number, maxSpeed: number, boost: boolean, touch: boolean, now: number) {
+  const small = Math.min(w, h) < 520;
+  const r = small ? 34 : 46;
+  // Touch screens: just above the steering buttons, clear of both thumbs
+  const btn = w >= 640 ? 112 : 80;
+  const cx = touch ? r + 18 : w - r - 22;
+  const cy = touch ? h - btn - r - 34 : h - r - 22;
+  const frac = clamp(speed / (maxSpeed * 1.25), 0, 1);
+  const a0 = Math.PI * 0.75;
+  const a1 = Math.PI * 2.25;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(15,23,42,0.62)';
+  ctx.fill();
+  ctx.lineCap = 'round';
+  ctx.lineWidth = small ? 6 : 8;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - 5, a0, a1);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.stroke();
+  if (frac > 0.01) {
+    const g = ctx.createLinearGradient(cx - r, 0, cx + r, 0);
+    g.addColorStop(0, '#4ade80');
+    g.addColorStop(0.6, '#fde047');
+    g.addColorStop(1, boost ? '#f472b6' : '#fb923c');
+    ctx.beginPath();
+    ctx.arc(cx, cy, r - 5, a0, a0 + (a1 - a0) * frac);
+    ctx.strokeStyle = g;
+    if (boost) {
+      ctx.shadowColor = '#fb923c';
+      ctx.shadowBlur = 10 + 6 * Math.sin(now / 60);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.fillStyle = boost ? '#fde047' : '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `900 ${small ? 20 : 26}px system-ui, sans-serif`;
+  ctx.fillText(String(Math.round(speed * 0.22)), cx, cy - 1);
+  ctx.font = `800 ${small ? 8 : 10}px system-ui, sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fillText(boost ? 'BOOST!' : 'km/h', cx, cy + (small ? 15 : 19));
+  ctx.restore();
+}
+
+/** What to say out loud for a banner, or '' to stay quiet. */
+function spokenFor(banner: string): string {
+  // Strip emoji and symbols, keep the words
+  const words = banner.replace(/(\d+)\/(\d+)/g, '$1 of $2').replace(/[^\p{L}\p{N}!?' ]/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (!words || words.length > 40) return '';
+  return words.charAt(0) + words.slice(1).toLowerCase();
+}
+
 // ---------- React UI ----------
 type Profile = {
   name: string; kartIdx: number; toddler: boolean; trackIdx: number; muted: boolean; paint: number; body: number;
@@ -2572,6 +2632,9 @@ type Hud = {
   improved: boolean;
 };
 type Screen = 'menu' | 'lobby' | 'race';
+type Panel = null | 'garage' | 'solo' | 'family' | 'settings' | 'trophies' | 'help';
+// Settings that live outside the profile (their own storage key)
+type Prefs = { voice: boolean };
 
 const CUPS = [
   { name: 'Sunshine Cup', emoji: '🌼', tracks: [0, 1, 3, 2], card: 'from-yellow-300 to-orange-500' },
@@ -2806,110 +2869,302 @@ function KartPicker({ value, paint, body, onPick, onPaint, onBody, compact }: {
   onBody: (i: number) => void;
   compact?: boolean;
 }) {
+  const [tab, setTab] = useState<'racer' | 'kart' | 'paint'>('racer');
   const sel = KARTS[value] || KARTS[0];
   const col = kartColors(value, paint);
   const st = kartStats(value, body);
+  const tabs = [
+    { id: 'racer' as const, label: '😀 Racer' },
+    { id: 'kart' as const, label: '🏎️ Kart' },
+    { id: 'paint' as const, label: '🎨 Paint' },
+  ];
   return (
     <div className="flex flex-col gap-3">
-      <div className={`grid gap-2 ${compact ? 'grid-cols-4 sm:grid-cols-8' : 'grid-cols-4 sm:grid-cols-8'}`}>
-        {KARTS.map((k, i) => {
-          const active = i === value;
-          return (
-            <button
-              key={k.name}
-              type="button"
-              onClick={() => onPick(i)}
-              aria-label={k.name}
-              className={`flex flex-col items-center rounded-2xl px-1 py-2 transition active:scale-95 ${active ? 'scale-105 shadow-xl ring-4 ring-white' : 'opacity-80 ring-2 ring-white/20 hover:opacity-100'}`}
-              style={{ background: `linear-gradient(145deg, ${k.color}, ${k.dark})` }}
-            >
-              <FaceIcon emoji={k.emoji} size={compact ? 40 : 48} happy={active} />
-              <span className="mt-1 text-center text-[10px] font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)] sm:text-[11px]">{k.name}</span>
-            </button>
-          );
-        })}
-      </div>
-      <div className="flex flex-col gap-3 rounded-2xl p-3 sm:flex-row sm:items-center" style={{ background: `linear-gradient(135deg, ${col.color}, ${col.dark})` }}>
-        <div className="flex items-center gap-2 sm:w-72">
+      {/* The chosen racer, always in view while you try things on */}
+      <div className="flex flex-col gap-3 rounded-3xl p-3 shadow-xl ring-2 ring-white/30 sm:flex-row sm:items-center" style={{ background: `linear-gradient(135deg, ${col.color}, ${col.dark})` }}>
+        <div className="flex items-center gap-3 sm:w-80">
           <span className="rounded-2xl bg-white/25 p-1">
-            <KartTurntable kartIdx={value} paint={paint} body={body} size={compact ? 112 : 150} />
+            <KartTurntable kartIdx={value} paint={paint} body={body} size={compact ? 124 : 168} />
           </span>
           <span>
-            <span className="block text-xl font-black text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.name}</span>
-            <span className="block text-sm font-bold text-white/90 drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">
-              {sel.blurb} · {BODIES[body]?.name ?? 'Classic'}
-            </span>
+            <span className="block text-2xl font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.name}</span>
+            <span className="block text-sm font-bold text-white/90 drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]">{sel.blurb}</span>
+            <span className="mt-1 inline-block rounded-full bg-black/25 px-2 py-0.5 text-xs font-black text-white">{BODIES[body]?.icon} {BODIES[body]?.name ?? 'Classic'} kart</span>
           </span>
         </div>
-        {!compact && (
-          <div className="flex-1 space-y-1 rounded-xl bg-black/25 p-2">
-            <StatBar label="Speed" value={(st.maxSpeed - 470) / 160} />
-            <StatBar label="Accel" value={(st.accel - 280) / 330} />
-            <StatBar label="Steering" value={(st.turn - 2.1) / 1.8} />
-            <StatBar label="Grip" value={(st.grip - 5) / 8} />
-          </div>
-        )}
+        <div className="flex-1 space-y-1 rounded-xl bg-black/25 p-2">
+          <StatBar label="Speed" value={(st.maxSpeed - 470) / 160} />
+          <StatBar label="Accel" value={(st.accel - 280) / 330} />
+          <StatBar label="Steering" value={(st.turn - 2.1) / 1.8} />
+          <StatBar label="Grip" value={(st.grip - 5) / 8} />
+        </div>
       </div>
-      <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
-        {BODIES.map((b, i) => (
+      <div className="grid grid-cols-3 gap-2 rounded-2xl bg-black/25 p-1.5">
+        {tabs.map((t) => (
           <button
-            key={b.name}
+            key={t.id}
             type="button"
-            onClick={() => onBody(i)}
-            aria-label={`${b.name} kart`}
-            className={`flex flex-col items-center rounded-2xl bg-white/15 px-1 py-2 transition active:scale-95 ${body === i ? 'scale-105 bg-white/35 ring-4 ring-white' : 'ring-2 ring-white/20 hover:bg-white/25'}`}
+            onClick={() => {
+              sfx('uiTap');
+              setTab(t.id);
+            }}
+            className={`rounded-xl py-2.5 text-base font-black transition active:scale-95 ${tab === t.id ? 'bg-white text-slate-900 shadow' : 'text-white/90'}`}
           >
-            <KartPreview kartIdx={value} paint={paint} body={i} size={compact ? 56 : 70} driver={false} />
-            <span className="text-[11px] font-black text-white drop-shadow">{b.icon} {b.name}</span>
-            {!compact && <span className="text-[10px] font-bold leading-tight text-white/80">{b.blurb}</span>}
+            {t.label}
           </button>
         ))}
       </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-black text-white">🎨 Paint:</span>
-        <button
-          type="button"
-          onClick={() => onPaint(-1)}
-          className={`h-9 rounded-full px-3 text-xs font-black text-white ring-2 transition active:scale-95 ${paint < 0 ? 'ring-white' : 'ring-white/30'}`}
-          style={{ background: `linear-gradient(135deg, ${sel.color}, ${sel.dark})` }}
-        >
-          Classic
-        </button>
-        {PAINTS.map((pt, i) => (
+      {tab === 'racer' && (
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-8">
+          {KARTS.map((k, i) => {
+            const active = i === value;
+            return (
+              <button
+                key={k.name}
+                type="button"
+                onClick={() => {
+                  sfx('uiTap', { pitch: 1 + (i % 8) * 0.04 });
+                  onPick(i);
+                }}
+                aria-label={k.name}
+                aria-pressed={active}
+                className={`flex flex-col items-center rounded-2xl px-1 py-2 transition active:scale-95 ${active ? 'scale-105 shadow-xl ring-4 ring-white' : 'opacity-85 ring-2 ring-white/20 hover:opacity-100'}`}
+                style={{ background: `linear-gradient(145deg, ${k.color}, ${k.dark})` }}
+              >
+                <FaceIcon emoji={k.emoji} size={compact ? 42 : 50} happy={active} />
+                <span className="mt-1 text-center text-[10px] font-black leading-tight text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)] sm:text-[11px]">{k.name}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {tab === 'kart' && (
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+          {BODIES.map((b, i) => (
+            <button
+              key={b.name}
+              type="button"
+              onClick={() => {
+                sfx('uiTap');
+                onBody(i);
+              }}
+              aria-label={`${b.name} kart`}
+              aria-pressed={body === i}
+              className={`flex flex-col items-center rounded-2xl bg-white/15 px-1 py-2 transition active:scale-95 ${body === i ? 'scale-105 bg-white/35 ring-4 ring-white' : 'ring-2 ring-white/20 hover:bg-white/25'}`}
+            >
+              <KartPreview kartIdx={value} paint={paint} body={i} size={compact ? 64 : 78} driver={false} />
+              <span className="text-xs font-black text-white drop-shadow">{b.icon} {b.name}</span>
+              <span className="text-[10px] font-bold leading-tight text-white/80">{b.blurb}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {tab === 'paint' && (
+        <div className="grid grid-cols-5 gap-3 sm:grid-cols-9">
           <button
-            key={pt.name}
             type="button"
-            aria-label={`${pt.name} paint`}
-            onClick={() => onPaint(i)}
-            className={`h-9 w-9 rounded-full ring-2 transition active:scale-90 ${paint === i ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
-            style={{ background: `linear-gradient(135deg, ${pt.color}, ${pt.dark})` }}
-          />
-        ))}
-      </div>
+            onClick={() => {
+              sfx('uiTap');
+              onPaint(-1);
+            }}
+            aria-pressed={paint < 0}
+            className={`flex aspect-square items-center justify-center rounded-full text-[11px] font-black text-white ring-2 transition active:scale-90 ${paint < 0 ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
+            style={{ background: `linear-gradient(135deg, ${sel.color}, ${sel.dark})` }}
+          >
+            Classic
+          </button>
+          {PAINTS.map((pt, i) => (
+            <button
+              key={pt.name}
+              type="button"
+              aria-label={`${pt.name} paint`}
+              aria-pressed={paint === i}
+              onClick={() => {
+                sfx('uiTap', { pitch: 0.9 + i * 0.05 });
+                onPaint(i);
+              }}
+              className={`aspect-square rounded-full ring-2 transition active:scale-90 ${paint === i ? 'scale-110 ring-4 ring-white' : 'ring-white/40'}`}
+              style={{ background: `linear-gradient(135deg, ${pt.color}, ${pt.dark})` }}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-function TrackPicker({ value, onPick, disabled }: { value: number; onPick: (i: number) => void; disabled?: boolean }) {
+// Track thumbnails: the real shape of each track, worked out once
+const OUTLINES: (Float32Array | undefined)[] = [];
+const THUMB_LOOKS: (ThumbLook | undefined)[] = [];
+function trackOutline(i: number): Float32Array {
+  let o = OUTLINES[i];
+  if (!o) {
+    const t = buildTrack(TRACKS[i]);
+    const stride = 5;
+    const n = Math.floor(t.n / stride);
+    o = new Float32Array(n * 2);
+    for (let k = 0; k < n; k++) {
+      o[k * 2] = t.xs[k * stride] / WORLD_W;
+      o[k * 2 + 1] = t.ys[k * stride] / WORLD_H;
+    }
+    OUTLINES[i] = o;
+  }
+  return o;
+}
+function TrackMap({ idx, width }: { idx: number; width: number }) {
+  const t = TRACKS[idx] || TRACKS[0];
+  let look = THUMB_LOOKS[idx];
+  if (!look) {
+    look = { grass: t.grassA, grass2: t.grassB, edge: t.edge, road: t.road, curb: t.curbB, line: t.line };
+    THUMB_LOOKS[idx] = look;
+  }
+  return <TrackThumb pts={trackOutline(idx)} look={look} width={width} height={Math.round(width * 0.66)} />;
+}
+
+function TrackPicker({ value, onPick, disabled, best, laps }: { value: number; onPick: (i: number) => void; disabled?: boolean; best?: Record<string, number>; laps?: number }) {
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       {TRACKS.map((t, i) => {
         const active = i === value;
+        const bt = best?.[`${i}|${laps ?? 3}`];
         return (
           <button
             key={t.name}
             type="button"
             disabled={disabled && !active}
-            onClick={() => onPick(i)}
-            className={`rounded-2xl bg-gradient-to-br ${t.card} p-3 text-center transition active:scale-95 disabled:opacity-40 ${active ? 'scale-[1.03] shadow-xl ring-4 ring-white' : 'opacity-85 ring-2 ring-white/20 hover:opacity-100'}`}
+            aria-pressed={active}
+            onClick={() => {
+              sfx('uiTap', { pitch: 0.9 + i * 0.06 });
+              onPick(i);
+            }}
+            className={`flex flex-col items-center rounded-2xl bg-gradient-to-br ${t.card} p-2 text-center transition active:scale-95 disabled:opacity-40 ${active ? 'scale-[1.03] shadow-xl ring-4 ring-white' : 'opacity-90 ring-2 ring-white/20 hover:opacity-100'}`}
           >
-            <div className="text-4xl drop-shadow">{t.emoji}</div>
-            <div className="mt-1 text-sm font-black text-white drop-shadow">{t.name}</div>
-            <div className="mt-0.5 text-[11px] font-bold leading-tight text-white/85">{t.blurb}</div>
+            <span className="relative">
+              <TrackMap idx={i} width={132} />
+              <span className="absolute -left-1 -top-2 text-3xl drop-shadow">{t.emoji}</span>
+            </span>
+            <span className="mt-1 text-sm font-black text-white drop-shadow">{t.name}</span>
+            <span className="text-[11px] font-bold leading-tight text-white/85">{t.blurb}</span>
+            {bt ? <span className="mt-1 rounded-full bg-black/30 px-2 py-0.5 text-[11px] font-black text-yellow-200">⏱️ Best {fmtTime(bt)}</span> : null}
           </button>
         );
       })}
     </div>
+  );
+}
+
+// Every sticker a racer can collect on the trophy shelf (the award titles)
+const STICKERS = [
+  { icon: '🏆', title: 'Race Winner' }, { icon: '🔥', title: 'Drift Master' }, { icon: '🪙', title: 'Coin Collector' },
+  { icon: '🎯', title: 'Sharp Shooter' }, { icon: '🍌', title: 'Banana Boss' }, { icon: '🦘', title: 'Air Ace' },
+  { icon: '🚀', title: 'Speed Demon' }, { icon: '🛡️', title: 'Safe Driver' }, { icon: '💪', title: 'Never Give Up' },
+  { icon: '🤝', title: 'Good Sport' }, { icon: '😄', title: 'Big Smiles' }, { icon: '🌈', title: 'Rainbow Racer' },
+  { icon: '⭐', title: 'Rising Star' },
+];
+
+/** Everything this device's racer has won. */
+function TrophyShelf({ t }: { t: Trophies }) {
+  const earned = STICKERS.filter((x) => t.awards[x.title]).length;
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-3">
+        {[
+          { icon: '🏁', n: t.races, label: 'Races' },
+          { icon: '🥇', n: t.wins, label: 'Wins' },
+          { icon: '🎉', n: t.podiums, label: 'Podiums' },
+        ].map((x) => (
+          <div key={x.label} className="rounded-3xl bg-black/25 p-3 text-center text-white ring-1 ring-white/20">
+            <div className="text-3xl">{x.icon}</div>
+            <div className="text-4xl font-black leading-none">{x.n}</div>
+            <div className="text-sm font-bold text-white/80">{x.label}</div>
+          </div>
+        ))}
+      </div>
+      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+        <h3 className="mb-2 text-lg font-black text-white">Cups</h3>
+        <div className="grid grid-cols-2 gap-3">
+          {CUPS.map((c, i) => {
+            const n = t.cups[String(i)] ?? 0;
+            return (
+              <div key={c.name} className={`flex items-center gap-3 rounded-2xl p-3 text-white ${n ? `bg-gradient-to-br ${c.card} shadow-lg` : 'bg-white/10'}`}>
+                <span className={`text-5xl ${n ? '' : 'opacity-30 grayscale'}`}>🏆</span>
+                <span>
+                  <span className="block font-black leading-tight">{c.emoji} {c.name}</span>
+                  <span className="block text-sm font-bold text-white/85">{n ? `Won ${n} time${n > 1 ? 's' : ''}` : 'Not won yet'}</span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+        <h3 className="mb-2 text-lg font-black text-white">Stickers <span className="text-sm font-bold text-white/70">{earned} of {STICKERS.length}</span></h3>
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
+          {STICKERS.map((x) => {
+            const n = t.awards[x.title] ?? 0;
+            return (
+              <div key={x.title} className={`relative flex flex-col items-center rounded-2xl p-2 text-center ${n ? 'bg-white/90 shadow-lg' : 'bg-white/10'}`}>
+                <span className={`text-4xl ${n ? '' : 'opacity-25 grayscale'}`}>{n ? x.icon : '❔'}</span>
+                <span className={`mt-1 text-[10px] font-black leading-tight ${n ? 'text-slate-900' : 'text-white/60'}`}>{x.title}</span>
+                {n > 1 && <span className="absolute -right-1 -top-1 rounded-full bg-orange-500 px-1.5 text-xs font-black text-white">×{n}</span>}
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-2 text-center text-xs font-bold text-white/70">Everyone gets a sticker after every race. Can you collect them all?</p>
+      </section>
+      <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+        <h3 className="mb-2 text-lg font-black text-white">Best times</h3>
+        <div className="flex flex-col gap-2">
+          {TRACKS.map((tr, i) => (
+            <div key={tr.name} className="flex items-center gap-3 rounded-2xl bg-white/10 p-2 text-white">
+              <TrackMap idx={i} width={72} />
+              <span className="min-w-0 flex-1 truncate font-black">{tr.emoji} {tr.name}</span>
+              <span className="text-right text-sm font-bold">
+                {[3, 2].map((l) => {
+                  const b = t.best[`${i}|${l}`];
+                  return b ? <span key={l} className="block text-yellow-200">{l} laps · {fmtTime(b)}</span> : null;
+                })}
+                {!t.best[`${i}|3`] && !t.best[`${i}|2`] && <span className="text-white/50">No time yet</span>}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
+  );
+}
+
+/** How to play, in pictures and few words. */
+function HelpCards({ touch }: { touch: boolean }) {
+  const cards = [
+    { icon: '🟢', title: 'Go!', text: touch ? 'Hold the big green GAS button.' : 'Hold W or the up arrow.' },
+    { icon: '↔️', title: 'Steer', text: touch ? 'Press ◀ and ▶ to turn.' : 'A and D, or the left and right arrows.' },
+    { icon: '🔥', title: 'Drift', text: touch ? 'Hold a turn to slide. Let go for a speed boost!' : 'Hold Shift in a turn to slide. Let go for a speed boost!' },
+    { icon: '🎁', title: 'Items', text: touch ? 'Drive through a ? box, then tap the item button.' : 'Drive through a ? box, then press Space.' },
+    { icon: '⭐', title: 'Tricks', text: touch ? 'Tap ⭐ while you are in the air.' : 'Press Space while you are in the air.' },
+    { icon: '🚀', title: 'Rocket start', text: 'Press GAS just before GO!' },
+    { icon: '💨', title: 'Slipstream', text: 'Follow close behind a kart to get pulled along.' },
+    { icon: '🪙', title: 'Coins', text: 'Each coin makes you a tiny bit faster. Collect 10!' },
+  ];
+  return (
+    <>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {cards.map((c) => (
+          <div key={c.title} className="flex items-center gap-3 rounded-3xl bg-black/25 p-3 text-white ring-1 ring-white/20">
+            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl">{c.icon}</span>
+            <span>
+              <span className="block text-lg font-black leading-tight">{c.title}</span>
+              <span className="block text-sm font-bold text-white/85">{c.text}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="rounded-3xl bg-black/25 p-4 text-sm font-bold text-white/90 ring-1 ring-white/20">
+        Keyboard: W A S D or arrow keys to drive, Shift to drift, Space for items and tricks, C to switch camera, Q to look back, H to honk, Esc for the menu. Game controllers work too.
+        Little racers can turn on Toddler Assist in Settings: the kart steers by itself and nothing can spin it out.
+      </p>
+    </>
   );
 }
 
@@ -3020,6 +3275,15 @@ export default function BendanaKartPage() {
   const [netDebug, setNetDebug] = useState('');
   const [posFx, setPosFx] = useState<{ dir: number; key: number }>({ dir: 0, key: 0 });
   const [autoJoin, setAutoJoin] = useState<string | null>(null);
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [raceMenu, setRaceMenu] = useState(false);
+  const [leaveArmed, setLeaveArmed] = useState(false);
+  const [panel, setPanel] = useState<Panel>(null);
+  const [prefs, setPrefs] = useState<Prefs>({ voice: true });
+  const [trophies, setTrophies] = useState<Trophies>(emptyTrophies);
+  const [news, setNews] = useState<TrophyNews | null>(null);
+  const [canFullscreen, setCanFullscreen] = useState(false);
+  const recordedRef = useRef('');
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvas3dRef = useRef<HTMLCanvasElement | null>(null);
@@ -3086,6 +3350,15 @@ export default function BendanaKartPage() {
     } catch {
       /* storage unavailable */
     }
+    try {
+      const pr = JSON.parse(window.localStorage.getItem('bendana-kart-prefs') || 'null') as Partial<Prefs> | null;
+      if (pr && typeof pr === 'object') setPrefs({ voice: pr.voice !== false });
+    } catch {
+      /* storage unavailable */
+    }
+    setTrophies(loadTrophies());
+    setCanFullscreen(typeof document.documentElement.requestFullscreen === 'function' && document.fullscreenEnabled !== false);
+    setProfileLoaded(true);
     const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     isTouchRef.current = touch;
     setIsTouch(touch);
@@ -3097,6 +3370,8 @@ export default function BendanaKartPage() {
         setJoinCode(c);
         // Refreshed while in this room: go straight back in
         if (window.sessionStorage.getItem(`bendana-kart-joined-${c}`)) setAutoJoin(c);
+        else setPanel('family'); // came from an invite link or the QR square: show the join button
+
       }
       debugRef.current = q.has('netdebug');
       autodriveRef.current = q.has('autodrive');
@@ -3161,12 +3436,110 @@ export default function BendanaKartPage() {
     setMuted(profile.muted);
     setMusicOn(profile.music);
     setHaptics(profile.haptics);
+    if (!profileLoaded) return; // never overwrite the saved profile before it has been read
     try {
       window.localStorage.setItem('bendana-kart-profile', JSON.stringify(profile));
     } catch {
       /* storage unavailable */
     }
-  }, [profile]);
+  }, [profile, profileLoaded]);
+
+  // Settings kept outside the profile
+  useEffect(() => {
+    setVoiceOn(prefs.voice);
+    if (!profileLoaded) return;
+    try {
+      window.localStorage.setItem('bendana-kart-prefs', JSON.stringify(prefs));
+    } catch {
+      /* storage unavailable */
+    }
+  }, [prefs, profileLoaded]);
+  useEffect(() => {
+    setVoiceMuted(profile.muted);
+  }, [profile.muted]);
+
+  // Screen size, for sizing the big kart on the home screen
+  const [vp, setVp] = useState({ w: 1024, h: 768 });
+  useEffect(() => {
+    const on = () => setVp({ w: window.innerWidth, h: window.innerHeight });
+    on();
+    window.addEventListener('resize', on);
+    return () => window.removeEventListener('resize', on);
+  }, []);
+
+  /** Every tap on a menu wakes up sound and speech (browsers need a touch first). */
+  const wake = useCallback(() => {
+    unlockAudio();
+    unlockVoice();
+  }, []);
+  const openPanel = useCallback((pn: Panel) => {
+    unlockAudio();
+    unlockVoice();
+    sfx(pn ? 'uiOpen' : 'uiBack');
+    setPanel(pn);
+  }, []);
+  const closePanel = useCallback(() => {
+    sfx('uiBack');
+    setPanel(null);
+  }, []);
+
+  const toggleFullscreen = () => {
+    try {
+      if (document.fullscreenElement) void document.exitFullscreen();
+      else void document.documentElement.requestFullscreen();
+    } catch {
+      /* not allowed here */
+    }
+  };
+
+  // After each race: add it to the trophy shelf (once per race)
+  useEffect(() => {
+    if (!awards.length) return;
+    const G = gameRef.current;
+    const cfg = raceRef.current;
+    if (!G || !cfg || recordedRef.current === cfg.id) return;
+    const mine = awards.find((a) => a.isMe);
+    if (!mine) return;
+    recordedRef.current = cfg.id;
+    let cupWon = -1;
+    const cup = cupRef.current;
+    if (cup && cfg.cup >= 0 && cfg.round >= CUPS[cfg.cup].tracks.length - 1) {
+      const top = Object.entries(cup.totals).sort((a, b) => b[1].pts - a[1].pts)[0];
+      if (top && top[0] === G.meId) cupWon = cfg.cup;
+    }
+    const me = G.karts[0];
+    const res = recordRace({
+      place: mine.place, racers: awards.length, award: mine.title, track: cfg.track, laps: G.laps,
+      timeMs: me.finished && me.finishTime > 0 ? me.finishTime : 0, cupWon,
+    });
+    setTrophies(res.trophies);
+    setNews(res.news);
+    if (res.news.newBest || res.news.cupWon) sfx('record');
+    else if (res.news.newAward) sfx('sticker');
+  }, [awards]);
+
+  // Changing screens closes any open panel
+  const prevScreenRef = useRef<Screen>('menu');
+  useEffect(() => {
+    if (prevScreenRef.current === screen) return;
+    prevScreenRef.current = screen;
+    setPanel(null);
+  }, [screen]);
+
+  // Esc opens and closes the race menu
+  useEffect(() => {
+    if (screen !== 'race') {
+      setRaceMenu(false);
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Escape') return;
+      setLeaveArmed(false);
+      setRaceMenu((m) => !m);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [screen]);
 
   // Menu music, and keep the screen awake while in a room or a race
   useEffect(() => {
@@ -3204,6 +3577,9 @@ export default function BendanaKartPage() {
   const startRace = useCallback((cfg: RaceCfg) => {
     setHud(EMPTY_HUD);
     setAwards([]);
+    setNews(null);
+    setRaceMenu(false);
+    setPanel(null);
     raceRef.current = cfg;
     playedRef.current.add(cfg.id);
     readyRef.current = false;
@@ -3607,6 +3983,19 @@ export default function BendanaKartPage() {
     return () => window.clearTimeout(t);
   }, [autoStartAt, hostStart]);
 
+  // A little sound when someone comes into the room or leaves it
+  const seatCountRef = useRef(0);
+  useEffect(() => {
+    if (screen !== 'lobby') {
+      seatCountRef.current = 0;
+      return;
+    }
+    const n = Math.min(players.length, MAX_PLAYERS);
+    if (seatCountRef.current && n > seatCountRef.current) sfx('join');
+    else if (n < seatCountRef.current) sfx('leave');
+    seatCountRef.current = n;
+  }, [players.length, screen]);
+
   // Emote bubbles fade after 2 s
   useEffect(() => {
     const ids = Object.keys(emotes);
@@ -3717,11 +4106,17 @@ export default function BendanaKartPage() {
         const sky = SKIES[TRACK_IDX] || SKIES[0];
         const scene: SceneTrack = {
           xs: TRACK.xs, ys: TRACK.ys, tx: TRACK.tx, ty: TRACK.ty, n: TRACK.n, halfW: HALF_W,
-          worldW: WORLD_W, worldH: WORLD_H, ground: getTrackCanvas(true),
-          big: sceneryItems().filter((it) => it.big),
+          worldW: WORLD_W, worldH: WORLD_H, theme: TRACK_IDX, name: THEME.name,
+          colors: {
+            grassA: THEME.grassA, grassB: THEME.grassB, edge: THEME.edge, outside: THEME.outside, road: THEME.road,
+            roadInner: THEME.roadInner, curbA: THEME.curbA, curbB: THEME.curbB, line: THEME.line, dust: THEME.dust,
+          },
+          scenery: sceneryItems(),
           sky: sky.sky, horizon: sky.horizon, hills: sky.hills, night: sky.night,
-          outside: THEME.outside, edge: THEME.edge,
           ramps: FEATURES.ramps.map((r) => ({ x: r.x, y: r.y, a: r.a, len: RAMP_LEN, width: HALF_W * 2 - 10 })),
+          pads: FEATURES.pads.map((p) => ({ x: p.x, y: p.y, a: p.a, len: PAD_LEN, width: PAD_W })),
+          // Road hazards are added by the gameplay code; draw them if they exist
+          hazards: (FEATURES as { hazards?: SceneTrack['hazards'] }).hazards ?? [],
         };
         view.setTrack(scene);
       } catch {
@@ -3797,6 +4192,12 @@ export default function BendanaKartPage() {
     let lastPlace = 0;
     let scored = false;
     let debugAt = 0;
+    let podiumIds: string[] | null = null;
+    let fireworkAt = 0;
+    let saidBanner = '';
+    let saidItem: ItemKind | null = null;
+    let saidLap = 0;
+    let gaugeV = 0;
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
       let dt = (now - last) / 1000;
@@ -3884,8 +4285,21 @@ export default function BendanaKartPage() {
       }
 
       const mode = profileRef.current.cam;
-      const v = mode !== 'top' ? getView() : null;
+      // The podium is a 3D stage, so it uses the 3D view even for top-down players
+      const podiumOn = G.closedAt > 0 && now - G.closedAt > 1800;
+      if (podiumOn && !podiumIds) {
+        podiumIds = rankRacers(racers(G)).slice(0, 3).map((r) => r.id);
+        startMusic(-2);
+        fireworkAt = now + 500;
+        const mine = podiumIds.indexOf(G.meId);
+        say(mine === 0 ? 'You win! Hooray!' : mine > 0 ? 'Great race! You are on the podium!' : 'Great racing, everyone!');
+      }
+      const v = mode !== 'top' || podiumOn ? getView() : null;
       const show3d = !!v;
+      if (podiumOn && show3d && now > fireworkAt && now - G.closedAt < 30000) {
+        fireworkAt = now + 500 + Math.random() * 1100;
+        sfx('firework', { pitch: 0.8 + Math.random() * 0.5, vol: 0.5 });
+      }
       if (canvas3d && canvas3d.style.visibility !== (show3d ? 'visible' : 'hidden')) canvas3d.style.visibility = show3d ? 'visible' : 'hidden';
       if (v) {
         const karts: KartView[] = [];
@@ -3927,9 +4341,20 @@ export default function BendanaKartPage() {
           guide: showGuide(G) && me.help * 0.6 > 0.02 ? guideLine(me).map((p) => ({ x: p.x, y: p.y, c: p.c, a: p.a * me.help * 0.75 })) : null,
           orbitYaw: orbit.yaw, orbitPitch: orbit.pitch, orbitDist: orbit.dist,
           finishedFor: G.finishedAt ? now - G.finishedAt : -1,
+          podium: podiumOn ? podiumIds : null,
         });
       }
-      render(ctx, G, track, w, h, dpr, now, show3d);
+      if (podiumOn && show3d) {
+        // Nothing from the race overlay on the podium: the stage is the show
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      } else {
+        render(ctx, G, track, w, h, dpr, now, show3d);
+        if (!me.finished && G.phase === 'racing') {
+          gaugeV += (Math.hypot(me.vx, me.vy) - gaugeV) * Math.min(1, dt * 8);
+          drawSpeedGauge(ctx, w, h, dpr, gaugeV, me.stats.maxSpeed, me.boostT > 0 || me.miniT > 0 || me.padT > 0 || me.trickT > 0, isTouchRef.current, now);
+        }
+      }
       if (now - hudAt > 100) {
         hudAt = now;
         const next = computeHud(G, now);
@@ -3940,6 +4365,18 @@ export default function BendanaKartPage() {
           if (up) vibrate([15, 30, 15]);
         }
         lastPlace = next.place;
+        // Spoken callouts for racers who can't read yet
+        if (next.banner && next.banner !== saidBanner) {
+          const line = spokenFor(next.banner);
+          if (line) say(line);
+        }
+        saidBanner = next.banner ?? '';
+        if (next.item && !next.rolling && next.item !== saidItem) say(`${ITEMS[next.item].label}!`);
+        saidItem = next.rolling ? saidItem : next.item;
+        if (next.lap !== saidLap && G.phase === 'racing') {
+          if (saidLap && next.lap === next.laps && !me.finished) say('Final lap!');
+          saidLap = next.lap;
+        }
         const key = JSON.stringify(next);
         if (key !== hudKey) {
           hudKey = key;
@@ -3956,6 +4393,7 @@ export default function BendanaKartPage() {
           x: Math.round(me0.x), y: Math.round(me0.y), a: +me0.angle.toFixed(2), d: Math.round(me0.dist), v: Math.round(Math.hypot(me0.vx, me0.vy)),
           idx: me0.idx, steer: +me0.steer.toFixed(2), auto: +me0.autoSteer.toFixed(2), spin: me0.spinT > 0, wrong: +me0.wrongT.toFixed(1),
           bots: G.karts.slice(1).map((b) => ({ lap: b.lap, ft: b.finishTime, done: b.finished })),
+          music: musicDebug(), closedAt: G.closedAt, podium: podiumOn,
         };
       }
       if (debugRef.current && now - debugAt > 500) {
@@ -3982,6 +4420,7 @@ export default function BendanaKartPage() {
       window.removeEventListener('blur', onBlur);
       input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
       engineStop();
+      stopVoice();
       if (gameRef.current === G) gameRef.current = null;
       view?.dispose();
       view = null;
@@ -4036,11 +4475,25 @@ export default function BendanaKartPage() {
     }
   };
 
+  const shareLink = async () => {
+    try {
+      if (typeof navigator.share === 'function') {
+        await navigator.share({ title: 'Bendana Kart', text: `Join my race! Room ${room}`, url: shareUrl });
+        return;
+      }
+    } catch {
+      return; // closed the share sheet
+    }
+    void copyLink();
+  };
+
   const nameInput = (
     <input
       value={profile.name}
       onChange={(e) => setProfile((p) => ({ ...p, name: e.target.value.slice(0, 14) }))}
       placeholder="Your name"
+      aria-label="Your name"
+      autoComplete="off"
       maxLength={14}
       className="w-full rounded-2xl border-0 bg-white/90 px-5 py-4 text-xl font-black text-slate-900 placeholder:text-slate-400 shadow-inner outline-none focus:ring-4 focus:ring-yellow-300"
     />
@@ -4064,7 +4517,7 @@ export default function BendanaKartPage() {
         ))}
       </div>
       {value.cup < 0 && (
-        <TrackPicker value={value.track} disabled={disabled} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
+        <TrackPicker value={value.track} disabled={disabled} best={trophies.best} laps={value.laps} onPick={(i) => setProfile((p) => ({ ...p, trackIdx: i }))} />
       )}
       <div className="flex items-center gap-2 text-white">
         <span className="text-sm font-black">Laps:</span>
@@ -4086,22 +4539,44 @@ export default function BendanaKartPage() {
   const toggles = (
     <div className="flex flex-wrap gap-2">
       {([
-        ['music', profile.music ? '🎵 Music on' : '🎵 Music off'],
-        ['muted', profile.muted ? '🔇 Sound off' : '🔊 Sound on'],
-        ['haptics', profile.haptics ? '📳 Buzz on' : '📳 Buzz off'],
-      ] as const).map(([k, label]) => (
+        ['music', profile.music ? '🎵 Music on' : '🎵 Music off', profile.music],
+        ['muted', profile.muted ? '🔇 Sound off' : '🔊 Sound on', !profile.muted],
+        ['haptics', profile.haptics ? '📳 Buzz on' : '📳 Buzz off', profile.haptics],
+      ] as const).map(([k, label, on]) => (
         <button
           key={k}
           type="button"
+          aria-pressed={on}
           onClick={() => {
             unlockAudio();
             setProfile((p) => ({ ...p, [k]: !p[k] }));
+            sfx('uiToggle');
           }}
-          className="rounded-full bg-black/25 px-4 py-2 text-sm font-black text-white ring-1 ring-white/25 active:scale-95"
+          className={`rounded-full px-4 py-2 text-sm font-black ring-1 transition active:scale-95 ${on ? 'bg-white/90 text-slate-900 ring-white' : 'bg-black/25 text-white/80 ring-white/25'}`}
         >
           {label}
         </button>
       ))}
+      {voiceAvailable() && (
+        <button
+          type="button"
+          aria-pressed={prefs.voice}
+          onClick={() => {
+            unlockAudio();
+            unlockVoice();
+            const on = !prefs.voice;
+            setPrefs((p) => ({ ...p, voice: on }));
+            sfx('uiToggle');
+            if (on) {
+              setVoiceOn(true);
+              say('Voice on!');
+            }
+          }}
+          className={`rounded-full px-4 py-2 text-sm font-black ring-1 transition active:scale-95 ${prefs.voice ? 'bg-white/90 text-slate-900 ring-white' : 'bg-black/25 text-white/80 ring-white/25'}`}
+        >
+          {prefs.voice ? '🗣️ Voice on' : '🗣️ Voice off'}
+        </button>
+      )}
     </div>
   );
 
@@ -4111,83 +4586,196 @@ export default function BendanaKartPage() {
     </span>
   );
 
+  // ---------- Panels (slide over the home screen and the lobby) ----------
+  const pickers = (compact: boolean) => (
+    <KartPicker compact={compact} value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
+  );
+  const bigGo = 'bk-tile w-full bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-2xl font-black text-slate-900 disabled:opacity-50';
+  let panelEl: React.ReactNode = null;
+  if (panel === 'garage') {
+    panelEl = (
+      <Sheet title="🔧 Garage" onClose={closePanel} tone="from-sky-600 via-indigo-600 to-violet-700" footer={<button type="button" onClick={closePanel} className={bigGo}>👍 Looks great!</button>}>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black text-white">What&apos;s your name?</h3>
+          {nameInput}
+        </section>
+        {pickers(vp.h < 560)}
+      </Sheet>
+    );
+  } else if (panel === 'solo') {
+    panelEl = (
+      <Sheet
+        title="🏁 Pick your race"
+        onClose={closePanel}
+        tone="from-emerald-600 via-teal-600 to-sky-700"
+        footer={
+          <button type="button" onClick={() => startSolo(profile.trackIdx, profile.cup, 0)} className={bigGo}>
+            🏁 START! <span className="text-base font-bold opacity-75">{profile.cup >= 0 ? `${CUPS[profile.cup].emoji} ${CUPS[profile.cup].name}` : `${TRACKS[profile.trackIdx].emoji} ${TRACKS[profile.trackIdx].name}`}</span>
+          </button>
+        }
+      >
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">{raceChoice(false, { track: profile.trackIdx, cup: profile.cup, laps: profile.laps })}</section>
+        <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+      </Sheet>
+    );
+  } else if (panel === 'family') {
+    panelEl = (
+      <Sheet title="👨‍👩‍👧‍👦 Family race" onClose={closePanel} tone="from-orange-500 via-rose-500 to-fuchsia-600">
+        <p className="rounded-3xl bg-black/25 p-4 text-center text-base font-bold text-white ring-1 ring-white/20">
+          Everyone races on their own phone, tablet or computer. One person starts a room, and up to {MAX_PLAYERS} racers can join it.
+        </p>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h3 className="text-xl font-black text-white">🔑 Join a room</h3>
+            <p className="text-sm font-bold text-white/85">Type the 4 letters from the other screen.</p>
+            <input
+              value={joinCode}
+              onChange={(e) => setJoinCode(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase())}
+              onKeyDown={(e) => e.key === 'Enter' && joinRace()}
+              placeholder="CODE"
+              aria-label="Room code"
+              inputMode="text"
+              autoCapitalize="characters"
+              autoComplete="off"
+              className="w-full rounded-2xl bg-white/95 px-3 py-3 text-center text-4xl font-black tracking-[0.4em] text-slate-900 outline-none placeholder:text-slate-300 focus:ring-4 focus:ring-yellow-300"
+            />
+            <button type="button" onClick={joinRace} disabled={!multiplayerReady || joinCode.length !== 4} className="bk-tile bg-gradient-to-b from-sky-300 to-indigo-500 px-4 py-4 text-2xl font-black text-white disabled:opacity-50">
+              {joinCode.length === 4 ? `Join room ${joinCode}` : 'Join'}
+            </button>
+          </section>
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h3 className="text-xl font-black text-white">📡 Start a room</h3>
+            <p className="text-sm font-bold text-white/85">You get a code and a square to scan. Share it with your family.</p>
+            <button type="button" onClick={hostRace} disabled={!multiplayerReady} className="bk-tile mt-auto bg-gradient-to-b from-yellow-200 to-orange-400 px-4 py-4 text-2xl font-black text-slate-900 disabled:opacity-50">
+              Start a room
+            </button>
+          </section>
+        </div>
+        {netError && <p className="rounded-2xl bg-red-600/85 p-3 text-center font-bold text-white">{netError}</p>}
+      </Sheet>
+    );
+  } else if (panel === 'settings') {
+    panelEl = (
+      <Sheet title="⚙️ Settings" onClose={closePanel} tone="from-slate-700 via-slate-800 to-indigo-900">
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
+          {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black text-white">Sound</h3>
+          {toggles}
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black text-white">Camera</h3>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {CAM_MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                aria-pressed={profile.cam === m.id}
+                onClick={() => {
+                  sfx('uiTap');
+                  setProfile((p) => ({ ...p, cam: m.id }));
+                }}
+                className={`rounded-xl px-2 py-3 text-sm font-black transition active:scale-95 ${profile.cam === m.id ? 'bg-yellow-300 text-slate-900' : 'bg-white/10 text-white ring-1 ring-white/25'}`}
+              >
+                <span className="block text-2xl">{m.icon}</span>
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="rounded-3xl bg-black/25 p-4 text-white ring-1 ring-white/20">
+          <h3 className="mb-2 text-lg font-black">Screen</h3>
+          {canFullscreen && (
+            <button type="button" onClick={toggleFullscreen} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">
+              ⛶ Full screen
+            </button>
+          )}
+          <p className="mt-2 text-sm font-bold text-white/80">
+            Tip: on a phone or tablet, use your browser&apos;s &quot;Add to Home Screen&quot; to get a Bendana Kart icon that opens full screen, like an app.
+          </p>
+        </section>
+      </Sheet>
+    );
+  } else if (panel === 'trophies') {
+    panelEl = (
+      <Sheet title="🏆 Trophy shelf" onClose={closePanel} tone="from-amber-500 via-orange-600 to-rose-700">
+        <TrophyShelf t={trophies} />
+      </Sheet>
+    );
+  } else if (panel === 'help') {
+    panelEl = (
+      <Sheet title="❓ How to play" onClose={closePanel} tone="from-cyan-600 via-sky-700 to-indigo-800">
+        <HelpCards touch={isTouch} />
+      </Sheet>
+    );
+  }
+
   // ---------- Screens ----------
   if (screen === 'menu') {
+    const wide = vp.w > vp.h;
+    const heroSize = Math.round(wide ? clamp(Math.min(vp.w * 0.4, vp.h * 0.58), 150, 430) : clamp(Math.min(vp.w * 0.8, vp.h * 0.34), 160, 400));
+    const meKart = KARTS[profile.kartIdx] || KARTS[0];
+    const small = [
+      { id: 'trophies' as const, icon: '🏆', label: 'Trophies' },
+      { id: 'garage' as const, icon: '🔧', label: 'Garage' },
+      { id: 'settings' as const, icon: '⚙️', label: 'Settings' },
+      { id: 'help' as const, icon: '❓', label: 'Help' },
+    ];
     return (
-      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-sky-500 via-fuchsia-500 to-amber-400 px-4 py-6 sm:py-10" onPointerDown={() => unlockAudio()}>
-        <div className="mx-auto flex max-w-3xl flex-col gap-5">
-          <header className="text-center">
-            <h1 className="text-5xl font-black tracking-tight text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.25)] sm:text-6xl">
-              Bendana Kart 🏁
-            </h1>
-            <p className="mt-2 text-lg font-bold text-white/90">Race your family from any phone, tablet or computer.</p>
-          </header>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">1. What&apos;s your name?</h2>
-            {nameInput}
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">2. Pick your racer and kart</h2>
-            <KartPicker value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">3. One race or a cup?</h2>
-            {raceChoice(false, { track: profile.trackIdx, cup: profile.cup, laps: profile.laps })}
-          </section>
-
-          <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
-            <div className="mt-3">{toggles}</div>
-          </section>
-
-          <section className="grid gap-3 rounded-3xl bg-black/20 p-4 backdrop-blur sm:grid-cols-3 sm:p-5">
-            <button
-              type="button"
-              onClick={() => startSolo(profile.trackIdx, profile.cup, 0)}
-              className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 px-4 py-5 text-xl font-black text-slate-900 shadow-lg active:scale-95"
-            >
-              🏁 Practice
-              <span className="block text-sm font-bold opacity-75">vs. 4 robot karts</span>
+      <main className="relative min-h-[100dvh] w-full overflow-x-hidden" onPointerDown={wake}>
+        <HomeBackdrop />
+        <div className={`relative mx-auto grid min-h-[100dvh] max-w-5xl content-center items-center gap-3 px-4 py-[max(1rem,env(safe-area-inset-top))] ${wide ? 'grid-cols-2 gap-6' : 'grid-cols-1'}`}>
+          <div className="flex flex-col items-center">
+            <Logo small={vp.h < 560 || vp.w < 380} />
+            <button type="button" onClick={() => openPanel('garage')} className="group relative mt-1 flex flex-col items-center" aria-label="Change your racer">
+              <span className="absolute bottom-9 h-[18%] w-[70%] rounded-[50%] bg-slate-900/25 blur-md" aria-hidden />
+              <KartTurntable kartIdx={profile.kartIdx} paint={profile.paint} body={profile.body} size={heroSize} />
+              <span className={`-mt-2 flex items-center gap-2 rounded-full bg-slate-900/85 py-1.5 pl-2 pr-4 text-white shadow-xl ring-2 ring-white/50 transition group-active:scale-95 ${profile.name ? '' : 'bk-wiggle'}`}>
+                <FaceIcon emoji={meKart.emoji} size={34} happy />
+                <span className="text-left leading-tight">
+                  <span className="block text-lg font-black">{profile.name || 'Tap to pick your racer'}</span>
+                  <span className="block text-xs font-bold text-white/75">{meKart.name} · {BODIES[profile.body]?.name ?? 'Classic'} kart ✏️</span>
+                </span>
+              </span>
             </button>
-            <button
-              type="button"
-              onClick={hostRace}
-              disabled={!multiplayerReady}
-              className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 px-4 py-5 text-xl font-black text-slate-900 shadow-lg active:scale-95 disabled:opacity-50"
-            >
-              📡 Host Race
-              <span className="block text-sm font-bold opacity-75">get a room code</span>
+          </div>
+
+          <div className="mx-auto flex w-full max-w-md flex-col gap-3">
+            <button type="button" onClick={() => openPanel('solo')} className="bk-tile flex items-center gap-4 bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-left text-slate-900 sm:py-5">
+              <span className="text-5xl drop-shadow sm:text-6xl">🏁</span>
+              <span>
+                <span className="block text-3xl font-black leading-none sm:text-4xl">PLAY</span>
+                <span className="block text-sm font-bold opacity-75 sm:text-base">Race the robot karts</span>
+              </span>
             </button>
-            <div className="flex flex-col gap-2 rounded-2xl bg-white/15 p-3">
-              <input
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase())}
-                placeholder="CODE"
-                inputMode="text"
-                autoCapitalize="characters"
-                className="w-full rounded-xl bg-white/90 px-3 py-2 text-center text-2xl font-black tracking-[0.4em] text-slate-900 outline-none placeholder:text-slate-400 focus:ring-4 focus:ring-yellow-300"
-              />
-              <button
-                type="button"
-                onClick={joinRace}
-                disabled={!multiplayerReady || joinCode.length !== 4}
-                className="rounded-xl bg-gradient-to-b from-sky-300 to-indigo-500 px-3 py-2 text-lg font-black text-white shadow active:scale-95 disabled:opacity-50"
-              >
-                🔑 Join Race
-              </button>
+            <button type="button" onClick={() => openPanel('family')} className="bk-tile flex items-center gap-4 bg-gradient-to-b from-yellow-200 to-orange-400 px-5 py-4 text-left text-slate-900 sm:py-5">
+              <span className="text-5xl drop-shadow sm:text-6xl">👨‍👩‍👧‍👦</span>
+              <span>
+                <span className="block text-3xl font-black leading-none sm:text-4xl">FAMILY RACE</span>
+                <span className="block text-sm font-bold opacity-75 sm:text-base">Everyone on their own screen</span>
+              </span>
+            </button>
+            <div className="grid grid-cols-4 gap-2">
+              {small.map((b) => (
+                <button key={b.id} type="button" onClick={() => openPanel(b.id)} className="bk-tile flex flex-col items-center bg-white/90 px-1 py-2.5 text-slate-900" style={{ borderRadius: '1.25rem' }}>
+                  <span className="text-3xl">{b.icon}</span>
+                  <span className="text-xs font-black sm:text-sm">{b.label}</span>
+                </button>
+              ))}
             </div>
-          </section>
-
-          {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
-
-          <p className="pb-4 text-center text-sm font-semibold text-white/85">
-            Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item (or do a trick in the air), C to switch camera, Q to look back, H to honk. Game controllers work too. On a tablet, use the big buttons, hold a turn to drift, and tap ⭐ in the air for a trick.
-          </p>
+            {trophies.races > 0 && (
+              <div className="flex flex-wrap justify-center gap-2 text-sm font-black text-slate-900">
+                <span className="rounded-full bg-white/80 px-3 py-1">🏁 {trophies.races} race{trophies.races > 1 ? 's' : ''}</span>
+                {trophies.wins > 0 && <span className="rounded-full bg-white/80 px-3 py-1">🥇 {trophies.wins} win{trophies.wins > 1 ? 's' : ''}</span>}
+                <span className="rounded-full bg-white/80 px-3 py-1">⭐ {STICKERS.filter((x) => trophies.awards[x.title]).length}/{STICKERS.length} stickers</span>
+              </div>
+            )}
+            {netError && !panel && <p className="rounded-2xl bg-red-600/85 p-3 text-center font-bold text-white">{netError}</p>}
+          </div>
         </div>
+        {panelEl}
       </main>
     );
   }
@@ -4197,102 +4785,142 @@ export default function BendanaKartPage() {
     const hp = host ? parseMeta(host.id, rosterRef.current.get(host.id)) : null;
     const shown = isHost ? { track: profile.trackIdx, cup: profile.cup, laps: profile.laps } : { track: hp?.trackIdx ?? 0, cup: hp?.cup ?? -1, laps: hp?.laps ?? 3 };
     const conn = rtt < 0 ? null : rtt < 150 ? '🟢' : rtt < 350 ? '🟡' : '🔴';
+    const seats = players.slice(0, MAX_PLAYERS);
+    const meKart = KARTS[profile.kartIdx] || KARTS[0];
+    const waiting = seats.filter((p) => !p.ready && !(host && p.id === host.id)).length;
+    const shortScreen = vp.h < 520;
     return (
-      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 px-4 py-6 sm:py-10" onPointerDown={() => unlockAudio()}>
-        <div className="mx-auto flex max-w-2xl flex-col gap-5">
-          <header className="text-center">
-            <p className="text-sm font-black uppercase tracking-widest text-white/80">Room code</p>
-            <div className="mt-1 text-7xl font-black tracking-[0.25em] text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.3)]">{room}</div>
-            <p className="mt-2 font-bold text-white/90">On the other devices, open Bendana Kart, tap Join Race and type this code.</p>
-            {shareUrl && (
-              <button type="button" onClick={copyLink} className="mt-3 rounded-full bg-white/20 px-4 py-2 text-sm font-bold text-white ring-1 ring-white/40 active:scale-95">
-                {copied ? '✅ Link copied' : '🔗 Copy invite link'}
-              </button>
-            )}
+      <main className="min-h-[100dvh] w-full overflow-y-auto bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 px-4 pb-32 pt-[max(1rem,env(safe-area-inset-top))]" onPointerDown={wake}>
+        <div className="mx-auto flex max-w-3xl flex-col gap-4">
+          {/* How to get in: the code, the square to scan, and a link to send */}
+          <header className={`flex flex-col items-center rounded-3xl bg-black/25 ring-1 ring-white/20 sm:flex-row sm:justify-center ${shortScreen ? 'gap-3 p-2 sm:gap-5' : 'gap-4 p-4 sm:gap-8'}`}>
+            <div className="text-center">
+              <p className="text-sm font-black uppercase tracking-widest text-white/80">Room code</p>
+              <div className={`font-black tracking-[0.2em] text-white drop-shadow-[0_4px_0_rgba(0,0,0,0.3)] ${shortScreen ? 'text-5xl' : 'text-7xl sm:text-8xl'}`}>{room}</div>
+              <p className="mx-auto mt-1 max-w-xs text-sm font-bold text-white/90">
+                {shortScreen ? 'Scan the square, or tap Family Race and type the code.' : 'On another device, point the camera at the square. Or open Bendana Kart, tap Family Race and type the code.'}
+              </p>
+              {shareUrl && (
+                <div className={`flex flex-wrap justify-center gap-2 ${shortScreen ? 'mt-1' : 'mt-3'}`}>
+                  <button type="button" onClick={shareLink} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">📤 Send invite</button>
+                  <button type="button" onClick={copyLink} className="rounded-full bg-white/20 px-4 py-2 text-sm font-black text-white ring-1 ring-white/40 active:scale-95">
+                    {copied ? '✅ Link copied' : '🔗 Copy link'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {shareUrl && <QrCode text={shareUrl} size={shortScreen ? 116 : 168} />}
           </header>
 
-          <section className="rounded-3xl bg-black/25 p-4 backdrop-blur">
+          <section className="rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
             <div className="mb-3 flex items-center justify-between gap-2">
-              <h2 className="text-lg font-black text-white">Racers ({Math.min(players.length, MAX_PLAYERS)}/{MAX_PLAYERS})</h2>
+              <h2 className="text-lg font-black text-white">Racers {seats.length}/{MAX_PLAYERS}</h2>
               <div className="flex items-center gap-2">
                 {!isHost && conn && <span className="rounded-full bg-black/30 px-2 py-1 text-xs font-black text-white">{conn} {rtt} ms</span>}
                 {statusBadge(netStatus)}
               </div>
             </div>
-            <ul className="flex flex-col gap-2">
-              {players.slice(0, MAX_PLAYERS).map((p) => (
-                <li
-                  key={p.id}
-                  className={`relative flex items-center gap-3 rounded-2xl px-4 py-3 text-white shadow transition ${p.ready || (host && p.id === host.id) ? 'ring-4 ring-lime-300' : ''}`}
-                  style={{ background: `linear-gradient(90deg, ${kartColors(p.kartIdx, p.paint).color}, ${kartColors(p.kartIdx, p.paint).dark})` }}
-                >
-                  <span className="text-4xl">{KARTS[p.kartIdx].emoji}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xl font-black">
-                      {p.name} {p.id === myId && <span className="text-sm opacity-80">(you)</span>}
+            <ul className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {Array.from({ length: MAX_PLAYERS }, (_, i) => {
+                const p = seats[i];
+                if (!p) {
+                  return (
+                    <li key={`empty-${i}`} className="flex min-h-[8.5rem] flex-col items-center justify-center rounded-2xl border-2 border-dashed border-white/35 text-white/60">
+                      <span className="text-3xl">＋</span>
+                      <span className="text-xs font-black">{players.length === 0 ? 'Connecting…' : 'Open seat'}</span>
+                    </li>
+                  );
+                }
+                const col = kartColors(p.kartIdx, p.paint);
+                const isH = !!host && p.id === host.id;
+                return (
+                  <li
+                    key={p.id}
+                    className={`relative flex min-h-[8.5rem] flex-col items-center justify-center rounded-2xl px-2 py-2 text-center text-white shadow-lg transition ${p.ready || isH ? 'ring-4 ring-lime-300' : 'ring-2 ring-white/25'}`}
+                    style={{ background: `linear-gradient(160deg, ${col.color}, ${col.dark})`, animation: 'bk-pop 0.35s ease-out both' }}
+                  >
+                    {isH && <span className="absolute -top-3 left-1/2 -translate-x-1/2 text-2xl drop-shadow" title="Host">👑</span>}
+                    {p.toddler && <span className="absolute right-1 top-1 text-lg" title="Toddler Assist">🛡️</span>}
+                    {emotes[p.id] && <span key={emotes[p.id].key} className="absolute -right-1 -top-3 animate-bounce text-4xl">{emotes[p.id].e}</span>}
+                    <FaceIcon emoji={KARTS[p.kartIdx].emoji} size={54} happy={p.ready || isH} />
+                    <span className="mt-1 block max-w-full truncate text-base font-black leading-tight drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">{p.name}</span>
+                    <span className="block text-[11px] font-bold opacity-90">{p.id === myId ? 'That’s you!' : KARTS[p.kartIdx].name}</span>
+                    <span className={`mt-1 rounded-full px-2 py-0.5 text-[11px] font-black ${isH ? 'bg-yellow-300 text-yellow-950' : p.ready ? 'bg-lime-300 text-lime-950' : 'bg-black/30'}`}>
+                      {isH ? 'HOST' : p.ready ? '✅ READY' : 'Getting ready…'}
                     </span>
-                    <span className="block text-sm font-bold opacity-85">{KARTS[p.kartIdx].name} · {BODIES[p.body]?.name ?? 'Classic'}</span>
-                  </span>
-                  {emotes[p.id] && <span key={emotes[p.id].key} className="animate-bounce text-4xl">{emotes[p.id].e}</span>}
-                  {p.toddler && <span className="text-2xl" title="Toddler Assist">🛡️</span>}
-                  {host && p.id === host.id ? <span className="text-2xl" title="Host">👑</span> : p.ready ? <span className="rounded-full bg-lime-300 px-2 py-1 text-xs font-black text-lime-950">✅ READY</span> : <span className="rounded-full bg-black/25 px-2 py-1 text-xs font-black">…</span>}
-                </li>
-              ))}
-              {players.length === 0 && <li className="rounded-2xl bg-white/10 p-4 text-center font-bold text-white/80">Connecting to the room…</li>}
+                  </li>
+                );
+              })}
             </ul>
-            {players.length === 1 && netStatus === 'joined' && (
-              <p className="mt-3 text-center text-sm font-bold text-white/80">Waiting for others to join…</p>
-            )}
             <div className="mt-3 flex flex-wrap justify-center gap-2">
               {EMOTES.map((e) => (
-                <button key={e} type="button" onClick={() => sendEmote(e)} className="h-12 w-12 rounded-full bg-white/15 text-2xl ring-1 ring-white/25 active:scale-90">
+                <button key={e} type="button" onClick={() => sendEmote(e)} aria-label={`Send ${e}`} className="h-12 w-12 rounded-full bg-white/15 text-2xl ring-1 ring-white/25 active:scale-90">
                   {e}
                 </button>
               ))}
             </div>
           </section>
 
-          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
-            <h2 className="text-lg font-black text-white">{isHost ? 'Pick the race' : `Race (👑 ${hostName} picks)`}</h2>
-            {raceChoice(!isHost, shown)}
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <h2 className="text-lg font-black text-white">{isHost ? 'Pick the race' : `The race (👑 ${hostName} picks)`}</h2>
+            {isHost ? (
+              raceChoice(false, shown)
+            ) : (
+              <div className={`flex items-center gap-4 rounded-2xl bg-gradient-to-br p-3 text-white ${shown.cup >= 0 ? CUPS[shown.cup].card : TRACKS[shown.track].card}`}>
+                {shown.cup >= 0 ? <span className="text-6xl drop-shadow">{CUPS[shown.cup].emoji}</span> : <TrackMap idx={shown.track} width={132} />}
+                <span>
+                  <span className="block text-2xl font-black leading-tight drop-shadow">{shown.cup >= 0 ? CUPS[shown.cup].name : `${TRACKS[shown.track].emoji} ${TRACKS[shown.track].name}`}</span>
+                  <span className="block text-sm font-bold text-white/90">
+                    {shown.cup >= 0 ? CUPS[shown.cup].tracks.map((t) => TRACKS[t].emoji).join(' ') : TRACKS[shown.track].blurb} · {shown.laps} laps
+                  </span>
+                </span>
+              </div>
+            )}
           </section>
 
-          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
-            <h2 className="text-lg font-black text-white">Your kart</h2>
-            {nameInput}
-            <KartPicker compact value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
+          <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 ring-1 ring-white/20">
+            <div className="flex items-center gap-3 rounded-2xl p-3 text-white" style={{ background: `linear-gradient(135deg, ${kartColors(profile.kartIdx, profile.paint).color}, ${kartColors(profile.kartIdx, profile.paint).dark})` }}>
+              <FaceIcon emoji={meKart.emoji} size={52} happy />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-xl font-black leading-tight drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">{profile.name || 'Racer'}</span>
+                <span className="block text-sm font-bold opacity-90">{meKart.name} · {BODIES[profile.body]?.name ?? 'Classic'} kart</span>
+              </span>
+              <button type="button" onClick={() => openPanel('garage')} className="rounded-full bg-white/90 px-4 py-2 text-sm font-black text-slate-900 active:scale-95">✏️ Change</button>
+              <button type="button" onClick={() => openPanel('settings')} aria-label="Settings" className="flex h-10 w-10 items-center justify-center rounded-full bg-black/30 text-xl ring-1 ring-white/30 active:scale-95">⚙️</button>
+            </div>
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
-            {toggles}
           </section>
 
           {netError && <p className="rounded-2xl bg-red-600/80 p-3 text-center font-bold text-white">{netError}</p>}
+        </div>
 
-          <div className="sticky bottom-3 flex flex-col gap-3 pb-6 sm:flex-row">
-            <button type="button" onClick={quitToMenu} className="rounded-2xl bg-white/20 px-5 py-4 text-lg font-black text-white ring-2 ring-white/30 backdrop-blur active:scale-95">
-              ← Leave
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-white/15 bg-slate-950/60 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur-md">
+          <div className="mx-auto flex max-w-3xl gap-3">
+            <button type="button" onClick={quitToMenu} aria-label="Leave the room" className="rounded-2xl bg-white/20 px-4 py-4 text-lg font-black text-white ring-2 ring-white/30 active:scale-95">
+              ←<span className="hidden sm:inline"> Leave</span>
             </button>
             {isHost ? (
               <button
                 type="button"
                 onClick={() => hostStart()}
                 disabled={netStatus !== 'joined'}
-                className="flex-1 rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 px-5 py-4 text-2xl font-black text-slate-900 shadow-xl active:scale-95 disabled:opacity-50"
+                className="bk-tile flex-1 bg-gradient-to-b from-lime-300 to-green-500 px-4 py-4 text-xl font-black text-slate-900 disabled:opacity-50 sm:text-2xl"
               >
-                {autoStartAt ? '🏁 Everyone is ready! Starting…' : '🏁 Start Race!'}
+                {autoStartAt ? '🏁 Everyone is ready! Starting…' : seats.length > 1 && waiting > 0 ? `🏁 Start now (${waiting} still getting ready)` : '🏁 Start Race!'}
               </button>
             ) : (
               <button
                 type="button"
                 onClick={toggleReady}
                 disabled={netStatus !== 'joined'}
-                className={`flex-1 rounded-2xl px-5 py-4 text-2xl font-black shadow-xl active:scale-95 disabled:opacity-50 ${ready ? 'bg-lime-300 text-lime-950 ring-4 ring-white' : 'bg-gradient-to-b from-yellow-200 to-orange-400 text-slate-900'}`}
+                className={`bk-tile flex-1 px-4 py-4 text-xl font-black disabled:opacity-50 sm:text-2xl ${ready ? 'bg-lime-300 text-lime-950 ring-4 ring-white' : 'bg-gradient-to-b from-yellow-200 to-orange-400 text-slate-900'}`}
               >
                 {ready ? `✅ Ready! Waiting for 👑 ${hostName}` : '👍 I’m Ready!'}
               </button>
             )}
           </div>
         </div>
+        {panelEl}
       </main>
     );
   }
@@ -4313,7 +4941,7 @@ export default function BendanaKartPage() {
       </div>
 
       {/* Top HUD */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+      <div className={`pointer-events-none absolute inset-x-0 top-0 items-start justify-between gap-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))] ${hud.podium ? 'hidden' : 'flex'}`}>
         <div className="rounded-2xl bg-slate-900/70 px-4 py-2 text-white shadow-lg ring-1 ring-white/20">
           <div
             key={posFx.key}
@@ -4355,34 +4983,31 @@ export default function BendanaKartPage() {
           </button>
           <button
             type="button"
-            onClick={() => setProfile((p) => ({ ...p, muted: !p.muted }))}
-            className="pointer-events-auto rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
-            aria-label={profile.muted ? 'Sound on' : 'Sound off'}
-          >
-            {profile.muted ? '🔇' : '🔊'}
-          </button>
-          <button
-            type="button"
-            onClick={race?.mode === 'multi' ? backToLobby : quitToMenu}
+            onClick={() => {
+              sfx('uiOpen');
+              setLeaveArmed(false);
+              setRaceMenu(true);
+            }}
             className="pointer-events-auto whitespace-nowrap rounded-full bg-slate-900/70 px-3 py-2 text-sm font-black text-white ring-1 ring-white/20 active:scale-95"
-            aria-label="Quit"
+            aria-label="Menu"
+            title="Menu (Esc)"
           >
-            ✕<span className="ml-1 hidden sm:inline">Quit</span>
+            ☰<span className="ml-1 hidden sm:inline">Menu</span>
           </button>
         </div>
       </div>
 
       {/* Race strip: everyone's face along the race */}
-      <div className="pointer-events-none absolute left-1/2 top-[6.6rem] h-9 w-[min(70vw,520px)] -translate-x-1/2 sm:top-[7.4rem]">
+      <div className={`pointer-events-none absolute left-1/2 top-[6.6rem] h-9 w-[min(70vw,520px)] -translate-x-1/2 sm:top-[7.4rem] ${hud.podium ? 'hidden' : ''}`}>
         <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-slate-900/50 ring-1 ring-white/30" />
         <div className="absolute right-0 top-1/2 -translate-y-1/2 translate-x-3 text-lg">🏁</div>
         {hud.standings.map((s) => (
           <div
             key={s.id}
-            className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 transition-[left] duration-100 ${s.isMe ? 'z-10 text-3xl drop-shadow-[0_0_6px_#fde047]' : 'text-2xl'}`}
+            className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 transition-[left] duration-100 ${s.isMe ? 'z-10 drop-shadow-[0_0_6px_#fde047]' : 'opacity-90'}`}
             style={{ left: `${Math.round(s.frac * 1000) / 10}%` }}
           >
-            {KARTS[s.kartIdx].emoji}
+            <FaceIcon emoji={KARTS[s.kartIdx].emoji} size={s.isMe ? 36 : 27} />
           </div>
         ))}
       </div>
@@ -4394,7 +5019,7 @@ export default function BendanaKartPage() {
         <pre className="pointer-events-none absolute bottom-40 left-2 max-w-[90vw] whitespace-pre-wrap rounded-xl bg-black/70 p-2 text-[11px] leading-tight text-lime-200">{netDebug}</pre>
       )}
 
-      {profile.toddler && (
+      {profile.toddler && !hud.finished && hud.countdown === null && (
         <div className="pointer-events-none absolute left-1/2 top-[9.4rem] -translate-x-1/2 rounded-full bg-sky-400/90 px-4 py-1 text-sm font-black text-slate-900 shadow sm:top-40">
           🛡️ Toddler Assist on: just hold GAS!
         </div>
@@ -4426,7 +5051,7 @@ export default function BendanaKartPage() {
           <div className="animate-pulse rounded-3xl bg-red-600/90 px-6 py-3 text-4xl font-black text-white shadow-2xl">↻ WRONG WAY</div>
         </div>
       )}
-      {(hud.tier > 0 || hud.draft) && (
+      {(hud.tier > 0 || hud.draft) && !hud.finished && (
         <div className="pointer-events-none absolute inset-x-0 bottom-36 flex justify-center gap-2 sm:bottom-40">
           {hud.tier > 0 && (
             <div className="rounded-full px-5 py-1 text-xl font-black text-white shadow-lg" style={{ background: ['', '#3b82f6', '#f97316', '#d946ef'][hud.tier] }}>
@@ -4440,6 +5065,14 @@ export default function BendanaKartPage() {
       {/* Countdown with start lights */}
       {hud.countdown !== null && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4">
+          {race && (hud.countdown > 3 || (hud.countdown > 0 && vp.h >= 520)) && (
+            <div className="mx-4 rounded-3xl bg-slate-900/75 px-7 py-4 text-center text-white shadow-2xl ring-2 ring-white/30" style={{ animation: 'bk-pop 0.5s ease-out both' }}>
+              {cupInfo && <div className="text-sm font-black uppercase tracking-widest text-yellow-300">{cupInfo.emoji} {cupInfo.name} · Race {race.round + 1} of {cupInfo.tracks.length}</div>}
+              <div className="text-4xl font-black drop-shadow sm:text-5xl">{TRACKS[race.track].emoji} {TRACKS[race.track].name}</div>
+              <div className="mt-1 text-base font-bold text-white/85">{TRACKS[race.track].blurb} · {hud.laps} laps</div>
+              {hud.countdown > 3 && <div className="mt-1 text-xl font-black text-lime-300">Get ready…</div>}
+            </div>
+          )}
           <div className="flex gap-3 rounded-full bg-slate-900/75 px-4 py-3 shadow-2xl ring-2 ring-white/30">
             {[3, 2, 1].map((n) => {
               const on = hud.countdown !== null && hud.countdown > 0 && hud.countdown <= n;
@@ -4453,7 +5086,6 @@ export default function BendanaKartPage() {
           >
             {hud.countdown === 0 ? 'GO!' : hud.countdown > 3 ? '' : hud.countdown}
           </div>
-          {hud.countdown > 3 && <div className="text-3xl font-black text-white drop-shadow">Get ready…</div>}
         </div>
       )}
       {hud.countdown !== null && hud.countdown > 0 && !isTouch && (
@@ -4513,140 +5145,193 @@ export default function BendanaKartPage() {
         </div>
       )}
 
-      {/* Finished, waiting for the others */}
+      {/* Finished, waiting for the others: a small card, so the victory lap stays in view */}
       {hud.finished && !hud.podium && (
-        <div className="absolute inset-0 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-3xl bg-gradient-to-br from-yellow-300 via-orange-400 to-pink-500 p-1 shadow-2xl">
-            <div className="rounded-[1.4rem] bg-slate-900/90 p-5 text-white">
-              <div className="text-center text-6xl">{hud.place === 1 ? '🏆' : hud.place === 2 ? '🥈' : hud.place === 3 ? '🥉' : '🎉'}</div>
-              <h2 className="mt-1 text-center text-3xl font-black">You finished {ordinal(hud.place)}!</h2>
-              {hud.improved && <p className="mt-1 text-center text-base font-black text-yellow-200">🌟 Your driving is getting better!</p>}
-              <ol className="mt-4 flex flex-col gap-2">
-                {hud.standings.map((s) => (
-                  <li key={s.id} className={`flex items-center gap-3 rounded-xl px-3 py-2 ${s.isMe ? 'bg-white/20 ring-2 ring-yellow-300' : 'bg-white/10'}`}>
-                    <span className="w-10 text-lg font-black">{ordinal(s.place)}</span>
-                    <span className="text-2xl">{KARTS[s.kartIdx].emoji}</span>
-                    <span className="flex-1 truncate font-bold">{s.name}</span>
-                    <span className="text-sm font-bold text-white/80">{s.time ?? (s.done ? '—' : 'racing…')}</span>
-                  </li>
+        <div className="pointer-events-none absolute inset-x-0 top-[8.5rem] flex justify-center px-3 sm:top-[9.5rem] landscape:justify-start">
+          <div className="pointer-events-auto w-full max-w-[19rem] rounded-3xl bg-slate-900/80 p-3 text-white shadow-2xl ring-2 ring-white/25" style={{ animation: 'bk-pop 0.45s ease-out both' }}>
+            <div className="flex items-center gap-2">
+              <span className="text-4xl">{hud.place === 1 ? '🏆' : hud.place === 2 ? '🥈' : hud.place === 3 ? '🥉' : '🎉'}</span>
+              <span>
+                <span className="block text-xl font-black leading-tight">You finished {ordinal(hud.place)}!</span>
+                <span className="block text-xs font-bold text-white/75">{hud.improved ? '🌟 Your driving is getting better!' : 'Waiting for everyone to finish…'}</span>
+              </span>
+            </div>
+            <ol className="mt-2 flex flex-col gap-1">
+              {hud.standings.map((s) => (
+                <li key={s.id} className={`flex items-center gap-2 rounded-xl px-2 py-0.5 text-sm ${s.isMe ? 'bg-white/20 ring-1 ring-yellow-300' : 'bg-white/10'}`}>
+                  <span className="w-8 font-black">{ordinal(s.place)}</span>
+                  <FaceIcon emoji={KARTS[s.kartIdx].emoji} size={22} />
+                  <span className="flex-1 truncate font-bold">{s.name}</span>
+                  <span className="text-xs font-bold text-white/75">{s.time ?? (s.done ? '—' : 'racing…')}</span>
+                </li>
+              ))}
+            </ol>
+            {race?.mode === 'multi' && (
+              <div className="mt-2 flex flex-wrap justify-center gap-1.5">
+                {EMOTES.map((e) => (
+                  <button key={e} type="button" onClick={() => sendEmote(e)} className="h-10 w-10 rounded-full bg-white/15 text-xl active:scale-90">{e}</button>
                 ))}
-              </ol>
-              <p className="mt-4 text-center text-sm font-bold text-white/80">Waiting for everyone to finish…</p>
-              {race?.mode === 'multi' && (
-                <div className="mt-3 flex flex-wrap justify-center gap-2">
-                  {EMOTES.map((e) => (
-                    <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Podium: the winners stand on the 3D stage, the results slide in below (or beside) it */}
+      {hud.podium && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col justify-between landscape:flex-row">
+          <Confetti />
+          <div className="relative flex-1 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] text-center">
+            <h2 className={`inline-block rounded-full bg-slate-900/70 px-5 py-2 font-black text-white shadow-xl ring-2 ring-white/25 ${vp.h < 520 ? 'text-lg' : 'text-2xl sm:text-3xl'}`} style={{ animation: 'bk-pop 0.5s ease-out both' }}>
+              {cupInfo ? `${cupInfo.emoji} ${cupInfo.name} · Race ${race!.round + 1}/${cupInfo.tracks.length}` : `🏁 ${race ? TRACKS[race.track].name : 'Race'} results`}
+            </h2>
+          </div>
+          <div
+            className="pointer-events-auto relative max-h-[54%] overflow-y-auto rounded-t-[2rem] bg-slate-950/80 p-3 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-[0_-10px_40px_rgba(0,0,0,0.45)] ring-1 ring-white/20 backdrop-blur-md landscape:h-full landscape:max-h-full landscape:w-[42%] landscape:max-w-md landscape:rounded-l-[2rem] landscape:rounded-tr-none landscape:pt-[max(0.75rem,env(safe-area-inset-top))]"
+            style={{ animation: 'bk-rise 0.6s 0.2s ease-out both', touchAction: 'pan-y' }}
+          >
+            <div className="mx-auto flex max-w-lg flex-col gap-2.5">
+              {news && (news.newBest || news.newAward || news.cupWon || news.firstWin) && (
+                <div className="flex flex-wrap justify-center gap-1.5">
+                  {news.cupWon && cupInfo && <span className="rounded-full bg-yellow-300 px-3 py-1 text-sm font-black text-yellow-950" style={{ animation: 'bk-pop 0.4s 1.2s both' }}>🏆 You won the {cupInfo.name}!</span>}
+                  {news.firstWin && <span className="rounded-full bg-yellow-300 px-3 py-1 text-sm font-black text-yellow-950" style={{ animation: 'bk-pop 0.4s 1.3s both' }}>🥇 Your first win!</span>}
+                  {news.newBest && <span className="rounded-full bg-lime-300 px-3 py-1 text-sm font-black text-lime-950" style={{ animation: 'bk-pop 0.4s 1.4s both' }}>⏱️ New best time!</span>}
+                  {news.newAward && <span className="rounded-full bg-fuchsia-300 px-3 py-1 text-sm font-black text-fuchsia-950" style={{ animation: 'bk-pop 0.4s 1.5s both' }}>⭐ New sticker for your shelf!</span>}
+                </div>
+              )}
+              <div className="grid gap-1.5 sm:grid-cols-2 landscape:grid-cols-1">
+                {awards.map((a, i) => (
+                  <div
+                    key={a.id}
+                    className={`flex items-center gap-2.5 rounded-2xl px-3 py-1.5 text-white shadow ${a.isMe ? 'bg-white/25 ring-2 ring-yellow-300' : 'bg-white/10'}`}
+                    style={{ animation: `bk-pop 0.4s ${0.6 + i * 0.2}s both` }}
+                  >
+                    <span className="w-8 text-center text-xl font-black">{['🥇', '🥈', '🥉'][a.place - 1] ?? ordinal(a.place)}</span>
+                    <FaceIcon emoji={KARTS[a.kartIdx].emoji} size={34} happy />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-black leading-tight">{a.name}</span>
+                      <span className="block text-sm font-bold leading-tight text-yellow-200">{a.icon} {a.title}</span>
+                    </span>
+                    <span className="text-xs font-bold text-white/70">{a.time ?? ''}</span>
+                  </div>
+                ))}
+              </div>
+              {cupView && cupTable.length > 0 && (
+                <div className="rounded-2xl bg-black/30 p-3 text-white">
+                  <div className="mb-1 text-center text-base font-black">{lastRound ? '🏆 Final cup points' : '📊 Cup points'}</div>
+                  {cupTable.map(([id, t], i) => (
+                    <div key={id} className="flex items-center gap-2 py-0.5 text-sm font-bold">
+                      <span className="w-6">{lastRound && i === 0 ? '🏆' : i + 1}</span>
+                      <FaceIcon emoji={KARTS[t.kartIdx]?.emoji ?? '🏎️'} size={22} />
+                      <span className="flex-1 truncate">{t.name}</span>
+                      <span className="font-black text-yellow-300">{t.pts}</span>
+                    </div>
                   ))}
                 </div>
               )}
+              <div className="flex flex-col gap-2">
+                {race?.mode === 'solo' && (
+                  <button
+                    type="button"
+                    onClick={() => (cupInfo && !lastRound ? startSolo(0, race.cup, race.round + 1) : startSolo(profile.trackIdx, cupInfo ? race.cup : -1, 0))}
+                    className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 shadow-lg active:scale-95"
+                  >
+                    {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : cupInfo ? '🔁 Play the cup again' : '🔁 Race again'}
+                  </button>
+                )}
+                {race?.mode === 'multi' && isHost && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => hostStart(cupInfo && !lastRound ? { nextRound: true } : { track: race.track })}
+                      className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 shadow-lg active:scale-95"
+                    >
+                      {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : '🔁 Race again (everyone)'}
+                    </button>
+                    {!cupInfo && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nt = (race.track + 1) % TRACKS.length;
+                          setProfile((p) => ({ ...p, trackIdx: nt }));
+                          hostStart({ track: nt });
+                        }}
+                        className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 py-2.5 text-lg font-black text-white active:scale-95"
+                      >
+                        ➡️ Next track: {TRACKS[(race.track + 1) % TRACKS.length].emoji} {TRACKS[(race.track + 1) % TRACKS.length].name}
+                      </button>
+                    )}
+                  </>
+                )}
+                {race?.mode === 'multi' && !isHost && (
+                  <p className="text-center text-sm font-bold text-white/80">Waiting for 👑 {host?.name ?? 'the host'} to start the next race…</p>
+                )}
+                {race?.mode === 'multi' && (
+                  <div className="flex flex-wrap justify-center gap-2">
+                    {EMOTES.map((e) => (
+                      <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
+                    ))}
+                  </div>
+                )}
+                <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-2.5 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
+                  {race?.mode === 'multi' ? 'Back to lobby' : '🏠 Home'}
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Podium and awards */}
-      {hud.podium && (
-        <div className="absolute inset-0 overflow-y-auto bg-gradient-to-b from-indigo-950/85 via-purple-900/85 to-slate-950/90 p-4 backdrop-blur-sm">
-          <Confetti />
-          <div className="relative mx-auto flex max-w-lg flex-col gap-4 pb-8 pt-[max(1rem,env(safe-area-inset-top))]">
-            <h2 className="text-center text-4xl font-black text-white drop-shadow">
-              {cupInfo ? `${cupInfo.emoji} ${cupInfo.name} · Race ${race!.round + 1}/${cupInfo.tracks.length}` : '🏁 Race results'}
-            </h2>
-            <div className="flex items-end justify-center gap-2">
-              {[1, 0, 2].map((i) => {
-                const a = awards[i];
-                if (!a) return <div key={i} className="w-24" />;
-                const hgt = ['h-36', 'h-24', 'h-16'][i];
-                const col = ['from-yellow-300 to-amber-500', 'from-slate-200 to-slate-400', 'from-orange-300 to-orange-600'][i];
-                return (
-                  <div key={a.id} className="flex w-24 flex-col items-center sm:w-28" style={{ animation: `bk-rise 0.6s ${0.3 + (2 - i) * 0.45}s both` }}>
-                    <div className="text-5xl drop-shadow-lg">{KARTS[a.kartIdx].emoji}</div>
-                    <div className="max-w-full truncate text-sm font-black text-white">{a.name}</div>
-                    <div className={`mt-1 flex w-full ${hgt} items-start justify-center rounded-t-2xl bg-gradient-to-b ${col} pt-2 text-3xl font-black text-slate-900 shadow-xl`}>
-                      {['🥇', '🥈', '🥉'][i]}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {awards.map((a, i) => (
-                <div
-                  key={a.id}
-                  className={`flex items-center gap-3 rounded-2xl px-3 py-2 text-white shadow ${a.isMe ? 'bg-white/25 ring-2 ring-yellow-300' : 'bg-white/10'}`}
-                  style={{ animation: `bk-pop 0.4s ${1.8 + i * 0.25}s both` }}
-                >
-                  <span className="w-8 text-center text-lg font-black">{ordinal(a.place)}</span>
-                  <span className="text-3xl">{KARTS[a.kartIdx].emoji}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-black">{a.name}</span>
-                    <span className="block text-sm font-bold text-yellow-200">{a.icon} {a.title}</span>
-                  </span>
-                  <span className="text-xs font-bold text-white/70">{a.time ?? ''}</span>
-                </div>
-              ))}
-            </div>
-            {cupView && cupTable.length > 0 && (
-              <div className="rounded-2xl bg-black/30 p-3 text-white">
-                <div className="mb-2 text-center text-lg font-black">{lastRound ? '🏆 Final cup points' : '📊 Cup points'}</div>
-                {cupTable.map(([id, t], i) => (
-                  <div key={id} className="flex items-center gap-2 py-0.5 font-bold">
-                    <span className="w-6">{lastRound && i === 0 ? '🏆' : i + 1}</span>
-                    <span className="text-xl">{KARTS[t.kartIdx]?.emoji}</span>
-                    <span className="flex-1 truncate">{t.name}</span>
-                    <span className="font-black text-yellow-300">{t.pts}</span>
-                  </div>
+      {/* Race menu: the race keeps going underneath, so it is quick to get in and out */}
+      {raceMenu && !hud.podium && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm" onPointerDown={(e) => e.target === e.currentTarget && setRaceMenu(false)}>
+          <div className="flex max-h-full w-full max-w-sm flex-col gap-3 overflow-y-auto rounded-3xl bg-slate-900/95 p-4 text-white shadow-2xl ring-2 ring-white/25" style={{ animation: 'bk-pop 0.25s ease-out both', touchAction: 'pan-y' }}>
+            <div className="text-center text-2xl font-black">☰ Menu</div>
+            <button
+              type="button"
+              onClick={() => {
+                sfx('uiBack');
+                setRaceMenu(false);
+              }}
+              className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-4 text-2xl font-black text-slate-900 shadow-lg active:scale-95"
+            >
+              ▶ Keep racing
+            </button>
+            <div>
+              <div className="mb-1 text-sm font-black text-white/80">Camera</div>
+              <div className="grid grid-cols-2 gap-2">
+                {CAM_MODES.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => {
+                      sfx('uiTap');
+                      setProfile((p) => ({ ...p, cam: m.id }));
+                    }}
+                    className={`rounded-xl px-2 py-2 text-sm font-black transition active:scale-95 ${profile.cam === m.id ? 'bg-yellow-300 text-slate-900' : 'bg-white/10 ring-1 ring-white/25'}`}
+                  >
+                    {m.icon} {m.label}
+                  </button>
                 ))}
               </div>
-            )}
-            <div className="flex flex-col gap-2">
-              {race?.mode === 'solo' && (
-                <button
-                  type="button"
-                  onClick={() => (cupInfo && !lastRound ? startSolo(0, race.cup, race.round + 1) : startSolo(profile.trackIdx, cupInfo ? race.cup : -1, 0))}
-                  className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95"
-                >
-                  {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : cupInfo ? '🔁 Play the cup again' : '🔁 Race again'}
-                </button>
-              )}
-              {race?.mode === 'multi' && isHost && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => hostStart(cupInfo && !lastRound ? { nextRound: true } : { track: race.track })}
-                    className="rounded-2xl bg-gradient-to-b from-lime-300 to-green-500 py-3 text-xl font-black text-slate-900 active:scale-95"
-                  >
-                    {cupInfo && !lastRound ? `▶ Next race: ${TRACKS[cupInfo.tracks[race.round + 1]].emoji} ${TRACKS[cupInfo.tracks[race.round + 1]].name}` : '🔁 Race again (everyone)'}
-                  </button>
-                  {!cupInfo && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const nt = (race.track + 1) % TRACKS.length;
-                        setProfile((p) => ({ ...p, trackIdx: nt }));
-                        hostStart({ track: nt });
-                      }}
-                      className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 py-3 text-lg font-black text-white active:scale-95"
-                    >
-                      ➡️ Next track: {TRACKS[(race.track + 1) % TRACKS.length].emoji} {TRACKS[(race.track + 1) % TRACKS.length].name}
-                    </button>
-                  )}
-                </>
-              )}
-              {race?.mode === 'multi' && !isHost && (
-                <p className="text-center text-sm font-bold text-white/80">Waiting for 👑 {host?.name ?? 'the host'} to start the next race…</p>
-              )}
-              {race?.mode === 'multi' && (
-                <div className="flex flex-wrap justify-center gap-2">
-                  {EMOTES.map((e) => (
-                    <button key={e} type="button" onClick={() => sendEmote(e)} className="h-11 w-11 rounded-full bg-white/15 text-2xl active:scale-90">{e}</button>
-                  ))}
-                </div>
-              )}
-              <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-3 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
-                {race?.mode === 'multi' ? 'Back to lobby' : 'Main menu'}
-              </button>
             </div>
+            {toggles}
+            <button
+              type="button"
+              onClick={() => {
+                if (!leaveArmed) {
+                  sfx('uiTap');
+                  setLeaveArmed(true);
+                  return;
+                }
+                sfx('uiBack');
+                setRaceMenu(false);
+                (race?.mode === 'multi' ? backToLobby : quitToMenu)();
+              }}
+              className={`rounded-2xl py-3 text-lg font-black active:scale-95 ${leaveArmed ? 'bg-red-500 text-white' : 'bg-white/10 text-white ring-1 ring-white/25'}`}
+            >
+              {leaveArmed ? 'Tap again to leave' : race?.mode === 'multi' ? (isHost ? '🚪 End race for everyone' : '🚪 Back to the lobby') : '🚪 Quit race'}
+            </button>
           </div>
         </div>
       )}
