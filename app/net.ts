@@ -497,12 +497,14 @@ export class HostClock {
     this.reset();
     if (meIsHost) this.rtt = 0;
   }
-  /** Call often; sends a ping when one is due. */
-  tick(room: Room, meIsHost: boolean) {
+  /** Call often; sends a ping when one is due. Once the clock is known, pings
+   *  slow right down during a race: every ping costs the host a reply, and
+   *  with 5 players those replies were eating the host's own kart updates. */
+  tick(room: Room, meIsHost: boolean, racing = false) {
     if (meIsHost || !this.host || !room.canSend()) return;
     const now = wall();
-    const fast = now - this.startedAt < 12000 || this.samples.length < 4;
-    if (now - this.pingAt < (fast ? 2000 : 6000)) return;
+    const fast = this.samples.length < 4;
+    if (now - this.pingAt < (fast ? 2000 : racing ? 20000 : 6000)) return;
     if (room.send('ping', { f: room.playerId, h: this.host, t0: now }, { force: true })) this.pingAt = now;
   }
   onPong(p: Record<string, unknown>, recv: number, myId: string) {
@@ -537,6 +539,8 @@ export const F_SHIELD = 16;
 export const F_DONE = 32;
 export const F_SNOOZE = 64;
 export const F_DRAFT = 128;
+export const F_RUSH = 256;
+export const F_MAGNET = 512;
 
 /** Optional track-following prediction supplied by the game. */
 export type FollowFn = (x: number, y: number, a: number, speed: number, tauSec: number) => { x: number; y: number; a: number } | null;
@@ -591,6 +595,13 @@ export class RemoteKart {
     }
     const cut = (this.samples[this.samples.length - 1]?.t ?? 0) - 3000;
     while (this.samples.length > 2 && this.samples[0].t < cut) this.samples.shift();
+  }
+
+  /** The newest sample, and the local wall time it describes (null before any data). */
+  latest(): { s: Sample; at: number } | null {
+    const s = this.samples[this.samples.length - 1];
+    if (!s || !isFinite(this.base)) return null;
+    return { s, at: s.t + this.base };
   }
 
   /** Has this kart sent anything yet? */
@@ -743,8 +754,10 @@ export class Sampler {
   private prev: number[][] = [];
   private at = 0;
   seq = 0;
+  /** `spacing` is the time between samples in ms (robots use a coarser 100). */
+  constructor(private spacing = 50) {}
   sample(now: number, x: number, y: number, a: number, vx: number, vy: number, w: number, f: number) {
-    if (now - this.at < 50) return;
+    if (now - this.at < this.spacing) return;
     this.at = now;
     this.fresh.push([Math.round(now), r1(x), r1(y), r3(a), Math.round(vx), Math.round(vy), r3(w), f]);
     if (this.fresh.length > 12) this.fresh.shift();
