@@ -186,6 +186,7 @@ export class View3D {
     this.scene.background = new THREE.Color(t.horizon);
     this.scene.fog = new THREE.Fog(t.horizon, 1500, 5600);
     this.worldFx = new World3D(t, { lowPower: this.lowPower, maxAniso: this.renderer.capabilities.getMaxAnisotropy() });
+    this.worldFx.setDetail(this.detail);
     this.world.add(this.worldFx.group);
     // Winners' stage, just outside the fence
     if (this.stage) {
@@ -273,21 +274,66 @@ export class View3D {
     return c;
   }
 
+  // Detail level: 0 = everything, 1 = no weather, floaters, shadows or crowd
+  // hops, 2 = also no crowd, clouds or skid marks. It only rises when a lower
+  // resolution alone was not enough.
+  private detail = 0;
+  private lite = false; // "Fast graphics": always the lightest picture
+  private drawn = { calls: 0, tris: 0 };
+
+  private setDetail(d: number) {
+    this.detail = this.lite ? 2 : Math.max(0, Math.min(2, Math.round(d)));
+    this.worldFx?.setDetail(this.detail);
+    this.skids.mesh.visible = this.detail < 2;
+  }
+  /** Start from the quality this device settled on last time. */
+  setQuality(q: { scale: number; detail: number }) {
+    if (!(q.scale > 0)) return;
+    this.resScale = Math.max(0.45, Math.min(this.lite ? 0.7 : 1, q.scale));
+    this.setDetail(q.detail || 0);
+    this.setSize(this.sizeW, this.sizeH, this.baseRatio);
+  }
+  /** The player's "Fast graphics" switch: least scenery and fewer pixels, whatever the frame rate. */
+  setLite(on: boolean) {
+    if (this.lite === on) return;
+    this.lite = on;
+    if (on) this.resScale = Math.min(this.resScale, 0.7);
+    this.setDetail(on ? 2 : 0);
+    this.setSize(this.sizeW, this.sizeH, this.baseRatio);
+  }
+  quality() {
+    return { scale: +this.resScale.toFixed(2), detail: this.detail };
+  }
+  stats() {
+    return { ...this.quality(), fps: Math.round(1 / this.frameEma), calls: this.drawn.calls, tris: this.drawn.tris };
+  }
+
   private adapt(now: number, dt: number) {
-    if (dt <= 0 || dt >= 0.1) return;
-    this.frameEma += (dt - this.frameEma) * 0.05;
+    // The caller caps dt at 0.1 s, so a very slow device still counts as slow
+    if (dt <= 0) return;
+    this.frameEma += (dt - this.frameEma) * 0.08;
     if (now < this.adaptAt) return;
-    this.adaptAt = now + 1500;
-    if (this.frameEma > 1 / 42 && this.resScale > 0.45) {
-      this.resScale *= 0.8;
+    const slow = this.frameEma > 1 / 45;
+    const top = this.lite ? 0.7 : 1;
+    this.adaptAt = now + (slow ? 900 : 1500);
+    if (slow) {
       this.goodFor = 0;
+      // First fewer pixels, then less scenery, then fewer pixels again
+      if (this.resScale > 0.62) this.resScale *= this.frameEma > 1 / 30 ? 0.7 : 0.82;
+      else if (this.detail < 2) this.setDetail(this.detail + 1);
+      else if (this.resScale > 0.45) this.resScale = Math.max(0.45, this.resScale * 0.85);
+      else return;
+      this.frameEma = 1 / 50; // judge the new setting on its own frames
       this.setSize(this.sizeW, this.sizeH, this.baseRatio);
-    } else if (this.frameEma < 1 / 57 && this.resScale < 1) {
+    } else if (this.frameEma < 1 / 57 && (this.resScale < top || this.detail > 0)) {
       this.goodFor += 1;
-      if (this.goodFor >= 4) {
-        this.resScale = Math.min(1, this.resScale * 1.15);
+      if (this.resScale < top && this.goodFor >= 4) {
+        this.resScale = Math.min(top, this.resScale * 1.12);
         this.goodFor = 0;
         this.setSize(this.sizeW, this.sizeH, this.baseRatio);
+      } else if (this.resScale >= top && !this.lite && this.goodFor >= 10) {
+        this.setDetail(this.detail - 1);
+        this.goodFor = 0;
       }
     }
   }
@@ -319,7 +365,7 @@ export class View3D {
       };
     } else this.podiumSince = 0;
     const me = f.karts[0];
-    this.skids.update(now, podium ? [] : f.karts);
+    if (this.detail < 2) this.skids.update(now, podium ? [] : f.karts);
     // Fireworks: when I cross the line, and all through the podium
     if ((f.finishedFor >= 0 && f.finishedFor < 7000) || podium) {
       if (now > this.fwAt) {
@@ -489,6 +535,8 @@ export class View3D {
       excite: f.finishedFor >= 0 ? 1 : f.countdownLeft !== null ? 0.6 : 0.15,
     });
     this.renderer.render(this.scene, this.camera);
+    this.drawn.calls = this.renderer.info.render.calls;
+    this.drawn.tris = this.renderer.info.render.triangles;
   }
 
   // ----- Driving line: a flat ribbon on the road, fading at both ends -----
