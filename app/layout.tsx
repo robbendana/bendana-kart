@@ -4,6 +4,9 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'Bendana Kart',
   description: 'A family kart racer you can play together from different devices.',
+  applicationName: 'Bendana Kart',
+  appleWebApp: { capable: true, title: 'Bendana Kart', statusBarStyle: 'black-translucent' },
+  formatDetection: { telephone: false },
 };
 
 export const viewport: Viewport = {

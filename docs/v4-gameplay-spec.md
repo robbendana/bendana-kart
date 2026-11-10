@@ -62,7 +62,7 @@ to it:
   earn a coin every 5 s instead, up to a cap per level.
 - **Robot level** (host option, also used in Practice): Chill, Fair (default)
   or Fast. Chill robots are 7% slower and have no mini-turbo. Fair robots are
-  4% slower with a small mini-turbo, tuned so a Practice race is about as hard
+  5% slower with a small mini-turbo, tuned so a Practice race is about as hard
   as it was before 4.0. Fast robots are 6% quicker, get full mini-turbos and
   slow down less when ahead.
 - Robots still go easier when players have steering help on, and still pace
