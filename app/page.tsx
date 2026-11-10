@@ -15,6 +15,11 @@ import {
   sendIntervalFor, F_SPIN, F_BOOST, F_DRIFT, F_AIR, F_SHIELD, F_DONE, F_SNOOZE, F_DRAFT,
   type Room, type Meta, type NetStatus, type NetEvent,
 } from './net';
+import {
+  loadStore, saveStore, activeLocal, syncActive, setActive, addPlayer, adoptPlayer, removeLocal, applyRace, mergeBoard, wireBoard,
+  type Store, type Gain,
+} from './players';
+import { WhoRow, GainStrip, FamilySheets, type Kit, type FamilyPanel } from './family-ui';
 
 /* =========================================================================
    Bendana Kart: a family kart racer.
@@ -869,9 +874,12 @@ function makeBoxes(): Box[] {
 type Skill = { s: number; n: number };
 const SKILL_KEY = 'bendana-kart-skill';
 const TIPS_KEY = 'bendana-kart-tips';
+// Each saved racer has their own driving score, so a parent's skill never takes help away from a child
+let skillOwner = '';
+const skillKey = () => (skillOwner ? `${SKILL_KEY}:${skillOwner}` : SKILL_KEY);
 function loadSkill(): Skill {
   try {
-    const v = JSON.parse(window.localStorage.getItem(SKILL_KEY) || 'null');
+    const v = JSON.parse(window.localStorage.getItem(skillKey()) || 'null');
     if (v && typeof v.s === 'number' && typeof v.n === 'number') return { s: clamp(v.s, 0, 1), n: Math.max(0, v.n | 0) };
   } catch {
     /* storage blocked */
@@ -880,7 +888,7 @@ function loadSkill(): Skill {
 }
 function saveSkill(sk: Skill) {
   try {
-    window.localStorage.setItem(SKILL_KEY, JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
+    window.localStorage.setItem(skillKey(), JSON.stringify({ s: +sk.s.toFixed(3), n: sk.n }));
   } catch {
     /* storage blocked */
   }
@@ -2993,6 +3001,30 @@ function sessionId(): string {
   }
 }
 
+const FAMILY_KIT: Kit = {
+  karts: KARTS,
+  tracks: TRACKS,
+  colors: kartColors,
+  face: (i, size) => <FaceIcon emoji={(KARTS[i] || KARTS[0]).emoji} size={size} happy />,
+  fmtTime,
+};
+
+/** The profile for the racer who is active on this device: their name and kart, plus this device's settings. */
+function playerProfile(st: Store, base: Profile): Profile {
+  const loc = activeLocal(st);
+  const p = loc.prefs;
+  return {
+    ...base,
+    name: st.board[loc.pid]?.n ?? '',
+    kartIdx: p.kartIdx < KARTS.length ? p.kartIdx : 0,
+    paint: p.paint < PAINTS.length ? p.paint : -1,
+    body: p.body < BODIES.length ? p.body : 0,
+    toddler: p.toddler,
+    assist: p.assist,
+    cam: CAM_MODES.some((m) => m.id === p.cam) ? (p.cam as CamMode) : 'chase',
+  };
+}
+
 type CupState = { cup: number; round: number; totals: Record<string, { name: string; kartIdx: number; pts: number }>; scored: string[] };
 
 export default function BendanaKartPage() {
@@ -3020,6 +3052,13 @@ export default function BendanaKartPage() {
   const [netDebug, setNetDebug] = useState('');
   const [posFx, setPosFx] = useState<{ dir: number; key: number }>({ dir: 0, key: 0 });
   const [autoJoin, setAutoJoin] = useState<string | null>(null);
+  // Saved racers, their stats and the family leaderboard (see players.ts)
+  const [family, setFamily] = useState<Store | null>(null);
+  const [panel, setPanel] = useState<FamilyPanel>(null);
+  const [gain, setGain] = useState<Gain | null>(null);
+  const familyRef = useRef<Store | null>(null);
+  const boardTimerRef = useRef(0);
+  const peersRef = useRef<Set<string>>(new Set());
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvas3dRef = useRef<HTMLCanvasElement | null>(null);
@@ -3039,6 +3078,7 @@ export default function BendanaKartPage() {
   const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false, drift: false, lookBack: false, ax: 0 });
   const isTouchRef = useRef(false);
   const profileRef = useRef<Profile>(profile);
+  const firstProfileRef = useRef<Profile>(profile);
   const playersRef = useRef<LobbyPlayer[]>([]);
   const rosterRef = useRef<Map<string, Meta>>(new Map());
   const myIdRef = useRef('');
@@ -3063,11 +3103,12 @@ export default function BendanaKartPage() {
     myIdRef.current = id;
     setMyId(id);
     wakeRef.current = new WakeLock();
+    let base = firstProfileRef.current;
     try {
       const saved = window.localStorage.getItem('bendana-kart-profile');
       if (saved) {
         const p = JSON.parse(saved) as Partial<Profile>;
-        setProfile({
+        base = {
           name: typeof p.name === 'string' ? p.name.slice(0, 14) : '',
           kartIdx: typeof p.kartIdx === 'number' && p.kartIdx >= 0 && p.kartIdx < KARTS.length ? p.kartIdx : 0,
           toddler: !!p.toddler,
@@ -3081,11 +3122,17 @@ export default function BendanaKartPage() {
           haptics: p.haptics !== false,
           laps: p.laps === 2 ? 2 : 3,
           cup: typeof p.cup === 'number' && p.cup >= -1 && p.cup < CUPS.length ? p.cup : -1,
-        });
+        };
       }
     } catch {
       /* storage unavailable */
     }
+    // Saved racers: the racer who played last on this device is ready to go
+    const st = loadStore(base.name, base);
+    familyRef.current = st;
+    setFamily(st);
+    skillOwner = st.active;
+    setProfile(playerProfile(st, base));
     const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     isTouchRef.current = touch;
     setIsTouch(touch);
@@ -3161,12 +3208,77 @@ export default function BendanaKartPage() {
     setMuted(profile.muted);
     setMusicOn(profile.music);
     setHaptics(profile.haptics);
+    if (profile === firstProfileRef.current) return; // nothing loaded yet
     try {
       window.localStorage.setItem('bendana-kart-profile', JSON.stringify(profile));
     } catch {
       /* storage unavailable */
     }
+    // Name and kart changes belong to the active racer
+    const st = familyRef.current;
+    if (st) {
+      const next = syncActive(st, profile.name, profile);
+      if (next !== st) {
+        familyRef.current = next;
+        setFamily(next);
+        saveStore(next);
+      }
+    }
   }, [profile]);
+
+  const commitFamily = useCallback((st: Store) => {
+    familyRef.current = st;
+    skillOwner = st.active;
+    setFamily(st);
+    saveStore(st);
+  }, []);
+
+  /** Switch to a saved racer (or one just made): their name, kart and settings come back. */
+  const switchTo = useCallback((st: Store) => {
+    commitFamily(st);
+    const next = playerProfile(st, profileRef.current);
+    profileRef.current = next;
+    setProfile(next);
+    setPanel(null);
+  }, [commitFamily]);
+  const pickPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (!st || st.active === pid) return;
+    unlockAudio();
+    sfx('ready');
+    switchTo(setActive(st, pid));
+  };
+  const createPlayer = (name: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(addPlayer(st, name, KARTS.length));
+  };
+  const adoptBoardPlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(adoptPlayer(st, pid));
+  };
+  const removePlayer = (pid: string) => {
+    const st = familyRef.current;
+    if (st) switchTo(removeLocal(st, pid, KARTS.length));
+  };
+
+  /** Send what this device knows of the leaderboard to the others in the room. */
+  const sendBoard = useCallback((only?: string) => {
+    const st = familyRef.current;
+    const rm = roomRef.current;
+    if (!st || !rm) return;
+    const recs = wireBoard(st, only);
+    if (recs.length) rm.send('lb', { id: myIdRef.current, recs }, { force: true });
+  }, []);
+  /** A moment after someone joins, share the board (spread out so devices do not all talk at once). */
+  const scheduleBoard = useCallback(() => {
+    if (boardTimerRef.current) return;
+    boardTimerRef.current = window.setTimeout(() => {
+      boardTimerRef.current = 0;
+      if (!gameRef.current || gameRef.current.closedAt) sendBoard();
+      else scheduleBoard(); // mid-race: wait for the finish
+    }, 1200 + Math.random() * 1800);
+  }, [sendBoard]);
+  useEffect(() => () => window.clearTimeout(boardTimerRef.current), []);
 
   // Menu music, and keep the screen awake while in a room or a race
   useEffect(() => {
@@ -3204,6 +3316,8 @@ export default function BendanaKartPage() {
   const startRace = useCallback((cfg: RaceCfg) => {
     setHud(EMPTY_HUD);
     setAwards([]);
+    setGain(null);
+    setPanel(null);
     raceRef.current = cfg;
     playedRef.current.add(cfg.id);
     readyRef.current = false;
@@ -3245,6 +3359,7 @@ export default function BendanaKartPage() {
     if (r) void r.close();
     hostRaceRef.current = null;
     rosterRef.current = new Map();
+    peersRef.current = new Set();
     setRoom(null);
     setPlayers([]);
     playersRef.current = [];
@@ -3357,6 +3472,16 @@ export default function BendanaKartPage() {
     playersRef.current = list;
     setPlayers(list);
     rm.setPlayers(Math.min(MAX_PLAYERS, list.length));
+    // Someone new in the room: swap leaderboards
+    const seen = peersRef.current;
+    let fresh = false;
+    for (const p of list) {
+      if (p.id !== myIdRef.current && !seen.has(p.id)) {
+        seen.add(p.id);
+        fresh = true;
+      }
+    }
+    if (fresh) scheduleBoard();
     const host = pickHost(list);
     const meHost = !!host && host.id === myIdRef.current;
     clockRef.current.setHost(host?.id ?? '', meHost);
@@ -3379,7 +3504,7 @@ export default function BendanaKartPage() {
         else if (!r.leftAt) r.leftAt = now;
       });
     }
-  }, [joinHostRace, leaveRoom]);
+  }, [joinHostRace, leaveRoom, scheduleBoard]);
 
   const joinRoom = useCallback((code: string, asHost: boolean) => {
     unlockAudio();
@@ -3466,6 +3591,12 @@ export default function BendanaKartPage() {
       if (!t || !Array.isArray(t) || (host && p.from !== host.id)) return;
       joinHostRace(parseMeta('x', { race: t }).race ?? t, Number(p.ts), recv);
     });
+    rm.on('lb', (p) => {
+      const st = familyRef.current;
+      if (!st) return;
+      const res = mergeBoard(st, p.recs);
+      if (res.changed) commitFamily(res.store);
+    });
     rm.on('lobby', (p) => {
       if (raceRef.current && p.r === raceRef.current.id) {
         raceRef.current = null;
@@ -3480,7 +3611,7 @@ export default function BendanaKartPage() {
     setScreen('lobby');
     // First presence after a short moment (meta must be set before track)
     rm.setMeta(myMeta(), true);
-  }, [applyEvent, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
+  }, [applyEvent, commitFamily, getSupabase, joinHostRace, leaveRoom, myMeta, refreshPlayers]);
 
   useEffect(() => {
     if (!autoJoin || !myId) return;
@@ -3797,6 +3928,26 @@ export default function BendanaKartPage() {
     let lastPlace = 0;
     let scored = false;
     let debugAt = 0;
+    // Save this race to the racer's stats, once
+    const racerPid = familyRef.current ? activeLocal(familyRef.current).pid : '';
+    let recorded = false;
+    const recordRace = (award: string | null, cupWon: boolean, quiet = false) => {
+      const st = familyRef.current;
+      const me = G.karts[0];
+      if (recorded || !st || !racerPid || !me.finished) return;
+      recorded = true;
+      const ranked = rankRacers(racers(G));
+      const lapsMs = G.lapAt.length === G.laps + 1 ? G.lapAt.slice(1).map((t, i) => t - G.lapAt[i]) : [];
+      const res = applyRace(st, racerPid, {
+        track: race.track, laps: G.laps, place: ranked.findIndex((r) => r.isMe) + 1, total: ranked.length,
+        family: G.mode === 'multi' && ranked.filter((r) => r.human).length >= 2,
+        timeMs: me.finishTime, lapsMs, stats: me.st, cleanLaps: G.cleanLaps, award, cupWon,
+      }, TRACKS.length);
+      if (!res) return;
+      commitFamily(res.store);
+      if (!quiet) setGain(res.gain);
+      if (G.mode === 'multi') window.setTimeout(() => sendBoard(racerPid), 300 + Math.random() * 900);
+    };
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
       let dt = (now - last) / 1000;
@@ -3879,7 +4030,15 @@ export default function BendanaKartPage() {
           });
           setCupView({ ...cup, totals: { ...cup.totals } });
         }
-        setAwards(computeAwards(G));
+        const aw = computeAwards(G);
+        setAwards(aw);
+        const mine = aw.find((a) => a.isMe);
+        let cupWon = false;
+        if (cup && race.cup >= 0 && race.round === CUPS[race.cup].tracks.length - 1) {
+          const top = Object.entries(cup.totals).sort((a, b) => b[1].pts - a[1].pts)[0];
+          cupWon = !!top && top[0] === G.meId;
+        }
+        recordRace(mine ? `${mine.icon} ${mine.title}` : null, cupWon);
         sfx('cheer');
       }
 
@@ -3982,11 +4141,12 @@ export default function BendanaKartPage() {
       window.removeEventListener('blur', onBlur);
       input.up = input.down = input.left = input.right = input.fire = input.drift = input.lookBack = false;
       engineStop();
+      recordRace(null, false, true); // finished but left before the results: it still counts
       if (gameRef.current === G) gameRef.current = null;
       view?.dispose();
       view = null;
     };
-  }, [screen, race]);
+  }, [screen, race, commitFamily, sendBoard]);
 
   // ---------- Touch controls ----------
   const press = (key: InputKey, on: boolean) => {
@@ -4111,6 +4271,29 @@ export default function BendanaKartPage() {
     </span>
   );
 
+  const familySheets = (
+    <FamilySheets panel={panel} store={family} kit={FAMILY_KIT} setPanel={setPanel} onCreate={createPlayer} onAdopt={adoptBoardPlayer} onRemove={removePlayer} />
+  );
+  const whoRow = family && <WhoRow store={family} kit={FAMILY_KIT} onPick={pickPlayer} onAdd={() => setPanel({ kind: 'add' })} />;
+  const familyButtons = (
+    <div className="grid grid-cols-2 gap-2">
+      <button
+        type="button"
+        onClick={() => family && setPanel({ kind: 'stats', pid: family.active })}
+        className="rounded-2xl bg-gradient-to-b from-sky-300 to-indigo-500 px-3 py-3 text-lg font-black text-white shadow-lg active:scale-95"
+      >
+        📊 My stats
+      </button>
+      <button
+        type="button"
+        onClick={() => setPanel({ kind: 'board' })}
+        className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 px-3 py-3 text-lg font-black text-slate-900 shadow-lg active:scale-95"
+      >
+        🏆 Leaderboard
+      </button>
+    </div>
+  );
+
   // ---------- Screens ----------
   if (screen === 'menu') {
     return (
@@ -4124,8 +4307,10 @@ export default function BendanaKartPage() {
           </header>
 
           <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
-            <h2 className="mb-3 text-lg font-black text-white">1. What&apos;s your name?</h2>
-            {nameInput}
+            <h2 className="mb-1 text-lg font-black text-white">1. Who&apos;s racing?</h2>
+            {whoRow}
+            <div className="mb-3 mt-1">{nameInput}</div>
+            {familyButtons}
           </section>
 
           <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
@@ -4140,7 +4325,7 @@ export default function BendanaKartPage() {
 
           <section className="rounded-3xl bg-black/20 p-4 backdrop-blur sm:p-5">
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
+            {!profile.toddler && <AssistPicker key={family?.active} value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
             <div className="mt-3">{toggles}</div>
           </section>
 
@@ -4188,6 +4373,7 @@ export default function BendanaKartPage() {
             Keyboard: W A S D or arrow keys to drive, Shift to drift, Space to use an item (or do a trick in the air), C to switch camera, Q to look back, H to honk. Game controllers work too. On a tablet, use the big buttons, hold a turn to drift, and tap ⭐ in the air for a trick.
           </p>
         </div>
+        {familySheets}
       </main>
     );
   }
@@ -4258,11 +4444,13 @@ export default function BendanaKartPage() {
           </section>
 
           <section className="flex flex-col gap-3 rounded-3xl bg-black/25 p-4 backdrop-blur">
-            <h2 className="text-lg font-black text-white">Your kart</h2>
+            <h2 className="text-lg font-black text-white">Who&apos;s racing?</h2>
+            {whoRow}
             {nameInput}
+            {familyButtons}
             <KartPicker compact value={profile.kartIdx} paint={profile.paint} onPick={(i) => setProfile((p) => ({ ...p, kartIdx: i }))} onPaint={(i) => setProfile((p) => ({ ...p, paint: i }))} body={profile.body} onBody={(i) => setProfile((p) => ({ ...p, body: i }))} />
             <ToddlerToggle on={profile.toddler} onToggle={() => setProfile((p) => ({ ...p, toddler: !p.toddler }))} />
-            {!profile.toddler && <AssistPicker value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
+            {!profile.toddler && <AssistPicker key={family?.active} value={profile.assist} onPick={(v) => setProfile((p) => ({ ...p, assist: v }))} />}
             {toggles}
           </section>
 
@@ -4293,6 +4481,7 @@ export default function BendanaKartPage() {
             )}
           </div>
         </div>
+        {familySheets}
       </main>
     );
   }
@@ -4586,6 +4775,7 @@ export default function BendanaKartPage() {
                 </div>
               ))}
             </div>
+            {gain && <GainStrip gain={gain} />}
             {cupView && cupTable.length > 0 && (
               <div className="rounded-2xl bg-black/30 p-3 text-white">
                 <div className="mb-2 text-center text-lg font-black">{lastRound ? '🏆 Final cup points' : '📊 Cup points'}</div>
@@ -4643,6 +4833,9 @@ export default function BendanaKartPage() {
                   ))}
                 </div>
               )}
+              <button type="button" onClick={() => setPanel({ kind: 'board' })} className="rounded-2xl bg-gradient-to-b from-yellow-200 to-orange-400 py-3 text-lg font-black text-slate-900 active:scale-95">
+                🏆 Family leaderboard
+              </button>
               <button type="button" onClick={race?.mode === 'multi' ? backToLobby : quitToMenu} className="rounded-2xl bg-white/15 py-3 text-lg font-black text-white ring-1 ring-white/25 active:scale-95">
                 {race?.mode === 'multi' ? 'Back to lobby' : 'Main menu'}
               </button>
@@ -4654,6 +4847,7 @@ export default function BendanaKartPage() {
       {hud.boost && (
         <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_120px_rgba(251,146,60,0.55)]" style={{ borderColor: kartColors(meSpec ? profile.kartIdx : 0, profile.paint).color }} />
       )}
+      {familySheets}
     </main>
   );
 }

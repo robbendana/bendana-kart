@@ -41,6 +41,30 @@ race each other live, one per device.
 - **Practice:** race four robot karts on one device.
 - **Multiplayer:** one player taps **Host Race** and gets a 4-letter code. Everyone else taps **Join Race** and types it in.
 
+## Saved racers, stats and the family leaderboard
+
+Each device remembers its racers. On the menu, tap your picture to race as
+yourself: your name, character, kart and help level come back, with nothing to
+type. **Add racer** makes a new one, so a shared tablet can hold the whole
+family. A racer who already plays on another device can tap their name under
+**Add racer** to bring their stars and badges along.
+
+Every finished race adds to that racer's stats: races, wins, coins, drifts,
+best times and laps per track, stars, levels and badges. **My stats** shows
+one racer's page and **Leaderboard** ranks the family and lists the track
+records.
+
+All of it is saved in the browser's local storage, so it works offline and
+costs nothing. No database is used. Whenever devices are in a room together
+they swap leaderboards in one small `lb` message each, so every device ends up
+with the same board. The code is in `app/players.ts` (data and merging) and
+`app/family-ui.tsx` (screens).
+
+Because the data lives in the browser, clearing the browser's site data
+erases that device's copy. Racers come back from any other family device the
+next time you share a room. `?store=name` gives a tab its own save data, which
+lets one browser act as several devices in tests.
+
 ## Controls
 
 | Device | Drive | Steer | Item | Camera |
